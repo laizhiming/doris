@@ -41,7 +41,7 @@ export function DataPrev(props: any) {
             body: {stmt: `SELECT * FROM ${dbName}.${tbl_name} LIMIT 10`},
         }).then((res: any) => {
             if (res && res.msg === 'success') {
-                console.log(getColumns(res.data?.meta), 2222)
+                // console.log(getColumns(res.data?.meta), 2222)
                 setColumns(getColumns(res.data?.meta))
                 setTableData(getTableData(res.data));
             }
@@ -76,7 +76,9 @@ export function DataPrev(props: any) {
         if (!source || source.length === 0) {
             return [];
         }
-        let metaArr = meta.map(item => item.name)
+        // let metaArr = meta.map(item => item.name)
+        // fix error: TypeError:(t[]).forEach is not a function
+        let metaArr = Array.isArray(meta) ? meta.map(item => item.name) : [];
         for (let i = 0; i < source.length; i++) {
             let node = source[i];
             if (node.length !== meta.length) {
