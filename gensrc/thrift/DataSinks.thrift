@@ -25,79 +25,83 @@ include "Partitions.thrift"
 include "PlanNodes.thrift"
 
 enum TDataSinkType {
-    DATA_STREAM_SINK,
-    RESULT_SINK,
-    DATA_SPLIT_SINK, // deprecated
-    MYSQL_TABLE_SINK,
-    EXPORT_SINK,
-    OLAP_TABLE_SINK,
-    MEMORY_SCRATCH_SINK,
-    ODBC_TABLE_SINK,
-    RESULT_FILE_SINK,
-    JDBC_TABLE_SINK,
-    MULTI_CAST_DATA_STREAM_SINK,
-    GROUP_COMMIT_OLAP_TABLE_SINK, // deprecated
-    GROUP_COMMIT_BLOCK_SINK,
-    HIVE_TABLE_SINK,
-    ICEBERG_TABLE_SINK,
+    DATA_STREAM_SINK = 0,
+    RESULT_SINK = 1,
+    DATA_SPLIT_SINK = 2, // deprecated
+    MYSQL_TABLE_SINK = 3,
+    EXPORT_SINK = 4,
+    OLAP_TABLE_SINK = 5,
+    MEMORY_SCRATCH_SINK = 6,
+    ODBC_TABLE_SINK = 7,
+    RESULT_FILE_SINK = 8,
+    JDBC_TABLE_SINK = 9,
+    MULTI_CAST_DATA_STREAM_SINK = 10,
+    GROUP_COMMIT_OLAP_TABLE_SINK = 11, // deprecated
+    GROUP_COMMIT_BLOCK_SINK = 12,
+    HIVE_TABLE_SINK = 13,
+    ICEBERG_TABLE_SINK = 14,
+    DICTIONARY_SINK = 15,
+    BLACKHOLE_SINK = 16,
+    TVF_TABLE_SINK = 17,
+    MAXCOMPUTE_TABLE_SINK = 18,
 }
 
 enum TResultSinkType {
-    MYSQL_PROTOCAL,
-    ARROW_FLIGHT_PROTOCAL,
-    FILE,    // deprecated, should not be used any more. FileResultSink is covered by TRESULT_FILE_SINK for concurrent purpose.
+    MYSQL_PROTOCOL = 0,
+    ARROW_FLIGHT_PROTOCOL = 1,
+    FILE = 2,    // deprecated, should not be used any more. FileResultSink is covered by TRESULT_FILE_SINK for concurrent purpose.
 }
 
 enum TParquetCompressionType {
-    SNAPPY,
-    GZIP,
-    BROTLI,
-    ZSTD,
-    LZ4,
-    LZO,
-    BZ2,
-    UNCOMPRESSED,
+    SNAPPY = 0,
+    GZIP = 1,
+    BROTLI = 2,
+    ZSTD = 3,
+    LZ4 = 4,
+    LZO = 5,
+    BZ2 = 6,
+    UNCOMPRESSED = 7,
 }
 
 enum TParquetVersion {
-    PARQUET_1_0,
-    PARQUET_2_LATEST,
+    PARQUET_1_0 = 0,
+    PARQUET_2_LATEST = 1,
 }
 
 enum TParquetDataType {
-    BOOLEAN,
-    INT32,
-    INT64,
-    INT96,
-    BYTE_ARRAY,
-    FLOAT,
-    DOUBLE,
-    FIXED_LEN_BYTE_ARRAY,
+    BOOLEAN = 0,
+    INT32 = 1,
+    INT64 = 2,
+    INT96 = 3,
+    BYTE_ARRAY = 4,
+    FLOAT = 5,
+    DOUBLE = 6,
+    FIXED_LEN_BYTE_ARRAY = 7,
 }
 
 enum TParquetDataLogicalType {
-      UNDEFINED = 0,  // Not a real logical type
-      STRING = 1,
-      MAP,
-      LIST,
-      ENUM,
-      DECIMAL,
-      DATE,
-      TIME,
-      TIMESTAMP,
-      INTERVAL,
-      INT,
-      NIL,  // Thrift NullType: annotates data that is always null
-      JSON,
-      BSON,
-      UUID,
-      NONE  // Not a real logical type; should always be last element
-    }
+    UNDEFINED = 0,  // Not a real logical type
+    STRING = 1,
+    MAP = 2,
+    LIST = 3,
+    ENUM = 4,
+    DECIMAL = 5,
+    DATE = 6,
+    TIME = 7,
+    TIMESTAMP = 8,
+    INTERVAL = 9,
+    INT = 10,
+    NIL = 11,  // Thrift NullType: annotates data that is always null
+    JSON = 12,
+    BSON = 13,
+    UUID = 14,
+    NONE = 15  // Not a real logical type; should always be last element
+}
 
 enum TParquetRepetitionType {
-    REQUIRED,
-    REPEATED,
-    OPTIONAL,
+    REQUIRED = 0,
+    REPEATED = 1,
+    OPTIONAL = 2,
 }
 
 struct TParquetSchema {
@@ -133,6 +137,21 @@ struct TResultFileSinkOptions {
     18: optional bool with_bom;
 
     19: optional PlanNodes.TFileCompressType orc_compression_type;
+
+    // Since we have changed the type mapping from Doris to Orc type,
+    // using the Outfile to export Date/Datetime types will cause BE core dump
+    // when only upgrading BE without upgrading FE.
+    // orc_writer_version = 1 means doris FE is higher than version 2.1.5
+    // orc_writer_version = 0 means doris FE is less than or equal to version 2.1.5
+    20: optional i64 orc_writer_version;
+
+    //iceberg write sink use int64
+    //hive write sink use int96
+    //export data to file use by user define properties
+    21: optional bool enable_int96_timestamps
+    // currently only for csv
+    // TODO: merge with parquet_compression_type and orc_compression_type
+    22: optional PlanNodes.TFileCompressType compression_type
 }
 
 struct TMemoryScratchSink {
@@ -175,12 +194,14 @@ struct TDataStreamSink {
   // per-destination runtime filters
   7: optional list<PlanNodes.TRuntimeFilterDesc> runtime_filters
 
-  // used for partition_type = TABLET_SINK_SHUFFLE_PARTITIONED
+  // used for partition_type = OLAP_TABLE_SINK_HASH_PARTITIONED
   8: optional Descriptors.TOlapTableSchemaParam tablet_sink_schema
   9: optional Descriptors.TOlapTablePartitionParam tablet_sink_partition
   10: optional Descriptors.TOlapTableLocationParam tablet_sink_location
   11: optional i64 tablet_sink_txn_id
   12: optional Types.TTupleId tablet_sink_tuple_id
+  13: optional list<Exprs.TExpr> tablet_sink_exprs
+  14: optional bool is_merge
 }
 
 struct TMultiCastDataStreamSink {
@@ -248,9 +269,9 @@ struct TExportSink {
 }
 
 enum TGroupCommitMode {
-    SYNC_MODE,
-    ASYNC_MODE,
-    OFF_MODE
+    SYNC_MODE = 0,
+    ASYNC_MODE = 1,
+    OFF_MODE = 2
 }
 
 struct TOlapTableSink {
@@ -324,6 +345,15 @@ struct THivePartition {
   3: optional PlanNodes.TFileFormatType file_format
 }
 
+struct THiveSerDeProperties {
+    1: optional string field_delim
+    2: optional string line_delim
+    3: optional string collection_delim // array ,map ,struct delimiter 
+    4: optional string mapkv_delim
+    5: optional string escape_char
+    6: optional string null_format
+}
+
 struct THiveTableSink {
     1: optional string db_name
     2: optional string table_name
@@ -335,6 +365,8 @@ struct THiveTableSink {
     8: optional THiveLocationParams location
     9: optional map<string, string> hadoop_config
     10: optional bool overwrite
+    11: optional THiveSerDeProperties serde_properties
+    12: optional list<Types.TNetworkAddress> broker_addresses;
 }
 
 enum TUpdateMode {
@@ -366,6 +398,15 @@ enum TFileContent {
     EQUALITY_DELETES = 2
 }
 
+struct TIcebergColumnStats {
+    1: optional map<i32, i64> column_sizes
+    2: optional map<i32, i64> value_counts
+    3: optional map<i32, i64> null_value_counts
+    4: optional map<i32, i64> nan_value_counts
+    5: optional map<i32, binary> lower_bounds;
+    6: optional map<i32, binary> upper_bounds;
+}
+
 struct TIcebergCommitData {
     1: optional string file_path
     2: optional i64 row_count
@@ -373,6 +414,7 @@ struct TIcebergCommitData {
     4: optional TFileContent file_content
     5: optional list<string> partition_values 
     6: optional list<string> referenced_data_files
+    7: optional TIcebergColumnStats column_stats
 }
 
 struct TSortField {
@@ -395,6 +437,83 @@ struct TIcebergTableSink {
     11: optional Types.TFileType file_type
     12: optional string original_output_path
     13: optional PlanNodes.TFileCompressType compression_type
+    14: optional list<Types.TNetworkAddress> broker_addresses;
+    // Static partition values for static partition overwrite
+    // Key: partition column name, Value: partition value as string
+    // When set, BE should use these values directly instead of computing from data
+    15: optional map<string, string> static_partition_values;
+    16: optional PlanNodes.TSortInfo sort_info;
+}
+
+enum TDictLayoutType {
+    HASH_MAP = 0,
+    IP_TRIE = 1,
+}
+
+struct TDictionarySink {
+    1: optional i64 dictionary_id
+    2: optional i64 version_id
+    3: optional string dictionary_name
+    4: optional TDictLayoutType layout_type
+    5: optional list<i64> key_output_expr_slots
+    6: optional list<i64> value_output_expr_slots
+    7: optional list<string> value_names
+    8: optional bool skip_null_key
+    9: optional i64 memory_limit
+}
+
+struct TBlackholeSink {
+}
+
+enum TTVFWriterType {
+    NATIVE = 0,
+    JNI = 1
+}
+
+struct TTVFTableSink {
+    1: optional string tvf_name              // "local", "s3", "hdfs"
+    2: optional string file_path
+    3: optional PlanNodes.TFileFormatType file_format
+    4: optional Types.TFileType file_type // FILE_LOCAL, FILE_S3, FILE_HDFS
+    5: optional map<string, string> properties
+    6: optional list<Descriptors.TColumn> columns
+    7: optional string column_separator
+    8: optional string line_delimiter
+    9: optional i64 max_file_size_bytes
+    10: optional bool delete_existing_files
+    11: optional map<string, string> hadoop_config
+    12: optional PlanNodes.TFileCompressType compression_type
+    13: optional i64 backend_id              // local TVF: specify BE
+    14: optional TTVFWriterType writer_type   // NATIVE or JNI
+    15: optional string writer_class          // Java class name (required when writer_type=JNI)
+}
+
+struct TMCCommitData {
+    1: optional string session_id
+    2: optional string partition_spec    // "key1=val1/key2=val2" format, empty for non-partitioned
+    3: optional list<i64> block_ids      // successfully written block IDs (legacy, unused with Storage API)
+    4: optional i64 row_count
+    5: optional i64 written_bytes
+    6: optional string commit_message    // Base64 serialized WriterCommitMessage from Storage API
+}
+
+struct TMaxComputeTableSink {
+    1: optional string session_id       // FE pre-created UploadSession ID (empty for dynamic partition)
+    2: optional string access_key
+    3: optional string secret_key
+    4: optional string endpoint
+    5: optional string project
+    6: optional string table_name
+    7: optional string quota
+    8: optional i64 block_id_start      // starting block_id for this fragment
+    9: optional i64 block_id_count      // number of block_ids available for this fragment
+    10: optional map<string, string> static_partition_spec  // static partition key-value pairs
+    11: optional i32 connect_timeout
+    12: optional i32 read_timeout
+    13: optional i32 retry_count
+    14: optional list<string> partition_columns  // partition column names for dynamic partition
+    15: optional string write_session_id          // Storage API write session ID
+    16: optional map<string, string> properties // contains authentication properties
 }
 
 struct TDataSink {
@@ -411,4 +530,8 @@ struct TDataSink {
   12: optional TMultiCastDataStreamSink multi_cast_stream_sink
   13: optional THiveTableSink hive_table_sink
   14: optional TIcebergTableSink iceberg_table_sink
+  15: optional TDictionarySink dictionary_sink
+  16: optional TBlackholeSink blackhole_sink
+  17: optional TTVFTableSink tvf_table_sink
+  18: optional TMaxComputeTableSink max_compute_table_sink
 }

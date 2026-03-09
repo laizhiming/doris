@@ -31,9 +31,9 @@
 #include "common/bvars.h"
 #include "common/config.h"
 #include "common/logging.h"
-#include "common/sync_point.h"
+#include "cpp/sync_point.h"
 #include "meta-service/meta_service.h"
-#include "meta-service/txn_kv.h"
+#include "meta-store/txn_kv.h"
 
 using namespace doris;
 
@@ -44,8 +44,10 @@ static std::unique_ptr<cloud::MetaServiceProxy> create_meta_service() {
     auto rate_limiter = std::make_shared<cloud::RateLimiter>();
     auto rc_mgr = std::make_shared<cloud::ResourceManager>(txn_kv);
     [&]() { ASSERT_EQ(rc_mgr->init(), 0); }();
+    auto snapshot_manager = std::make_shared<cloud::SnapshotManager>(txn_kv);
 
-    auto meta_service_impl = std::make_unique<cloud::MetaServiceImpl>(txn_kv, rc_mgr, rate_limiter);
+    auto meta_service_impl = std::make_unique<cloud::MetaServiceImpl>(txn_kv, rc_mgr, rate_limiter,
+                                                                      snapshot_manager);
     return std::make_unique<cloud::MetaServiceProxy>(std::move(meta_service_impl));
 }
 
@@ -70,23 +72,31 @@ int main(int argc, char** argv) {
     cloud::config::txn_store_retry_base_intervals_ms = 1;
     cloud::config::fdb_cluster_file_path = "fdb.cluster";
     cloud::config::write_schema_kv = true;
+    cloud::config::enable_check_instance_id = false;
+    cloud::config::enable_loopback_address_for_ms = true;
 
-    auto sp = cloud::SyncPoint::get_instance();
+    auto sp = SyncPoint::get_instance();
     sp->enable_processing();
-    sp->set_call_back("encrypt_ak_sk:get_encryption_key_ret",
-                      [](void* p) { *reinterpret_cast<int*>(p) = 0; });
-    sp->set_call_back("encrypt_ak_sk:get_encryption_key",
-                      [](void* p) { *reinterpret_cast<std::string*>(p) = "test"; });
-    sp->set_call_back("encrypt_ak_sk:get_encryption_key_id",
-                      [](void* p) { *reinterpret_cast<int*>(p) = 1; });
-    sp->set_call_back("decrypt_ak_sk:get_encryption_key_ret",
-                      [](void* p) { *reinterpret_cast<int*>(p) = 0; });
-    sp->set_call_back("decrypt_ak_sk:get_encryption_key",
-                      [](void* p) { *reinterpret_cast<std::string*>(p) = "test"; });
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "test";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "test";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
     sp->set_call_back("MetaServiceProxy::call_impl_duration_ms",
-                      [](void* raw) { *reinterpret_cast<uint64_t*>(raw) = 0; });
-    sp->set_call_back("put_schema_kv:schema_key_exists_return::pred",
-                      [](void* pred) { *reinterpret_cast<bool*>(pred) = true; });
+                      [](auto&& args) { *try_any_cast<uint64_t*>(args[0]) = 0; });
+    sp->set_call_back("put_schema_kv:schema_key_exists_return",
+                      [](auto&& args) { *try_any_cast<bool*>(args.back()) = true; });
+    sp->set_call_back("resource_manager::set_safe_drop_time",
+                      [](auto&& args) { *try_any_cast<int64_t*>(args[0]) = -1; });
 
     meta_service = create_meta_service();
 
@@ -139,18 +149,18 @@ int main(int argc, char** argv) {
 
             auto count = std::make_shared<std::atomic<uint64_t>>(0);
             auto inject_at = std::make_shared<std::atomic<uint64_t>>(0);
-            sp->set_call_back(name, [=](void* raw) mutable {
+            sp->set_call_back(name, [=](auto&& args) mutable {
                 size_t n = count->fetch_add(1);
                 if (n == *inject_at) {
-                    *reinterpret_cast<fdb_error_t*>(raw) = err;
+                    *try_any_cast<fdb_error_t*>(args[0]) = err;
                 }
             });
-            sp->set_call_back("MetaServiceProxy::call_impl:1", [=](void*) {
+            sp->set_call_back("MetaServiceProxy::call_impl:1", [=](auto&&) {
                 // For each RPC invoking, inject every fdb txn kv call.
                 count->store(0);
                 inject_at->store(0);
             });
-            sp->set_call_back("MetaServiceProxy::call_impl:2", [=](void*) {
+            sp->set_call_back("MetaServiceProxy::call_impl:2", [=](auto&&) {
                 count->store(0);
                 inject_at->fetch_add(1);
             });
@@ -345,7 +355,7 @@ static doris::TabletMetaCloudPB add_tablet(int64_t table_id, int64_t index_id, i
     return tablet;
 }
 
-static int create_tablet(MetaService* meta_service, const std::string& instance_id,
+static int create_tablet(MetaService* meta_service, const std::string& instance_id, int64_t db_id,
                          int64_t table_id, int64_t index_id, int64_t partition_id,
                          int64_t tablet_id) {
     if (tablet_id < 0) {
@@ -357,6 +367,7 @@ static int create_tablet(MetaService* meta_service, const std::string& instance_
     cloud::CreateTabletsRequest req;
     cloud::CreateTabletsResponse resp;
     req.set_cloud_unique_id(cloud_unique_id(instance_id));
+    req.set_db_id(db_id);
     req.add_tablet_metas()->CopyFrom(add_tablet(table_id, index_id, partition_id, tablet_id));
     meta_service->create_tablets(&ctrl, &req, &resp, nullptr);
     if (ctrl.Failed()) {
@@ -791,8 +802,8 @@ TEST(FdbInjectionTest, AllInOne) {
     int64_t partition_id = 1;
     std::vector<uint64_t> tablet_ids;
     for (int64_t tablet_id = 1; tablet_id <= 10; ++tablet_id) {
-        ret = create_tablet(meta_service.get(), instance_id, table_id, index_id, partition_id,
-                            tablet_id);
+        ret = create_tablet(meta_service.get(), instance_id, db_id, table_id, index_id,
+                            partition_id, tablet_id);
         ASSERT_EQ(ret, 0) << tablet_id;
         tablet_ids.push_back(tablet_id);
     }

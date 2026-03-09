@@ -23,10 +23,12 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Id;
 import org.apache.doris.common.Pair;
 import org.apache.doris.mtmv.MTMVCache;
+import org.apache.doris.mtmv.MTMVRelatedTableIf;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.rules.exploration.mv.mapping.ExpressionMapping;
 import org.apache.doris.nereids.trees.plans.ObjectId;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.PreAggStatus;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.algebra.Relation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
@@ -39,9 +41,12 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Async context for query rewrite by materialized view
@@ -50,14 +55,14 @@ public class AsyncMaterializationContext extends MaterializationContext {
 
     private static final Logger LOG = LogManager.getLogger(AsyncMaterializationContext.class);
     private final MTMV mtmv;
+    private Map<MTMVRelatedTableIf, Map<String, Set<String>>> partitionMultiFlatMap;
 
     /**
      * MaterializationContext, this contains necessary info for query rewriting by mv
      */
     public AsyncMaterializationContext(MTMV mtmv, Plan mvPlan, Plan mvOriginalPlan, List<Table> baseTables,
             List<Table> baseViews, CascadesContext cascadesContext, StructInfo structInfo) {
-        super(mvPlan, mvOriginalPlan, MaterializedViewUtils.generateMvScanPlan(mtmv, cascadesContext),
-                cascadesContext, structInfo);
+        super(mvPlan, mvOriginalPlan, cascadesContext, structInfo);
         this.mtmv = mtmv;
     }
 
@@ -67,12 +72,16 @@ public class AsyncMaterializationContext extends MaterializationContext {
 
     @Override
     Plan doGenerateScanPlan(CascadesContext cascadesContext) {
-        return MaterializedViewUtils.generateMvScanPlan(this.mtmv, cascadesContext);
+        return MaterializedViewUtils.generateMvScanPlan(this.mtmv, this.mtmv.getBaseIndexId(),
+                this.mtmv.getPartitionIds(), PreAggStatus.on(), cascadesContext);
     }
 
     @Override
-    List<String> getMaterializationQualifier() {
-        return this.mtmv.getFullQualifiers();
+    public List<String> generateMaterializationIdentifier() {
+        if (super.identifier == null) {
+            super.identifier = MaterializationContext.generateMaterializationIdentifier(mtmv, null);
+        }
+        return super.identifier;
     }
 
     @Override
@@ -88,7 +97,7 @@ public class AsyncMaterializationContext extends MaterializationContext {
             }
         }
         failReasonBuilder.append("\n").append("]");
-        return Utils.toSqlString("MaterializationContext[" + getMaterializationQualifier() + "]",
+        return Utils.toSqlString("MaterializationContext[" + generateMaterializationIdentifier() + "]",
                 "rewriteSuccess", this.success,
                 "failReason", failReasonBuilder.toString());
     }
@@ -98,13 +107,14 @@ public class AsyncMaterializationContext extends MaterializationContext {
         MTMVCache mtmvCache;
         try {
             mtmvCache = mtmv.getOrGenerateCache(cascadesContext.getConnectContext());
-        } catch (AnalysisException e) {
+        } catch (Exception e) {
             LOG.warn(String.format("get mv plan statistics fail, materialization qualifier is %s",
-                    getMaterializationQualifier()), e);
+                    generateMaterializationIdentifier()), e);
             return Optional.empty();
         }
         RelationId relationId = null;
-        Optional<LogicalOlapScan> logicalOlapScan = this.getScanPlan().collectFirst(LogicalOlapScan.class::isInstance);
+        Optional<LogicalOlapScan> logicalOlapScan = this.getScanPlan(null, cascadesContext)
+                .collectFirst(LogicalOlapScan.class::isInstance);
         if (logicalOlapScan.isPresent()) {
             relationId = logicalOlapScan.get().getRelationId();
         }
@@ -116,10 +126,17 @@ public class AsyncMaterializationContext extends MaterializationContext {
         if (!(relation instanceof PhysicalCatalogRelation)) {
             return false;
         }
-        return ((PhysicalCatalogRelation) relation).getTable() instanceof MTMV;
+        if (!(((PhysicalCatalogRelation) relation).getTable() instanceof MTMV)) {
+            return false;
+        }
+        return ((PhysicalCatalogRelation) relation).getTable().getFullQualifiers().equals(
+                this.generateMaterializationIdentifier()
+        );
     }
 
-    public Plan getScanPlan() {
+    @Override
+    public Plan getScanPlan(StructInfo queryInfo, CascadesContext cascadesContext) {
+        super.getScanPlan(queryInfo, cascadesContext);
         return scanPlan;
     }
 
@@ -162,5 +179,29 @@ public class AsyncMaterializationContext extends MaterializationContext {
 
     public boolean isSuccess() {
         return success;
+    }
+
+    /**
+     * Calculate partition mappings and cache
+     */
+    public Map<MTMVRelatedTableIf, Map<String, Set<String>>> calculatePartitionMappings() throws AnalysisException {
+        if (partitionMultiFlatMap != null) {
+            return partitionMultiFlatMap;
+        }
+        partitionMultiFlatMap = new HashMap<>();
+        Map<String, Map<MTMVRelatedTableIf, Set<String>>> partitionMultiMap = this.mtmv.calculatePartitionMappings();
+        for (Map.Entry<String, Map<MTMVRelatedTableIf, Set<String>>> entry : partitionMultiMap.entrySet()) {
+            String partitionKey = entry.getKey();
+            Map<MTMVRelatedTableIf, Set<String>> tableMap = entry.getValue();
+            for (Map.Entry<MTMVRelatedTableIf, Set<String>> tableEntry : tableMap.entrySet()) {
+                MTMVRelatedTableIf table = tableEntry.getKey();
+                Set<String> set = tableEntry.getValue();
+                partitionMultiFlatMap
+                        .computeIfAbsent(table, k -> new HashMap<>())
+                        .computeIfAbsent(partitionKey, k -> new HashSet<>())
+                        .addAll(set);
+            }
+        }
+        return partitionMultiFlatMap;
     }
 }

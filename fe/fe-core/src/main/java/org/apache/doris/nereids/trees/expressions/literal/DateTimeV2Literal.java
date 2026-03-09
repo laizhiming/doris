@@ -19,14 +19,16 @@ package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.exceptions.NotSupportedException;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.functions.executable.DateTimeExtractAndTransform;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
-import org.apache.doris.nereids.util.DateUtils;
-import org.apache.doris.nereids.util.StandardDateFormat;
-
-import com.google.common.base.Preconditions;
+import org.apache.doris.nereids.types.TimeStampTzType;
+import org.apache.doris.qe.ConnectContext;
 
 import java.time.LocalDateTime;
 import java.util.Objects;
@@ -35,6 +37,9 @@ import java.util.Objects;
  * date time v2 literal for nereids
  */
 public class DateTimeV2Literal extends DateTimeLiteral {
+
+    public static final DateTimeV2Literal USE_IN_FLOOR_CEIL
+            = new DateTimeV2Literal(0001L, 01L, 01L, 0L, 0L, 0L, 0L);
 
     public DateTimeV2Literal(String s) {
         this(DateTimeV2Type.forTypeFromString(s), s);
@@ -59,35 +64,6 @@ public class DateTimeV2Literal extends DateTimeLiteral {
         roundMicroSecond(dateType.getScale());
     }
 
-    private void roundMicroSecond(int scale) {
-        Preconditions.checkArgument(scale >= 0 && scale <= DateTimeV2Type.MAX_SCALE,
-                "invalid datetime v2 scale: %s", scale);
-        double factor = Math.pow(10, 6 - scale);
-
-        this.microSecond = Math.round(this.microSecond / factor) * (int) factor;
-
-        if (this.microSecond >= 1000000) {
-            LocalDateTime localDateTime = DateUtils.getTime(StandardDateFormat.DATE_TIME_FORMATTER_TO_MICRO_SECOND,
-                    getStringValue()).plusSeconds(1);
-            this.year = localDateTime.getYear();
-            this.month = localDateTime.getMonthValue();
-            this.day = localDateTime.getDayOfMonth();
-            this.hour = localDateTime.getHour();
-            this.minute = localDateTime.getMinute();
-            this.second = localDateTime.getSecond();
-            this.microSecond -= 1000000;
-        }
-        if (checkRange() || checkDate()) {
-            // may fallback to legacy planner. make sure the behaviour of rounding is same.
-            throw new AnalysisException("datetime literal [" + toString() + "] is out of range");
-        }
-    }
-
-    public String getFullMicroSecondValue() {
-        return String.format("%04d-%02d-%02d %02d:%02d:%02d.%06d",
-                year, month, day, hour, minute, second, microSecond);
-    }
-
     @Override
     public DateTimeV2Type getDataType() throws UnboundException {
         return (DateTimeV2Type) super.getDataType();
@@ -102,6 +78,11 @@ public class DateTimeV2Literal extends DateTimeLiteral {
     public LiteralExpr toLegacyLiteral() {
         return new org.apache.doris.analysis.DateLiteral(year, month, day, hour, minute, second, microSecond,
                 getDataType().toCatalogDataType());
+    }
+
+    @Override
+    public double getDouble() {
+        return super.getDouble() + microSecond / 1000000.0;
     }
 
     @Override
@@ -179,16 +160,79 @@ public class DateTimeV2Literal extends DateTimeLiteral {
                 (int) (microSecond / Math.pow(10, DateTimeV2Type.MAX_SCALE - scale)));
     }
 
-    public String getMicrosecondString() {
-        if (microSecond == 0) {
-            return "0";
+    @Override
+    protected Expression uncheckedCastTo(DataType targetType) throws AnalysisException {
+        if (this.dataType.equals(targetType)) {
+            return this;
         }
-        return String.format("%0" + getDataType().getScale() + "d",
-                (int) (microSecond / Math.pow(10, DateTimeV2Type.MAX_SCALE - getDataType().getScale())));
+        if (targetType.isDateTimeType()) {
+            return new DateTimeLiteral((DateTimeType) targetType,
+                    year, month, day, hour, minute, second, microSecond);
+        }
+        if (targetType.isTimeStampTzType()) {
+            DateTimeV2Literal dtV2Lit = (DateTimeV2Literal) (DateTimeExtractAndTransform.convertTz(
+                    this,
+                    new StringLiteral(ConnectContext.get().getSessionVariable().timeZone),
+                    new StringLiteral("UTC")));
+            return new TimestampTzLiteral((TimeStampTzType) targetType,
+                    dtV2Lit.getYear(), dtV2Lit.getMonth(), dtV2Lit.getDay(),
+                    dtV2Lit.getHour(), dtV2Lit.getMinute(), dtV2Lit.getSecond(), dtV2Lit.getMicroSecond());
+        }
+        return super.uncheckedCastTo(targetType);
     }
 
     public Expression plusDays(long days) {
         return fromJavaDateType(toJavaDateType().plusDays(days), getDataType().getScale());
+    }
+
+    /**
+     * plusDaySecond
+     */
+    public Expression plusDaySecond(VarcharLiteral daySecond) {
+        String stringValue = daySecond.getStringValue().trim();
+
+        if (!stringValue.matches("[0-9:\\-\\s]+")) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String[] split = stringValue.split("\\s+");
+        if (split.length != 2) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String day = split[0];
+        String[] hourMinuteSecond = split[1].split(":");
+
+        if (hourMinuteSecond.length != 3) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        try {
+            long days = Long.parseLong(day);
+            boolean dayPositive = days >= 0;
+
+            long hours = Long.parseLong(hourMinuteSecond[0]);
+            long minutes = Long.parseLong(hourMinuteSecond[1]);
+            long seconds = Long.parseLong(hourMinuteSecond[2]);
+
+            if (dayPositive) {
+                hours = Math.abs(hours);
+                minutes = Math.abs(minutes);
+                seconds = Math.abs(seconds);
+            } else {
+                hours = -Math.abs(hours);
+                minutes = -Math.abs(minutes);
+                seconds = -Math.abs(seconds);
+            }
+
+            return fromJavaDateType(toJavaDateType()
+                .plusDays(days)
+                .plusHours(hours)
+                .plusMinutes(minutes)
+                .plusSeconds(seconds), getDataType().getScale());
+        } catch (NumberFormatException e) {
+            throw new NotSupportedException("Invalid time format");
+        }
     }
 
     public Expression plusMonths(long months) {
@@ -215,8 +259,140 @@ public class DateTimeV2Literal extends DateTimeLiteral {
         return fromJavaDateType(toJavaDateType().plusSeconds(seconds), getDataType().getScale());
     }
 
+    /**
+     * plusDaySecond
+     */
+    public Expression plusDayHour(VarcharLiteral dayHour) {
+        String stringValue = dayHour.getStringValue().trim();
+
+        if (!stringValue.matches("[0-9\\-\\s]+")) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String[] split = stringValue.split("\\s+");
+        if (split.length != 2) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String day = split[0];
+        String hour = split[1];
+
+        try {
+            long days = Long.parseLong(day);
+            boolean dayPositive = days >= 0;
+
+            long hours = Long.parseLong(hour);
+
+            if (dayPositive) {
+                hours = Math.abs(hours);
+            } else {
+                hours = -Math.abs(hours);
+            }
+
+            return fromJavaDateType(toJavaDateType()
+                .plusDays(days)
+                .plusHours(hours), getDataType().getScale());
+        } catch (NumberFormatException e) {
+            throw new NotSupportedException("Invalid time format");
+        }
+    }
+
+    /**
+     * plusMinuteSecond
+     */
+    public Expression plusMinuteSecond(VarcharLiteral minuteSecond) {
+        String stringValue = minuteSecond.getStringValue().trim();
+
+        if (!stringValue.matches("[0-9\\-:\\s]+")) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String[] split = stringValue.split(":");
+        if (split.length != 2) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String minute = split[0].trim();
+        String second = split[1].trim();
+
+        try {
+            long minutes = Long.parseLong(minute);
+            boolean minutePositive = minutes >= 0;
+
+            long seconds = Long.parseLong(second);
+
+            if (minutePositive) {
+                seconds = Math.abs(seconds);
+            } else {
+                seconds = -Math.abs(seconds);
+            }
+
+            return fromJavaDateType(toJavaDateType()
+                .plusMinutes(minutes)
+                .plusSeconds(seconds), getDataType().getScale());
+        } catch (NumberFormatException e) {
+            throw new NotSupportedException("Invalid time format");
+        }
+    }
+
+    /**
+     * plusSecondMicrosecond
+     */
+    public Expression plusSecondMicrosecond(VarcharLiteral secondMicrosecond) {
+        String stringValue = secondMicrosecond.getStringValue().trim();
+
+        if (!stringValue.matches("[0-9\\-\\.\\s]+")) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String[] split = stringValue.split("\\.");
+        if (split.length != 2) {
+            throw new NotSupportedException("Invalid time format");
+        }
+
+        String second = split[0].trim();
+        String microsecond = split[1].trim();
+
+        try {
+            long seconds = Long.parseLong(second);
+            boolean secondPositive = seconds >= 0;
+
+            long microseconds = Long.parseLong(microsecond);
+            int microsecondLen = microsecond.startsWith("-") ? microsecond.length() - 1 : microsecond.length();
+            if (microsecondLen < 6) {
+                microseconds *= Math.pow(10, 6 - microsecondLen);
+            }
+
+            if (secondPositive) {
+                microseconds = Math.abs(microseconds);
+            } else {
+                microseconds = -Math.abs(microseconds);
+            }
+
+            return fromJavaDateType(toJavaDateType()
+                .plusSeconds(seconds)
+                .plusNanos(Math.multiplyExact(microseconds, 1000L)), getDataType().getScale());
+        } catch (NumberFormatException e) {
+            throw new NotSupportedException("Invalid time format");
+        }
+    }
+
+    // When performing addition or subtraction with MicroSeconds, the precision must be set to 6 to display it
+    // completely. use multiplyExact to be aware of multiplication overflow possibility.
     public Expression plusMicroSeconds(long microSeconds) {
-        return fromJavaDateType(toJavaDateType().plusNanos(microSeconds * 1000L), getDataType().getScale());
+        return fromJavaDateType(toJavaDateType().plusNanos(Math.multiplyExact(microSeconds, 1000L)), 6);
+    }
+
+    public Expression plusMilliSeconds(long microSeconds) {
+        return plusMicroSeconds(Math.multiplyExact(microSeconds, 1000L));
+    }
+
+    public int getScale() {
+        return ((DateTimeV2Type) dataType).getScale();
+    }
+
+    public int commonScale(DateTimeV2Literal other) {
+        return (int) Math.max(getScale(), other.getScale());
     }
 
     /**
@@ -239,7 +415,12 @@ public class DateTimeV2Literal extends DateTimeLiteral {
         }
         if (newMicroSecond > MAX_MICROSECOND) {
             newMicroSecond %= newMicroSecond;
-            DateTimeV2Literal result = (DateTimeV2Literal) this.plusSeconds(1);
+            Expression plus1Second = this.plusSeconds(1);
+            if (plus1Second.isNullLiteral()) {
+                throw new AnalysisException("round ceil datetime literal (" + toString() + ", "
+                        + newScale + ") is out of range");
+            }
+            DateTimeV2Literal result = (DateTimeV2Literal) plus1Second;
             newSecond = result.second;
             newMinute = result.minute;
             newHour = result.hour;
@@ -257,7 +438,7 @@ public class DateTimeV2Literal extends DateTimeLiteral {
     }
 
     public static Expression fromJavaDateType(LocalDateTime dateTime) {
-        return fromJavaDateType(dateTime, 0);
+        return fromJavaDateType(dateTime, 6);
     }
 
     /**
@@ -265,9 +446,10 @@ public class DateTimeV2Literal extends DateTimeLiteral {
      */
     public static Expression fromJavaDateType(LocalDateTime dateTime, int precision) {
         long value = (long) Math.pow(10, DateTimeV2Type.MAX_SCALE - precision);
-        return isDateOutOfRange(dateTime)
-                ? new NullLiteral(DateTimeV2Type.of(precision))
-                : new DateTimeV2Literal(DateTimeV2Type.of(precision), dateTime.getYear(),
+        if (isDateOutOfRange(dateTime)) {
+            throw new AnalysisException("datetime out of range" + dateTime.toString());
+        }
+        return new DateTimeV2Literal(DateTimeV2Type.of(precision), dateTime.getYear(),
                         dateTime.getMonthValue(), dateTime.getDayOfMonth(), dateTime.getHour(),
                         dateTime.getMinute(), dateTime.getSecond(),
                         (dateTime.getNano() / 1000) / value * value);
@@ -285,6 +467,6 @@ public class DateTimeV2Literal extends DateTimeLiteral {
             return false;
         }
         DateTimeV2Literal literal = (DateTimeV2Literal) o;
-        return Objects.equals(dataType, literal.dataType);
+        return Objects.equals(dataType, literal.dataType) && Objects.equals(microSecond, literal.microSecond);
     }
 }

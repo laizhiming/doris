@@ -19,7 +19,8 @@
 // /testing/trino-product-tests/src/main/resources/sql-tests/testcases/tpcds
 // and modified by Doris.
 
-
+import static java.util.concurrent.TimeUnit.SECONDS
+import org.awaitility.Awaitility
 
 suite("flink_connector") {
 
@@ -41,10 +42,26 @@ suite("flink_connector") {
         return
     }
 
-    def run_cmd = "java -cp flink-doris-demo.jar com.doris.DorisFlinkDfSinkDemo $context.config.feHttpAddress regression_test_flink_connector_p0.$tableName $context.config.feHttpUser"
+    def systemJavaPath = ["bash", "-c", "which java"].execute().text.trim()
+    logger.info("System java path: ${systemJavaPath}")
+
+    def runtimeJavaHome = System.getProperty("java.home")
+    logger.info("Runtime java home: ${runtimeJavaHome}")
+    def javaPath = "${runtimeJavaHome}/bin/java"
+
+    def javaVersion = System.getProperty("java.version")
+    logger.info("Runtime java version: ${javaVersion}")
+
+    def run_cmd = "${javaPath} -cp flink-doris-demo.jar com.doris.DorisFlinkDfSinkDemo $context.config.feHttpAddress regression_test_flink_connector_p0.$tableName $context.config.feHttpUser"
     logger.info("run_cmd : $run_cmd")
     def run_flink_jar = run_cmd.execute().getText()
     logger.info("result: $run_flink_jar")
+    // The publish in the commit phase is asynchronous
+    Awaitility.await().atMost(30, SECONDS).pollInterval(1, SECONDS).await().until(
+            {
+                def result = sql """ select count(1) from $tableName"""
+                logger.info("retry count: $result")
+                result.size() >= 1
+            })
     qt_select """ select * from $tableName order by order_id"""
-
 }

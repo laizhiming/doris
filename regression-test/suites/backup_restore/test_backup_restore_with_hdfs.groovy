@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_backup_restore_with_hdfs", "backup_restore") {
+suite("test_backup_restore_with_hdfs", "backup_restore,external") {
     String suiteName = "test_backup_restore_with_hdfs"
 
     if (!enableHdfs()) {
@@ -23,7 +23,7 @@ suite("test_backup_restore_with_hdfs", "backup_restore") {
         return
     }
 
-    String repoName = "${suiteName}_repo"
+    String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbName = "${suiteName}_db"
     String tableName = "${suiteName}_table"
     String snapshotName = "${suiteName}_snapshot"

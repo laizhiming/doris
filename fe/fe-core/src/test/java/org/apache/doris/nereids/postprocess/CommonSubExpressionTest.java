@@ -20,42 +20,66 @@ package org.apache.doris.nereids.postprocess;
 import org.apache.doris.nereids.processor.post.CommonSubExpressionCollector;
 import org.apache.doris.nereids.processor.post.CommonSubExpressionOpt;
 import org.apache.doris.nereids.rules.expression.ExpressionRewriteTestHelper;
+import org.apache.doris.nereids.trees.expressions.Add;
 import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.And;
+import org.apache.doris.nereids.trees.expressions.ArrayItemReference;
+import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.ArrayMap;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.Lambda;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
+import org.apache.doris.nereids.types.ArrayType;
 import org.apache.doris.nereids.types.IntegerType;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 public class CommonSubExpressionTest extends ExpressionRewriteTestHelper {
     @Test
     public void testExtractCommonExpr() {
         List<NamedExpression> exprs = parseProjections("a+b, a+b+1, abs(a+b+1), a");
-        CommonSubExpressionCollector collector =
-                new CommonSubExpressionCollector();
+        CommonSubExpressionCollector collector = new CommonSubExpressionCollector();
         exprs.forEach(expr -> collector.visit(expr, null));
-        System.out.println(collector.commonExprByDepth);
         Assertions.assertEquals(2, collector.commonExprByDepth.size());
-        List<Expression> l1 = collector.commonExprByDepth.get(Integer.valueOf(1))
-                .stream().collect(Collectors.toList());
-        List<Expression> l2 = collector.commonExprByDepth.get(Integer.valueOf(2))
-                .stream().collect(Collectors.toList());
+        List<Expression> l1 = new ArrayList<>(collector.commonExprByDepth.get(1));
+        List<Expression> l2 = new ArrayList<>(collector.commonExprByDepth.get(2));
         Assertions.assertEquals(1, l1.size());
         assertExpression(l1.get(0), "a+b");
         Assertions.assertEquals(1, l2.size());
         assertExpression(l2.get(0), "a+b+1");
+    }
+
+    @Test
+    void testLambdaExpression() {
+        ArrayItemReference ref = new ArrayItemReference("x", new SlotReference(new ExprId(1), "y",
+                ArrayType.of(IntegerType.INSTANCE), true, ImmutableList.of()));
+        Expression add = new Add(ref.toSlot(), Literal.of(1));
+        Expression and = new And(add, add);
+        ArrayMap arrayMap = new ArrayMap(new Lambda(ImmutableList.of("x"), and, ImmutableList.of(ref)));
+        List<NamedExpression> exprs = Lists.newArrayList(
+                new Alias(new ExprId(10000), arrayMap, "c1"),
+                new Alias(new ExprId(10001), arrayMap, "c2")
+        );
+        CommonSubExpressionCollector collector = new CommonSubExpressionCollector();
+        exprs.forEach(expr -> collector.visit(expr, false));
+        Assertions.assertEquals(1, collector.commonExprByDepth.size());
+        Assertions.assertEquals(1, collector.commonExprByDepth.get(4).size());
+        Assertions.assertEquals(arrayMap, collector.commonExprByDepth.get(4).iterator().next());
     }
 
     @Test
@@ -68,15 +92,14 @@ public class CommonSubExpressionTest extends ExpressionRewriteTestHelper {
         computeMultLayerProjectionsMethod.setAccessible(true);
         List<List<NamedExpression>> multiLayers = (List<List<NamedExpression>>) computeMultLayerProjectionsMethod
                 .invoke(opt, inputSlots, exprs);
-        System.out.println(multiLayers);
         Assertions.assertEquals(3, multiLayers.size());
         List<NamedExpression> l0 = multiLayers.get(0);
         Assertions.assertEquals(2, l0.size());
         Assertions.assertTrue(l0.contains(ExprParser.INSTANCE.parseExpression("a")));
-        Assertions.assertTrue(l0.get(1) instanceof Alias);
+        Assertions.assertInstanceOf(Alias.class, l0.get(1));
         assertExpression(l0.get(1).child(0), "a+b");
-        Assertions.assertEquals(multiLayers.get(1).size(), 3);
-        Assertions.assertEquals(multiLayers.get(2).size(), 5);
+        Assertions.assertEquals(3, multiLayers.get(1).size());
+        Assertions.assertEquals(5, multiLayers.get(2).size());
         List<NamedExpression> l2 = multiLayers.get(2);
         for (int i = 0; i < 5; i++) {
             Assertions.assertEquals(exprs.get(i).getExprId().asInt(), l2.get(i).getExprId().asInt());
@@ -128,4 +151,53 @@ public class CommonSubExpressionTest extends ExpressionRewriteTestHelper {
         }
     }
 
+    @Test
+    public void testCaseWhenSubExprExtracted() {
+        // a+b appears 4 times inside CASE WHEN, should be collected as common sub-expression
+        // WhenClause itself should NOT be collected
+        List<NamedExpression> exprs = parseProjections(
+                "CASE WHEN (a+b > 10) THEN (a+b) WHEN (a+b > 5) THEN (a+b) ELSE 0 END");
+        CommonSubExpressionCollector collector = new CommonSubExpressionCollector();
+        exprs.forEach(expr -> collector.collect(expr));
+
+        // a+b is at depth 1 and appears multiple times → should be in commonExprByDepth
+        Assertions.assertFalse(collector.commonExprByDepth.isEmpty(),
+                "a+b should be collected as common sub-expression");
+        Set<Expression> depth1 = collector.commonExprByDepth.get(1);
+        Assertions.assertNotNull(depth1, "common expressions at depth 1 should exist");
+        Assertions.assertEquals(1, depth1.size());
+        assertExpression(depth1.iterator().next(), "a+b");
+
+        // no WhenClause should appear in commonExprByDepth at any depth
+        for (Set<Expression> exprsAtDepth : collector.commonExprByDepth.values()) {
+            for (Expression e : exprsAtDepth) {
+                Assertions.assertFalse(e instanceof org.apache.doris.nereids.trees.expressions.WhenClause,
+                        "WhenClause should not be collected as common sub-expression");
+            }
+        }
+    }
+
+    @Test
+    public void testEmptyLayerWhenOnlyWhenClauseIsCommon() throws Exception {
+        // two identical WhenClause(false, null), no slot references
+        List<NamedExpression> exprs = parseProjections(
+                "CASE WHEN false THEN null WHEN false THEN null ELSE 1 END");
+        Set<Slot> inputSlots = new HashSet<>();
+
+        CommonSubExpressionOpt opt = new CommonSubExpressionOpt();
+        Method method = CommonSubExpressionOpt.class
+                .getDeclaredMethod("computeMultiLayerProjections", Set.class, List.class);
+        method.setAccessible(true);
+
+        List<List<NamedExpression>> multiLayers =
+                (List<List<NamedExpression>>) method.invoke(opt, inputSlots, exprs);
+
+        // Bug: multiLayers = [[], [CASE...]]  — l0 is empty
+        // Expected: either multiLayers is empty (no useful CSE),
+        //           or every layer is non-empty
+        for (List<NamedExpression> layer : multiLayers) {
+            Assertions.assertFalse(layer.isEmpty(),
+                    "intermediate layer should not be empty");
+        }
+    }
 }

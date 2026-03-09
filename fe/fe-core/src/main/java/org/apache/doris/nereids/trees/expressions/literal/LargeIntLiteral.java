@@ -22,6 +22,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.LargeIntType;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Objects;
 
@@ -32,8 +33,16 @@ public class LargeIntLiteral extends IntegerLikeLiteral {
 
     private final BigInteger value;
 
+    /**
+     * LargeIntLiteral
+     * @param value Value.
+     */
     public LargeIntLiteral(BigInteger value) {
         super(LargeIntType.INSTANCE);
+        if (value.compareTo(LargeIntType.MAX_VALUE) > 0 || value.compareTo(LargeIntType.MIN_VALUE) < 0) {
+            throw new org.apache.doris.nereids.exceptions.AnalysisException(
+                    "Can not create LargeIntLiteral by value : " + value);
+        }
         this.value = Objects.requireNonNull(value);
     }
 
@@ -60,6 +69,11 @@ public class LargeIntLiteral extends IntegerLikeLiteral {
     @Override
     public double getDouble() {
         return value.doubleValue();
+    }
+
+    @Override
+    public BigDecimal getBigDecimalValue() {
+        return new BigDecimal(value);
     }
 
     @Override

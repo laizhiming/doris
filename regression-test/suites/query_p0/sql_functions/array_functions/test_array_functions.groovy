@@ -72,20 +72,20 @@ suite("test_array_functions") {
     qt_select_array_reverse_sort1 "SELECT k1, array_reverse_sort(k2), array_reverse_sort(k3), array_reverse_sort(k4) FROM ${tableName} ORDER BY k1"
     qt_select_array_reverse_sort2 "SELECT k1, array_reverse_sort(k8), array_reverse_sort(k10) FROM ${tableName} ORDER BY k1"
     qt_select_array_reverse_sort3 "SELECT k1, array_reverse_sort(k12) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_union(k2, k4) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_union(k8, k9) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_union(k10, k11) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_union(k12, k13) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_union(k2, k4)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_union(k8, k9)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_union(k10, k11)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_union(k12, k13)) FROM ${tableName} ORDER BY k1"
     // multi-params array_union
-    qt_select "SELECT k1, array_union(k2, k4, k14) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_except(k2, k4) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_except(k8, k9) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_except(k10, k11) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_except(k12, k13) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_intersect(k2, k4) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_intersect(k8, k9) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_intersect(k10, k11) FROM ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array_intersect(k12, k13) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_union(k2, k4, k14)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_except(k2, k4)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_except(k8, k9)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_except(k10, k11)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_except(k12, k13)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_intersect(k2, k4)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_intersect(k8, k9)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_intersect(k10, k11)) FROM ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array_sort(array_intersect(k12, k13)) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_slice(k2, 2) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_slice(k2, 1, 2) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_slice(k8, 1, 2) FROM ${tableName} ORDER BY k1"
@@ -150,7 +150,7 @@ suite("test_array_functions") {
     qt_select_array_with_constant4 "SELECT k1, array_with_constant(2, 123), array_repeat(123, 2) from ${tableName} ORDER BY k1"
     qt_select_array_with_constant5 "SELECT k1, array_with_constant(k1, 3), array_repeat(3, k1) from ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array(2, k1) from ${tableName} ORDER BY k1"
-    qt_select "SELECT k1, array(k1, null, '2020-01-01') from ${tableName} ORDER BY k1"
+    qt_select "SELECT k1, array(k1, null, '2020') from ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array(null, k1) from ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_position(k2, 5) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_position(k3, 'a') FROM ${tableName} ORDER BY k1"
@@ -248,6 +248,19 @@ suite("test_array_functions") {
     qt_select "SELECT k1, array_pushback(k10, cast('2023-03-08 10:30:00.999' as datetimev2(3))) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_pushback(k10, null) FROM ${tableName} ORDER BY k1"
     qt_select "SELECT k1, array_pushback(k12, null) FROM ${tableName} ORDER BY k1"
+    // test array_pushback alias array_append
+    qt_array_append "SELECT k1, array_append(k2, k1) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k2, 1) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k3, 'a') FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k3, null) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k4, null) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k5, 'hi') FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k5, 'hi222') FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k6, null) from ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k8, cast('2023-03-05' as datev2)) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k10, cast('2023-03-08 10:30:00.999' as datetimev2(3))) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k10, null) FROM ${tableName} ORDER BY k1"
+    qt_array_append "SELECT k1, array_append(k12, null) FROM ${tableName} ORDER BY k1"
 
     qt_select "select k2, bitmap_to_string(bitmap_from_array(k2)) from ${tableName} order by k1;"
     
@@ -271,12 +284,12 @@ suite("test_array_functions") {
     sql """ insert into ${tableName3} values (10005,'aaaaa',[10005,null,null]) """
     sql """ insert into ${tableName3} values (10006,'bbbbb',[60002,60002,60003,null,60005]) """
     
-    qt_select_union "select class_id, student_ids, array_union(student_ids,[1,2,3]) from ${tableName3} order by class_id;"
-    qt_select_union_left_const "select class_id, student_ids, array_union([1,2,3], student_ids,[1,2,3]) from ${tableName3} order by class_id;"
-    qt_select_except "select class_id, student_ids, array_except(student_ids,[1,2,3]) from ${tableName3} order by class_id;"
-    qt_select_except_left_const "select class_id, student_ids, array_except([1,2,3], student_ids) from ${tableName3} order by class_id;"
-    qt_select_intersect "select class_id, student_ids, array_intersect(student_ids,[1,2,3,null]) from ${tableName3} order by class_id;"
-    qt_select_intersect_left_const "select class_id, student_ids, array_intersect([1,2,3,null], student_ids) from ${tableName3} order by class_id;"
+    qt_select_union "select class_id, student_ids, array_sort(array_union(student_ids,[1,2,3])) from ${tableName3} order by class_id;"
+    qt_select_union_left_const "select class_id, student_ids, array_sort(array_union([1,2,3], student_ids,[1,2,3])) from ${tableName3} order by class_id;"
+    qt_select_except "select class_id, student_ids, array_sort(array_except(student_ids,[1,2,3])) from ${tableName3} order by class_id;"
+    qt_select_except_left_const "select class_id, student_ids, array_sort(array_except([1,2,3], student_ids)) from ${tableName3} order by class_id;"
+    qt_select_intersect "select class_id, student_ids, array_sort(array_intersect(student_ids,[1,2,3,null])) from ${tableName3} order by class_id;"
+    qt_select_intersect_left_const "select class_id, student_ids, array_sort(array_intersect([1,2,3,null], student_ids)) from ${tableName3} order by class_id;"
 
     def tableName4 = "tbl_test_array_datetimev2_functions"
 
@@ -353,8 +366,8 @@ suite("test_array_functions") {
                 `k3` int(11) NULL COMMENT "",
                 `k4` datetimev2(0) NULL COMMENT "",
                 `k5` datetimev2(3) NULL COMMENT "",
-                `k6` datetimev2(6) NULL COMMENT "",              
-                `step` int(11) NULL COMMENT ""              
+                `k6` datetimev2(6) NULL COMMENT "",
+                `step` int(11) NULL COMMENT ""
             ) ENGINE=OLAP
             DUPLICATE KEY(`test_id`)
             DISTRIBUTED BY HASH(`test_id`) BUCKETS 1
@@ -421,4 +434,41 @@ suite("test_array_functions") {
     qt_const_select "select sequence(cast('2022-35-38 12:00:10' as datetimev2(0)), cast('2022-05-18 22:00:30' as datetimev2(0))); "
     qt_const_select "select sequence(1, 10, 0); "
     qt_const_select "select sequence(cast('2022-05-15 12:00:00' as datetimev2(0)), cast('2022-05-17 12:00:00' as datetimev2(0)), interval 0 day); "
+    qt_const_select """select sequence("2022-05-18T12:00:00.123", "2022-05-18T12:16:00.123", interval 5 minute); """
+
+
+
+    sql"""
+        DROP TABLE IF EXISTS db_test_array_join;
+    """
+
+
+    sql"""
+ CREATE TABLE IF NOT EXISTS db_test_array_join (
+              `id` INT(11) NUll COMMENT "",
+              `sarr` array<String>  NUll COMMENT "",
+              `s1` String  NUll COMMENT "",
+              `s2` String  NUll COMMENT ""
+            ) ENGINE=OLAP
+            DUPLICATE KEY(`id`)
+            DISTRIBUTED BY HASH(`id`) BUCKETS 1
+            PROPERTIES (
+            "replication_allocation" = "tag.location.default: 1",
+            "storage_format" = "V2"
+);
+
+    """
+
+    sql"""
+insert into db_test_array_join values(1,["a","b","c"],"0000","?") , (2,["c","d","e"] , "11111" , "??") , (3,["f",null,"g"] ,"222222", "???");
+    """
+
+    qt_array_join_1 """
+        select id, array_join(sarr,s1) from db_test_array_join order by id;
+    """
+
+    qt_array_join_2 """
+        select id , array_join(sarr,s1,s2) from db_test_array_join order by id;
+    """
+
 }

@@ -22,11 +22,11 @@
 #include <utility>
 
 #include "common/config.h"
+#include "common/metrics/doris_metrics.h"
+#include "common/metrics/metrics.h"
 #include "common/status.h"
 #include "runtime/record_batch_queue.h"
-#include "util/doris_metrics.h"
 #include "util/hash_util.hpp"
-#include "util/metrics.h"
 
 namespace doris {
 
@@ -82,8 +82,10 @@ void ResultQueueMgr::create_queue(const TUniqueId& fragment_instance_id,
     if (iter != _fragment_queue_map.end()) {
         *queue = iter->second;
     } else {
-        // the blocking queue size = 20 (default), in this way, one queue have 20 * 1024 rows at most
-        BlockQueueSharedPtr tmp(new RecordBatchQueue(config::max_memory_sink_batch_count));
+        // max_elements will not take effect, because when queue size reaches max_memory_sink_batch_count,
+        // MemoryScratchSink will block queue dependency, in this way, one queue have 20 * 1024 rows at most.
+        // use MemoryScratchSink queue dependency instead of BlockingQueue to achieve blocking.
+        BlockQueueSharedPtr tmp(new RecordBatchQueue(config::max_memory_sink_batch_count * 2));
         _fragment_queue_map.insert(std::make_pair(fragment_instance_id, tmp));
         *queue = tmp;
     }

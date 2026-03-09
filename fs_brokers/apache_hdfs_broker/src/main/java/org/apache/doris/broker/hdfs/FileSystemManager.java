@@ -60,8 +60,6 @@ import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 
 public class FileSystemManager {
 
@@ -152,6 +150,7 @@ public class FileSystemManager {
     private static final String FS_BOS_SECRET_KEY = "fs.bos.secret.access.key";
     private static final String FS_BOS_ENDPOINT = "fs.bos.endpoint";
     private static final String FS_BOS_IMPL = "fs.bos.impl";
+    private static final String FS_BOS_IMPL_DISABLE_CACHE = "fs.bos.impl.disable.cache";
     private static final String FS_BOS_MULTIPART_UPLOADS_BLOCK_SIZE = "fs.bos.multipart.uploads.block.size";
 
     // arguments for afs
@@ -159,6 +158,7 @@ public class FileSystemManager {
     private static final String HADOOP_JOB_UGI = "hadoop.job.ugi";
     private static final String FS_DEFAULT_NAME = "fs.default.name";
     private static final String FS_AFS_IMPL = "fs.afs.impl";
+    private static final String FS_AFS_IMPL_DISABLE_CACHE = "fs.afs.impl.disable.cache";
     private static final String DFS_AGENT_PORT = "dfs.agent.port";
     private static final String DFS_CLIENT_AUTH_METHOD = "dfs.client.auth.method";
     private static final String DFS_RPC_TIMEOUT = "dfs.rpc.timeout";
@@ -234,6 +234,8 @@ public class FileSystemManager {
             brokerFileSystem = getGooseFSFileSystem(path, properties);
         } else if (scheme.equals(GCS_SCHEME)) {
             brokerFileSystem = getGCSFileSystem(path, properties);
+        } else if (scheme.equals(AFS_SCHEME)) {
+            brokerFileSystem = getAfsFileSystem(path, properties);
         } else {
             throw new BrokerException(TBrokerOperationStatusCode.INVALID_INPUT_FILE_PATH,
                 "invalid path. scheme is not supported");
@@ -662,7 +664,7 @@ public class FileSystemManager {
      */
     public BrokerFileSystem getChdfsFileSystem(String path, Map<String, String> properties) {
         WildcardURI pathUri = new WildcardURI(path);
-        String host = CHDFS_SCHEME;
+        String host = CHDFS_SCHEME + "://" + pathUri.getAuthority();
         String authentication = properties.getOrDefault(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,
                 AUTHENTICATION_SIMPLE);
         if (Strings.isNullOrEmpty(authentication) || (!authentication.equals(AUTHENTICATION_SIMPLE)
@@ -845,6 +847,7 @@ public class FileSystemManager {
                 conf.set(FS_BOS_SECRET_KEY, secretKey);
                 conf.set(FS_BOS_ENDPOINT, endpoint);
                 conf.set(FS_BOS_IMPL, "org.apache.hadoop.fs.bos.BaiduBosFileSystem");
+                conf.set(FS_BOS_IMPL_DISABLE_CACHE, "true");
                 conf.set(FS_BOS_MULTIPART_UPLOADS_BLOCK_SIZE, multiPartUploadBlockSize);
                 FileSystem bosFileSystem = FileSystem.get(pathUri.getUri(), conf);
                 fileSystem.setFileSystem(bosFileSystem);
@@ -1008,7 +1011,8 @@ public class FileSystemManager {
                 conf.set(HADOOP_JOB_UGI, afsUgi);
                 conf.set(HADOOP_JOB_GROUP_NAME, group);
                 conf.set(FS_DEFAULT_NAME, host);
-                conf.set(FS_AFS_IMPL, "org.apache.hadoop.fs.DFileSystem");
+                conf.set(FS_AFS_IMPL, properties.getOrDefault(FS_AFS_IMPL, "org.apache.hadoop.fs.LiteFileSystem"));
+                conf.set(FS_AFS_IMPL_DISABLE_CACHE, "true");
                 conf.set(DFS_CLIENT_AUTH_METHOD, properties.getOrDefault(DFS_CLIENT_AUTH_METHOD, "3"));
                 conf.set(DFS_AGENT_PORT, properties.getOrDefault(DFS_AGENT_PORT, "20001"));
                 conf.set(DFS_RPC_TIMEOUT, properties.getOrDefault(DFS_RPC_TIMEOUT, "300000"));
@@ -1377,35 +1381,32 @@ public class FileSystemManager {
     /**
      *   In view of the different expiration mechanisms of different authentication modes，
      *   there are two ways to determine whether BrokerFileSystem has expired:
-     *   1. For the authentication mode of Kerberos and S3 aksk, use the createTime to determine whether it expires
+     *   1. For the authentication mode of Kerberos and S3 aksk, use the end time of TGT to determine whether it expires
      *   2. For other authentication modes, the lastAccessTime is used to determine whether it has expired
      */
     private BrokerFileSystem updateCachedFileSystem(FileSystemIdentity fileSystemIdentity, Map<String, String> properties) {
         BrokerFileSystem brokerFileSystem;
         if (cachedFileSystem.containsKey(fileSystemIdentity)) {
             brokerFileSystem = cachedFileSystem.get(fileSystemIdentity);
-            if (properties.containsKey(KERBEROS_KEYTAB) && properties.containsKey(KERBEROS_PRINCIPAL)) {
-                if (brokerFileSystem.isExpiredByCreateTime(BrokerConfig.client_expire_seconds)) {
-                    logger.info("file system " + brokerFileSystem + " is expired, update it.");
-                    try {
-                        Configuration conf = new HdfsConfiguration();
-                        conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION, AUTHENTICATION_KERBEROS);
-                        UserGroupInformation ugi = UserGroupInformation.loginUserFromKeytabAndReturnUGI(
-                            preparePrincipal(properties.get(KERBEROS_PRINCIPAL)), properties.get(KERBEROS_KEYTAB));
-                        // update FileSystem TGT
-                        ugi.checkTGTAndReloginFromKeytab();
-                    } catch (Exception e) {
-                        logger.error("errors while checkTGTAndReloginFromKeytab: ", e);
-                    }
+            if (UserGroupInformation.isSecurityEnabled()) {
+                try {
+                    UserGroupInformation.getCurrentUser().checkTGTAndReloginFromKeytab();
+                } catch (Exception e) {
+                    logger.error("errors while refresh TGT: ", e);
                 }
-            } else if (brokerFileSystem.isExpiredByLastAccessTime(BrokerConfig.client_expire_seconds)) {
+            } else if (brokerFileSystem.isExpiredByLastAccessTime()) {
                 brokerFileSystem.getLock().lock();
+                BrokerFileSystem bfs = cachedFileSystem.get(fileSystemIdentity);
+                if (!bfs.isExpiredByLastAccessTime()) {
+                  return bfs;
+                }
                 try {
                     logger.info("file system " + brokerFileSystem + " is expired, update it.");
                     brokerFileSystem.closeFileSystem();
-                    brokerFileSystem.getLock().unlock();
                 } catch (Throwable t) {
                     logger.error("errors while close file system: ", t);
+                } finally {
+                    brokerFileSystem.getLock().unlock();
                 }
                 brokerFileSystem = new BrokerFileSystem(fileSystemIdentity);
                 cachedFileSystem.put(fileSystemIdentity, brokerFileSystem);

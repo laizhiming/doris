@@ -17,7 +17,7 @@
 
 import java.nio.charset.Charset;
 
-suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg") {
+suite("test_jdbc_query_pg", "p0,external") {
 
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
@@ -388,13 +388,29 @@ suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg")
         """
         sql """ drop view if exists $dorisViewName """
         sql """
-            CREATE VIEW $dorisViewName as select `ID` AS `ID`, `c_user` AS `c_user`, 
-            `c_time` AS `c_time`, `m_user` AS `m_user`, `m_time` AS `m_time`, 
-            `app_id` AS `app_id`, `t_id` AS `t_id`, `w_t_s` AS `w_t_s`, 
-            `rf_id` AS `rf_id`, `e_info` AS `e_info`, `f_id` AS `org_id`, `id_code` AS `id_code`,
-            ROUND( CAST ( get_json_string ( `e_info`, '\$.weight' ) AS DECIMAL ( 10, 2 )), 2 ) AS `weight`,
-            get_json_string ( `e_info`, '\$.remark' ) AS `remark`,to_date( `w_t_s` ) AS `dt_str`   
-            from $dorisExTable1 
+            CREATE VIEW $dorisViewName as
+            select `ID` AS `ID`,
+                `c_user` AS `c_user`,
+                `c_time` AS `c_time`,
+                `m_user` AS `m_user`,
+                `m_time` AS `m_time`,
+                `app_id` AS `app_id`,
+                `t_id` AS `t_id`,
+                `w_t_s` AS `w_t_s`,
+                `rf_id` AS `rf_id`,
+                `e_info` AS `e_info`,
+                `f_id` AS `org_id`,
+                `id_code` AS `id_code`,
+                ROUND(
+                    CAST (
+                        get_json_string (`e_info`, '\$.weight') AS DECIMAL (10, 2)
+                    ),
+                    2
+                ) AS `weight`,
+                get_json_string (`e_info`, '\$.remark') AS `remark`,
+                to_date(`w_t_s`) AS `dt_str`
+            from $dorisExTable1
+            where `w_t_s` <= '9999-12-31 23:59:59'
         """
         sql """
             insert into $dorisInTable1 
@@ -489,8 +505,9 @@ suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg")
             );
         """
         order_qt_sql38 """ SELECT count(*) FROM ${dorisExTable1} WHERE id IN (SELECT k8 FROM $jdbcPg14Table1 WHERE k8 > 111); """
-        sql """ create view if not exists aview as select k7, k8 from $jdbcPg14Table1; """
-        order_qt_sql39 """ SELECT * FROM aview a JOIN aview b on a.k8 = b.k8 order by a.k8 desc limit 5 """
+        sql """ drop view if exists aview_pg """
+        sql """ create view if not exists aview_pg as select k7, k8 from $jdbcPg14Table1; """
+        order_qt_sql39 """ SELECT * FROM aview_pg a JOIN aview_pg b on a.k8 = b.k8 order by a.k8 desc limit 5 """
         order_qt_sql42 """ SELECT * FROM (SELECT * FROM $jdbcPg14Table1 WHERE k8 % 8 = 0) l JOIN ${dorisExTable1} o ON l.k8 = o.id """
         order_qt_sql43 """ SELECT * FROM (SELECT * FROM $jdbcPg14Table1 WHERE k8 % 8 = 0) l LEFT JOIN ${dorisExTable1} o ON l.k8 = o.id order by k8 limit 5"""
         order_qt_sql44 """ SELECT * FROM (SELECT * FROM $jdbcPg14Table1 WHERE k8 % 8 = 0) l RIGHT JOIN ${dorisExTable1} o ON l.k8 = o.id"""
@@ -510,8 +527,9 @@ suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg")
         order_qt_sql49 """ SELECT * FROM (SELECT * FROM $jdbcPg14Table1 WHERE k8 % 120 > 110) l
                             JOIN (SELECT *, COUNT(1) OVER (PARTITION BY id ORDER BY id) FROM ${dorisExTable1}) o ON l.k8 = o.id """
         order_qt_sql50 """ SELECT COUNT(*) FROM $jdbcPg14Table1 as a LEFT OUTER JOIN ${dorisExTable1} as b ON a.k8 = b.id AND a.k8 > 111 WHERE a.k8 < 114 """
-        order_qt_sql51 """ SELECT count(*) > 0 FROM $jdbcPg14Table1 JOIN ${dorisExTable1} ON (cast(1.2 AS FLOAT) = CAST(1.2 AS decimal(2,1))) """
-        order_qt_sql52 """ SELECT count(*) > 0 FROM $jdbcPg14Table1 JOIN ${dorisExTable1} ON CAST((CASE WHEN (TRUE IS NOT NULL) THEN '1.2' ELSE '1.2' END) AS FLOAT) = CAST(1.2 AS decimal(2,1)) """
+        // float/double compare is not accurate, should not depend on it
+        // order_qt_sql51 """ SELECT count(*) > 0 FROM $jdbcPg14Table1 JOIN ${dorisExTable1} ON (cast(1.2 AS FLOAT) = CAST(1.2 AS decimal(2,1))) """
+        // order_qt_sql52 """ SELECT count(*) > 0 FROM $jdbcPg14Table1 JOIN ${dorisExTable1} ON CAST((CASE WHEN (TRUE IS NOT NULL) THEN '1.2' ELSE '1.2' END) AS FLOAT) = CAST(1.2 AS decimal(2,1)) """
         order_qt_sql53 """ SELECT SUM(k8) FROM $jdbcPg14Table1 as a JOIN ${dorisExTable1} as b ON a.k8 = CASE WHEN b.id % 2 = 0 and b.name = 'abc' THEN b.id ELSE NULL END """
         order_qt_sql54 """ SELECT COUNT(*) FROM $jdbcPg14Table1 a JOIN ${dorisExTable1} b on not (a.k8 <> b.id) """
         order_qt_sql55 """ SELECT COUNT(*) FROM $jdbcPg14Table1 a JOIN ${dorisExTable1} b on not not not (a.k8 = b.id)  """
@@ -575,7 +593,7 @@ suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg")
         order_qt_sql84 """ SELECT NULL, NULL INTERSECT SELECT NULL, NULL FROM $jdbcPg14Table1 """
         order_qt_sql85 """ SELECT COUNT(*) FROM $jdbcPg14Table1 INTERSECT SELECT COUNT(k8) FROM $jdbcPg14Table1 HAVING SUM(k7) IS NOT NULL """
         order_qt_sql86 """ SELECT k8 FROM $jdbcPg14Table1 WHERE k8 < 7 EXCEPT SELECT k8 FROM $jdbcPg14Table1 WHERE k8 > 21 """
-        order_qt_sql87 """ SELECT row_number() OVER (PARTITION BY k7) rn, k8 FROM $jdbcPg14Table1 LIMIT 3 """
+        order_qt_sql87 """ SELECT row_number() OVER (PARTITION BY k7 order by k8) rn, k8 FROM $jdbcPg14Table1 LIMIT 3 """
         order_qt_sql88 """ SELECT row_number() OVER (PARTITION BY k7 ORDER BY k8) rn FROM $jdbcPg14Table1 LIMIT 3 """
         order_qt_sql89 """ SELECT row_number() OVER (ORDER BY k8) rn FROM $jdbcPg14Table1 LIMIT 3 """
         order_qt_sql90 """ SELECT row_number() OVER () FROM $jdbcPg14Table1 as a JOIN ${dorisExTable1} as b ON a.k8 = b.id WHERE a.k8 > 111 LIMIT 2 """
@@ -622,7 +640,7 @@ suite("test_jdbc_query_pg", "p0,external,pg,external_docker,external_docker_pg")
         order_qt_sql93 """ SELECT CASE k8 WHEN 1 THEN CAST(1 AS decimal(4,1)) WHEN 2 THEN CAST(1 AS decimal(4,2)) 
                             ELSE CAST(1 AS decimal(4,3)) END FROM $jdbcPg14Table1 limit 3"""
         order_qt_sql95 """ SELECT * from (SELECT k8 FROM $jdbcPg14Table1 UNION (SELECT id as k8 FROM ${dorisExTable1}  UNION SELECT k7 as k8 FROM $jdbcPg14Table1) 
-                            UNION ALL SELECT id as k8 FROM $exMysqlTypeTable ORDER BY id limit 3) as a order by k8 limit 3"""
+                            UNION ALL (SELECT id as k8 FROM $exMysqlTypeTable ORDER BY id limit 3)) as a order by k8 limit 3"""
         order_qt_sql100 """ SELECT COUNT(*) FROM $jdbcPg14Table1 WHERE EXISTS(SELECT max(id) FROM ${dorisExTable1}) """
         order_qt_sql103 """ SELECT count(*) FROM $jdbcPg14Table1 n WHERE (SELECT count(*) FROM ${dorisExTable1} r WHERE n.k8 = r.id) > 1 """
         order_qt_sql105 """ SELECT count(*) AS numwait FROM $jdbcPg14Table1 l1 WHERE

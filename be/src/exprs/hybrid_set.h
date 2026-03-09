@@ -17,18 +17,20 @@
 
 #pragma once
 
+#include <gen_cpp/internal_service.pb.h>
+#include <pdqsort.h>
+
 #include "common/object_pool.h"
-#include "exprs/runtime_filter.h"
-#include "runtime/decimalv2_value.h"
-#include "runtime/define_primitive_type.h"
-#include "runtime/primitive_type.h"
-#include "vec/columns/column_nullable.h"
-#include "vec/columns/column_string.h"
-#include "vec/common/hash_table/phmap_fwd_decl.h"
-#include "vec/common/string_ref.h"
+#include "core/column/column_nullable.h"
+#include "core/column/column_string.h"
+#include "core/column/column_vector.h"
+#include "core/data_type/primitive_type.h"
+#include "exec/common/hash_table/phmap_fwd_decl.h"
+#include "exec/runtime_filter/utils.h"
+#include "exprs/filter_base.h"
 
 namespace doris {
-
+#include "common/compile_check_begin.h"
 constexpr int FIXED_CONTAINER_MAX_SIZE = 8;
 
 /**
@@ -60,46 +62,70 @@ public:
         }
     }
 
+    void check_size() {
+        if (N != _size) {
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "invalid size of FixedContainer<{}>: {}", N, _size);
+        }
+    }
+
     // Use '|' instead of '||' has better performance by test.
     ALWAYS_INLINE bool find(const T& value) const {
+        DCHECK_EQ(N, _size);
         if constexpr (N == 0) {
             return false;
         }
         if constexpr (N == 1) {
-            return (value == _data[0]);
+            return (Compare::equal(value, _data[0]));
         }
         if constexpr (N == 2) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1]));
         }
         if constexpr (N == 3) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2]));
         }
         if constexpr (N == 4) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]) | (uint8_t)(value == _data[3]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2])) |
+                   (uint8_t)(Compare::equal(value, _data[3]));
         }
         if constexpr (N == 5) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]) | (uint8_t)(value == _data[3]) |
-                   (uint8_t)(value == _data[4]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2])) |
+                   (uint8_t)(Compare::equal(value, _data[3])) |
+                   (uint8_t)(Compare::equal(value, _data[4]));
         }
         if constexpr (N == 6) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]) | (uint8_t)(value == _data[3]) |
-                   (uint8_t)(value == _data[4]) | (uint8_t)(value == _data[5]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2])) |
+                   (uint8_t)(Compare::equal(value, _data[3])) |
+                   (uint8_t)(Compare::equal(value, _data[4])) |
+                   (uint8_t)(Compare::equal(value, _data[5]));
         }
         if constexpr (N == 7) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]) | (uint8_t)(value == _data[3]) |
-                   (uint8_t)(value == _data[4]) | (uint8_t)(value == _data[5]) |
-                   (uint8_t)(value == _data[6]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2])) |
+                   (uint8_t)(Compare::equal(value, _data[3])) |
+                   (uint8_t)(Compare::equal(value, _data[4])) |
+                   (uint8_t)(Compare::equal(value, _data[5])) |
+                   (uint8_t)(Compare::equal(value, _data[6]));
         }
         if constexpr (N == FIXED_CONTAINER_MAX_SIZE) {
-            return (uint8_t)(value == _data[0]) | (uint8_t)(value == _data[1]) |
-                   (uint8_t)(value == _data[2]) | (uint8_t)(value == _data[3]) |
-                   (uint8_t)(value == _data[4]) | (uint8_t)(value == _data[5]) |
-                   (uint8_t)(value == _data[6]) | (uint8_t)(value == _data[7]);
+            return (uint8_t)(Compare::equal(value, _data[0])) |
+                   (uint8_t)(Compare::equal(value, _data[1])) |
+                   (uint8_t)(Compare::equal(value, _data[2])) |
+                   (uint8_t)(Compare::equal(value, _data[3])) |
+                   (uint8_t)(Compare::equal(value, _data[4])) |
+                   (uint8_t)(Compare::equal(value, _data[5])) |
+                   (uint8_t)(Compare::equal(value, _data[6])) |
+                   (uint8_t)(Compare::equal(value, _data[7]));
         }
         CHECK(false) << "unreachable path";
         return false;
@@ -139,10 +165,21 @@ public:
     Iterator begin() { return Iterator(_data, 0); }
     Iterator end() { return Iterator(_data, _size); }
 
+    void clear() {
+        std::array<T, N> {}.swap(_data);
+        _size = 0;
+    }
+
 private:
     std::array<T, N> _data;
     size_t _size {};
 };
+
+template <typename T>
+struct IsFixedContainer : std::false_type {};
+
+template <typename T, size_t N>
+struct IsFixedContainer<FixedContainer<T, N>> : std::true_type {};
 
 /**
  * Dynamic Container uses phmap::flat_hash_set.
@@ -164,6 +201,8 @@ public:
 
     bool find(const T& value) const { return _set.contains(value); }
 
+    void clear() { _set.clear(); }
+
     Iterator begin() { return _set.begin(); }
 
     Iterator end() { return _set.end(); }
@@ -175,13 +214,16 @@ private:
 };
 
 // TODO Maybe change void* parameter to template parameter better.
-class HybridSetBase : public RuntimeFilterFuncBase {
+class HybridSetBase : public FilterBase {
 public:
-    HybridSetBase() = default;
+    HybridSetBase(bool null_aware) : FilterBase(null_aware) {}
     virtual ~HybridSetBase() = default;
     virtual void insert(const void* data) = 0;
     // use in vectorize execute engine
     virtual void insert(void* data, size_t) = 0;
+
+    virtual void insert_range_from(const vectorized::ColumnPtr& column, size_t start,
+                                   size_t end) = 0;
 
     virtual void insert_fixed_len(const vectorized::ColumnPtr& column, size_t start) = 0;
 
@@ -192,39 +234,33 @@ public:
             insert(value);
             iter->next();
         }
-        _contains_null |= set->_contains_null;
+        _contain_null |= set->_contain_null;
     }
 
+    virtual void clear() = 0;
+    bool empty() { return !_contain_null && size() == 0; }
     virtual int size() = 0;
     virtual bool find(const void* data) const = 0;
     // use in vectorize execute engine
     virtual bool find(const void* data, size_t) const = 0;
 
     virtual void find_batch(const doris::vectorized::IColumn& column, size_t rows,
-                            doris::vectorized::ColumnUInt8::Container& results) {
-        LOG(FATAL) << "HybridSetBase not support find_batch";
-        __builtin_unreachable();
-    }
-
+                            doris::vectorized::ColumnUInt8::Container& results,
+                            const uint8_t* __restrict filter = nullptr) = 0;
     virtual void find_batch_negative(const doris::vectorized::IColumn& column, size_t rows,
-                                     doris::vectorized::ColumnUInt8::Container& results) {
-        LOG(FATAL) << "HybridSetBase not support find_batch_negative";
-        __builtin_unreachable();
-    }
-
+                                     doris::vectorized::ColumnUInt8::Container& results,
+                                     const uint8_t* __restrict filter = nullptr) = 0;
     virtual void find_batch_nullable(const doris::vectorized::IColumn& column, size_t rows,
                                      const doris::vectorized::NullMap& null_map,
-                                     doris::vectorized::ColumnUInt8::Container& results) {
-        LOG(FATAL) << "HybridSetBase not support find_batch_nullable";
-        __builtin_unreachable();
-    }
-
+                                     doris::vectorized::ColumnUInt8::Container& results,
+                                     const uint8_t* __restrict filter = nullptr) = 0;
     virtual void find_batch_nullable_negative(const doris::vectorized::IColumn& column, size_t rows,
                                               const doris::vectorized::NullMap& null_map,
-                                              doris::vectorized::ColumnUInt8::Container& results) {
-        LOG(FATAL) << "HybridSetBase not support find_batch_nullable_negative";
-        __builtin_unreachable();
-    }
+                                              doris::vectorized::ColumnUInt8::Container& results,
+                                              const uint8_t* __restrict filter = nullptr) = 0;
+
+    virtual void to_pb(PInFilter* filter) = 0;
+    virtual uint64_t get_digest(uint64_t seed) = 0;
 
     class IteratorBase {
     public:
@@ -236,30 +272,7 @@ public:
     };
 
     virtual IteratorBase* begin() = 0;
-
-    bool contain_null() const { return _contains_null && _null_aware; }
-    bool _contains_null = false;
 };
-
-template <typename Type>
-const Type* check_and_get_hybrid_set(const HybridSetBase& column) {
-    return typeid_cast<const Type*>(&column);
-}
-
-template <typename Type>
-const Type* check_and_get_hybrid_set(const HybridSetBase* column) {
-    return typeid_cast<const Type*>(column);
-}
-
-template <typename Type>
-bool check_hybrid_set(const HybridSetBase& column) {
-    return check_and_get_hybrid_set<Type>(&column);
-}
-
-template <typename Type>
-bool check_hybrid_set(const HybridSetBase* column) {
-    return check_and_get_hybrid_set<Type>(column);
-}
 
 template <PrimitiveType T,
           typename _ContainerType = DynamicContainer<typename PrimitiveTypeTraits<T>::CppType>,
@@ -270,23 +283,31 @@ public:
     using ElementType = typename ContainerType::ElementType;
     using ColumnType = _ColumnType;
 
-    HybridSet() = default;
-
+    HybridSet(bool null_aware) : HybridSetBase(null_aware) {}
     ~HybridSet() override = default;
 
     void insert(const void* data) override {
         if (data == nullptr) {
-            _contains_null = true;
+            _contain_null = true;
             return;
         }
         _set.insert(*reinterpret_cast<const ElementType*>(data));
     }
+    void clear() override { _set.clear(); }
 
     void insert(void* data, size_t /*unused*/) override { insert(data); }
 
     void insert_fixed_len(const vectorized::ColumnPtr& column, size_t start) override {
-        const auto size = column->size();
+        insert_range_from(column, start, column->size());
+    }
 
+    void insert_range_from(const vectorized::ColumnPtr& column, size_t start, size_t end) override {
+        if (end > column->size()) {
+            throw doris::Exception(doris::ErrorCode::INTERNAL_ERROR,
+                                   "Parameters start = {}, end = {}, are out of bound in "
+                                   "HybridSet::insert_range_from method (data.size() = {}).",
+                                   start, end, column->size());
+        }
         if (column->is_nullable()) {
             const auto* nullable = assert_cast<const vectorized::ColumnNullable*>(column.get());
             const auto& col = nullable->get_nested_column();
@@ -295,67 +316,74 @@ public:
                             .get_data();
 
             const ElementType* data = (ElementType*)col.get_raw_data().data;
-            for (size_t i = start; i < size; i++) {
+            for (size_t i = start; i < end; i++) {
                 if (!nullmap[i]) {
                     _set.insert(*(data + i));
                 } else {
-                    _contains_null = true;
+                    _contain_null = true;
                 }
             }
         } else {
             const ElementType* data = (ElementType*)column->get_raw_data().data;
-            for (size_t i = start; i < size; i++) {
+            for (size_t i = start; i < end; i++) {
                 _set.insert(*(data + i));
             }
         }
     }
 
-    int size() override { return _set.size(); }
+    int size() override { return (int)_set.size(); }
 
     bool find(const void* data) const override {
-        if (data == nullptr) {
-            return false;
-        }
-
         return _set.find(*reinterpret_cast<const ElementType*>(data));
     }
 
     bool find(const void* data, size_t /*unused*/) const override { return find(data); }
 
     void find_batch(const doris::vectorized::IColumn& column, size_t rows,
-                    doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, false>(column, rows, nullptr, results);
+                    doris::vectorized::ColumnUInt8::Container& results,
+                    const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<false, false>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_negative(const doris::vectorized::IColumn& column, size_t rows,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, true>(column, rows, nullptr, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<false, true>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_nullable(const doris::vectorized::IColumn& column, size_t rows,
                              const doris::vectorized::NullMap& null_map,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, false>(column, rows, &null_map, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<true, false>(column, rows, &null_map, results, filter);
     }
 
     void find_batch_nullable_negative(const doris::vectorized::IColumn& column, size_t rows,
                                       const doris::vectorized::NullMap& null_map,
-                                      doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, true>(column, rows, &null_map, results);
+                                      doris::vectorized::ColumnUInt8::Container& results,
+                                      const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<true, true>(column, rows, &null_map, results, filter);
     }
 
     template <bool is_nullable, bool is_negative>
     void _find_batch(const doris::vectorized::IColumn& column, size_t rows,
                      const doris::vectorized::NullMap* null_map,
-                     doris::vectorized::ColumnUInt8::Container& results) {
+                     doris::vectorized::ColumnUInt8::Container& results,
+                     const uint8_t* __restrict filter) {
         auto& col = assert_cast<const ColumnType&>(column);
         const auto* __restrict data = (ElementType*)col.get_data().data();
         const uint8_t* __restrict null_map_data;
         if constexpr (is_nullable) {
             null_map_data = null_map->data();
         }
+
+        if constexpr (IsFixedContainer<ContainerType>::value) {
+            _set.check_size();
+        }
+
         auto* __restrict result_data = results.data();
-        for (size_t i = 0; i < rows; ++i) {
+
+        auto update_value = [&](size_t i) {
             if constexpr (!is_nullable && !is_negative) {
                 result_data[i] = _set.find(data[i]);
             } else if constexpr (!is_nullable && is_negative) {
@@ -364,6 +392,17 @@ public:
                 result_data[i] = _set.find(data[i]) & (!null_map_data[i]);
             } else { // (is_nullable && is_negative)
                 result_data[i] = !(_set.find(data[i]) & (!null_map_data[i]));
+            }
+        };
+        if (filter != nullptr) {
+            for (size_t i = 0; i < rows; i++) {
+                if (filter[i]) {
+                    update_value(i);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < rows; i++) {
+                update_value(i);
             }
         }
     }
@@ -386,7 +425,28 @@ public:
         return _pool.add(new (std::nothrow) Iterator(_set.begin(), _set.end()));
     }
 
-    ContainerType* get_inner_set() { return &_set; }
+    void set_pb(PInFilter* filter, auto f) {
+        for (auto v : _set) {
+            f(filter->add_values(), v);
+        }
+    }
+
+    void to_pb(PInFilter* filter) override { set_pb(filter, get_convertor<ElementType>()); }
+
+    uint64_t get_digest(uint64_t seed) override {
+        std::vector<ElementType> elems(_set.begin(), _set.end());
+        pdqsort(elems.begin(), elems.end());
+        if constexpr (std::is_same<ElementType, bool>::value) {
+            for (bool v : elems) {
+                seed = HashUtil::crc_hash64(&v, sizeof(v), seed);
+            }
+        } else {
+            seed = HashUtil::crc_hash64(elems.data(),
+                                        (uint32_t)(elems.size() * sizeof(ElementType)), seed);
+        }
+
+        return HashUtil::crc_hash64(&_contain_null, sizeof(_contain_null), seed);
+    }
 
 private:
     ContainerType _set;
@@ -398,13 +458,14 @@ class StringSet : public HybridSetBase {
 public:
     using ContainerType = _ContainerType;
 
-    StringSet() = default;
+    StringSet(bool null_aware) : HybridSetBase(null_aware) {}
 
     ~StringSet() override = default;
 
+    void clear() override { _set.clear(); }
     void insert(const void* data) override {
         if (data == nullptr) {
-            _contains_null = true;
+            _contain_null = true;
             return;
         }
 
@@ -428,12 +489,22 @@ public:
             if (nullmap == nullptr || !nullmap[i]) {
                 _set.insert(col.get_data_at(i).to_string());
             } else {
-                _contains_null = true;
+                _contain_null = true;
             }
         }
     }
 
     void insert_fixed_len(const vectorized::ColumnPtr& column, size_t start) override {
+        insert_range_from(column, start, column->size());
+    }
+
+    void insert_range_from(const vectorized::ColumnPtr& column, size_t start, size_t end) override {
+        if (end > column->size()) {
+            throw doris::Exception(doris::ErrorCode::INTERNAL_ERROR,
+                                   "Parameters start = {}, end = {}, are out of bound in "
+                                   "StringSet::insert_range_from method (data.size() = {}).",
+                                   start, end, column->size());
+        }
         if (column->is_nullable()) {
             const auto* nullable = assert_cast<const vectorized::ColumnNullable*>(column.get());
             const auto& nullmap =
@@ -442,32 +513,28 @@ public:
             if (nullable->get_nested_column().is_column_string64()) {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString64&>(
                                                  nullable->get_nested_column()),
-                                         nullmap.data(), start, nullmap.size());
+                                         nullmap.data(), start, end);
             } else {
                 _insert_fixed_len_string(
                         assert_cast<const vectorized::ColumnString&>(nullable->get_nested_column()),
-                        nullmap.data(), start, nullmap.size());
+                        nullmap.data(), start, end);
             }
         } else {
             if (column->is_column_string64()) {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString64&>(*column),
-                                         nullptr, start, column->size());
+                                         nullptr, start, end);
             } else {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString&>(*column),
-                                         nullptr, start, column->size());
+                                         nullptr, start, end);
             }
         }
     }
 
-    int size() override { return _set.size(); }
+    int size() override { return (int)_set.size(); }
 
     bool find(const void* data) const override {
-        if (data == nullptr) {
-            return false;
-        }
-
         const auto* value = reinterpret_cast<const StringRef*>(data);
-        std::string str_value(const_cast<const char*>(value->data), value->size);
+        std::string str_value(value->data, value->size);
         return _set.find(str_value);
     }
 
@@ -477,38 +544,49 @@ public:
     }
 
     void find_batch(const doris::vectorized::IColumn& column, size_t rows,
-                    doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, false>(column, rows, nullptr, results);
+                    doris::vectorized::ColumnUInt8::Container& results,
+                    const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<false, false>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_negative(const doris::vectorized::IColumn& column, size_t rows,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, true>(column, rows, nullptr, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<false, true>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_nullable(const doris::vectorized::IColumn& column, size_t rows,
                              const doris::vectorized::NullMap& null_map,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, false>(column, rows, &null_map, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<true, false>(column, rows, &null_map, results, filter);
     }
 
     void find_batch_nullable_negative(const doris::vectorized::IColumn& column, size_t rows,
                                       const doris::vectorized::NullMap& null_map,
-                                      doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, true>(column, rows, &null_map, results);
+                                      doris::vectorized::ColumnUInt8::Container& results,
+                                      const uint8_t* __restrict filter = nullptr) override {
+        _find_batch<true, true>(column, rows, &null_map, results, filter);
     }
 
     template <bool is_nullable, bool is_negative>
     void _find_batch(const doris::vectorized::IColumn& column, size_t rows,
                      const doris::vectorized::NullMap* null_map,
-                     doris::vectorized::ColumnUInt8::Container& results) {
+                     doris::vectorized::ColumnUInt8::Container& results,
+                     const uint8_t* __restrict filter) {
         const auto& col = assert_cast<const doris::vectorized::ColumnString&>(column);
         const uint8_t* __restrict null_map_data;
         if constexpr (is_nullable) {
             null_map_data = null_map->data();
         }
+
+        if constexpr (IsFixedContainer<ContainerType>::value) {
+            _set.check_size();
+        }
+
         auto* __restrict result_data = results.data();
-        for (size_t i = 0; i < rows; ++i) {
+
+        auto update_value = [&](size_t i) {
             const auto& string_data = col.get_data_at(i).to_string();
             if constexpr (!is_nullable && !is_negative) {
                 result_data[i] = _set.find(string_data);
@@ -518,6 +596,18 @@ public:
                 result_data[i] = _set.find(string_data) & (!null_map_data[i]);
             } else { // (is_nullable && is_negative)
                 result_data[i] = !(_set.find(string_data) & (!null_map_data[i]));
+            }
+        };
+
+        if (filter != nullptr) {
+            for (size_t i = 0; i < rows; ++i) {
+                if (filter[i]) {
+                    update_value(i);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < rows; ++i) {
+                update_value(i);
             }
         }
     }
@@ -529,7 +619,7 @@ public:
         ~Iterator() override = default;
         bool has_next() const override { return !(_begin == _end); }
         const void* get_value() override {
-            _value.data = const_cast<char*>(_begin->data());
+            _value.data = _begin->data();
             _value.size = _begin->length();
             return &_value;
         }
@@ -545,7 +635,23 @@ public:
         return _pool.add(new (std::nothrow) Iterator(_set.begin(), _set.end()));
     }
 
-    ContainerType* get_inner_set() { return &_set; }
+    void set_pb(PInFilter* filter, auto f) {
+        for (const auto& v : _set) {
+            f(filter->add_values(), v);
+        }
+    }
+
+    void to_pb(PInFilter* filter) override { set_pb(filter, get_convertor<std::string>()); }
+
+    uint64_t get_digest(uint64_t seed) override {
+        std::vector<StringRef> elems(_set.begin(), _set.end());
+        pdqsort(elems.begin(), elems.end());
+
+        for (const auto& v : elems) {
+            seed = HashUtil::crc_hash64(v.data, (uint32_t)v.size, seed);
+        }
+        return HashUtil::crc_hash64(&_contain_null, sizeof(_contain_null), seed);
+    }
 
 private:
     ContainerType _set;
@@ -560,13 +666,14 @@ class StringValueSet : public HybridSetBase {
 public:
     using ContainerType = _ContainerType;
 
-    StringValueSet() = default;
+    StringValueSet(bool null_aware) : HybridSetBase(null_aware) {}
 
     ~StringValueSet() override = default;
+    void clear() override { _set.clear(); }
 
     void insert(const void* data) override {
         if (data == nullptr) {
-            _contains_null = true;
+            _contain_null = true;
             return;
         }
 
@@ -590,12 +697,22 @@ public:
             if (nullmap == nullptr || !nullmap[i]) {
                 _set.insert(col.get_data_at(i));
             } else {
-                _contains_null = true;
+                _contain_null = true;
             }
         }
     }
 
     void insert_fixed_len(const vectorized::ColumnPtr& column, size_t start) override {
+        insert_range_from(column, start, column->size());
+    }
+
+    void insert_range_from(const vectorized::ColumnPtr& column, size_t start, size_t end) override {
+        if (end > column->size()) {
+            throw doris::Exception(doris::ErrorCode::INTERNAL_ERROR,
+                                   "Parameters start = {}, end = {}, are out of bound in "
+                                   "StringSet::insert_range_from method (data.size() = {}).",
+                                   start, end, column->size());
+        }
         if (column->is_nullable()) {
             const auto* nullable = assert_cast<const vectorized::ColumnNullable*>(column.get());
             const auto& nullmap =
@@ -604,90 +721,106 @@ public:
             if (nullable->get_nested_column().is_column_string64()) {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString64&>(
                                                  nullable->get_nested_column()),
-                                         nullmap.data(), start, nullmap.size());
+                                         nullmap.data(), start, end);
             } else {
                 _insert_fixed_len_string(
                         assert_cast<const vectorized::ColumnString&>(nullable->get_nested_column()),
-                        nullmap.data(), start, nullmap.size());
+                        nullmap.data(), start, end);
             }
         } else {
             if (column->is_column_string64()) {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString64&>(*column),
-                                         nullptr, start, column->size());
+                                         nullptr, start, end);
             } else {
                 _insert_fixed_len_string(assert_cast<const vectorized::ColumnString&>(*column),
-                                         nullptr, start, column->size());
+                                         nullptr, start, end);
             }
         }
     }
 
-    int size() override { return _set.size(); }
+    int size() override { return (int)_set.size(); }
 
     bool find(const void* data) const override {
-        if (data == nullptr) {
-            return false;
-        }
-
         const auto* value = reinterpret_cast<const StringRef*>(data);
         return _set.find(*value);
     }
 
     bool find(const void* data, size_t size) const override {
-        if (data == nullptr) {
-            return false;
-        }
-
         StringRef sv(reinterpret_cast<const char*>(data), size);
         return _set.find(sv);
     }
 
     void find_batch(const doris::vectorized::IColumn& column, size_t rows,
-                    doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, false>(column, rows, nullptr, results);
+                    doris::vectorized::ColumnUInt8::Container& results,
+                    const uint8_t* __restrict filter) override {
+        _find_batch<false, false>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_negative(const doris::vectorized::IColumn& column, size_t rows,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<false, true>(column, rows, nullptr, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter) override {
+        _find_batch<false, true>(column, rows, nullptr, results, filter);
     }
 
     void find_batch_nullable(const doris::vectorized::IColumn& column, size_t rows,
                              const doris::vectorized::NullMap& null_map,
-                             doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, false>(column, rows, &null_map, results);
+                             doris::vectorized::ColumnUInt8::Container& results,
+                             const uint8_t* __restrict filter) override {
+        _find_batch<true, false>(column, rows, &null_map, results, filter);
     }
 
     void find_batch_nullable_negative(const doris::vectorized::IColumn& column, size_t rows,
                                       const doris::vectorized::NullMap& null_map,
-                                      doris::vectorized::ColumnUInt8::Container& results) override {
-        _find_batch<true, true>(column, rows, &null_map, results);
+                                      doris::vectorized::ColumnUInt8::Container& results,
+                                      const uint8_t* __restrict filter) override {
+        _find_batch<true, true>(column, rows, &null_map, results, filter);
     }
 
     template <bool is_nullable, bool is_negative>
     void _find_batch(const doris::vectorized::IColumn& column, size_t rows,
                      const doris::vectorized::NullMap* null_map,
-                     doris::vectorized::ColumnUInt8::Container& results) {
+                     doris::vectorized::ColumnUInt8::Container& results,
+                     const uint8_t* __restrict filter) {
         const auto& col = assert_cast<const doris::vectorized::ColumnString&>(column);
         const auto& offset = col.get_offsets();
         const uint8_t* __restrict data = col.get_chars().data();
-        auto* __restrict cursor = const_cast<uint8_t*>(data);
         const uint8_t* __restrict null_map_data;
         if constexpr (is_nullable) {
             null_map_data = null_map->data();
         }
+
+        if constexpr (IsFixedContainer<ContainerType>::value) {
+            _set.check_size();
+        }
+
         auto* __restrict result_data = results.data();
-        for (size_t i = 0; i < rows; ++i) {
-            uint32_t len = offset[i] - offset[i - 1];
+
+        auto update_value = [&](size_t i, uint32_t len) {
             if constexpr (!is_nullable && !is_negative) {
-                result_data[i] = _set.find(StringRef(cursor, len));
+                result_data[i] = _set.find(StringRef(data, len));
             } else if constexpr (!is_nullable && is_negative) {
-                result_data[i] = !_set.find(StringRef(cursor, len));
+                result_data[i] = !_set.find(StringRef(data, len));
             } else if constexpr (is_nullable && !is_negative) {
-                result_data[i] = (!null_map_data[i]) & _set.find(StringRef(cursor, len));
+                result_data[i] = (!null_map_data[i]) & _set.find(StringRef(data, len));
             } else { // (is_nullable && is_negative)
-                result_data[i] = !((!null_map_data[i]) & _set.find(StringRef(cursor, len)));
+                result_data[i] = !((!null_map_data[i]) & _set.find(StringRef(data, len)));
             }
-            cursor += len;
+        };
+
+        if (filter != nullptr) {
+            for (size_t i = 0; i < rows; ++i) {
+                uint32_t len = offset[i] - offset[i - 1];
+                if (filter[i]) {
+                    update_value(i, len);
+                }
+                data += len;
+            }
+        } else {
+            for (size_t i = 0; i < rows; ++i) {
+                uint32_t len = offset[i] - offset[i - 1];
+                update_value(i, len);
+                data += len;
+            }
         }
     }
 
@@ -698,7 +831,7 @@ public:
         ~Iterator() override = default;
         bool has_next() const override { return !(_begin == _end); }
         const void* get_value() override {
-            _value.data = const_cast<char*>(_begin->data);
+            _value.data = _begin->data;
             _value.size = _begin->size;
             return &_value;
         }
@@ -714,11 +847,24 @@ public:
         return _pool.add(new (std::nothrow) Iterator(_set.begin(), _set.end()));
     }
 
-    ContainerType* get_inner_set() { return &_set; }
+    void to_pb(PInFilter* filter) override {
+        throw Exception(ErrorCode::INTERNAL_ERROR, "StringValueSet do not support to_pb");
+    }
+
+    uint64_t get_digest(uint64_t seed) override {
+        std::vector<StringRef> elems(_set.begin(), _set.end());
+        pdqsort(elems.begin(), elems.end());
+
+        for (const auto& v : elems) {
+            seed = HashUtil::crc_hash64(v.data, (uint32_t)v.size, seed);
+        }
+
+        return HashUtil::crc_hash64(&_contain_null, sizeof(_contain_null), seed);
+    }
 
 private:
     ContainerType _set;
     ObjectPool _pool;
 };
-
+#include "common/compile_check_end.h"
 } // namespace doris

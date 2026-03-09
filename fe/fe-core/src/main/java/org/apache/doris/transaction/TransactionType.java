@@ -20,5 +20,7 @@ package org.apache.doris.transaction;
 public enum TransactionType {
     UNKNOWN,
     HMS,
-    ICEBERG
+    ICEBERG,
+    JDBC,
+    MAXCOMPUTE
 }

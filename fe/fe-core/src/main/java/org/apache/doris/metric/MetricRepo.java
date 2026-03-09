@@ -19,13 +19,20 @@ package org.apache.doris.metric;
 
 import org.apache.doris.alter.Alter;
 import org.apache.doris.alter.AlterJobV2.JobType;
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.TabletInvertedIndex;
+import org.apache.doris.catalog.TabletSlidingWindowAccessStats;
+import org.apache.doris.cloud.catalog.CloudTabletRebalancer;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.InternalErrorCode;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.ThreadPoolManager;
+import org.apache.doris.common.Version;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.job.common.JobStatus;
+import org.apache.doris.job.common.TaskStatus;
+import org.apache.doris.job.extensions.insert.streaming.StreamingInsertJob;
 import org.apache.doris.load.EtlJobType;
 import org.apache.doris.load.loadv2.JobState;
 import org.apache.doris.load.loadv2.LoadManager;
@@ -34,6 +41,11 @@ import org.apache.doris.load.routineload.RoutineLoadManager;
 import org.apache.doris.metric.Metric.MetricUnit;
 import org.apache.doris.monitor.jvm.JvmService;
 import org.apache.doris.monitor.jvm.JvmStats;
+import org.apache.doris.mtmv.MTMVPartitionInfo.MTMVPartitionType;
+import org.apache.doris.mtmv.MTMVRefreshEnum.RefreshMethod;
+import org.apache.doris.mtmv.MTMVRefreshEnum.RefreshTrigger;
+import org.apache.doris.mtmv.MTMVUtil;
+import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.service.ExecuteEnv;
@@ -45,17 +57,17 @@ import com.codahale.metrics.Histogram;
 import com.codahale.metrics.MetricRegistry;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 public final class MetricRepo {
@@ -70,11 +82,14 @@ public final class MetricRepo {
 
     public static final String TABLET_NUM = "tablet_num";
     public static final String TABLET_MAX_COMPACTION_SCORE = "tablet_max_compaction_score";
+    public static final String TABLET_ACCESS_RECENT = "tablet_access_recent";
+    public static final String TABLET_ACCESS_TOTAL = "tablet_access_total";
     public static final String CLOUD_TAG = "cloud";
 
     public static LongCounterMetric COUNTER_REQUEST_ALL;
     public static LongCounterMetric COUNTER_QUERY_ALL;
     public static LongCounterMetric COUNTER_QUERY_ERR;
+    public static LongCounterMetric COUNTER_QUERY_SLOW;
     public static LongCounterMetric COUNTER_QUERY_TABLE;
     public static LongCounterMetric COUNTER_QUERY_OLAP_TABLE;
     public static LongCounterMetric COUNTER_QUERY_HIVE_TABLE;
@@ -89,15 +104,21 @@ public final class MetricRepo {
     public static Histogram HISTO_QUERY_LATENCY;
     public static AutoMappedMetric<Histogram> USER_HISTO_QUERY_LATENCY;
     public static AutoMappedMetric<GaugeMetricImpl<Long>> USER_GAUGE_QUERY_INSTANCE_NUM;
+    public static AutoMappedMetric<GaugeMetricImpl<Integer>> USER_GAUGE_CONNECTIONS;
     public static AutoMappedMetric<LongCounterMetric> USER_COUNTER_QUERY_INSTANCE_BEGIN;
     public static AutoMappedMetric<LongCounterMetric> BE_COUNTER_QUERY_RPC_ALL;
     public static AutoMappedMetric<LongCounterMetric> BE_COUNTER_QUERY_RPC_FAILED;
     public static AutoMappedMetric<LongCounterMetric> BE_COUNTER_QUERY_RPC_SIZE;
+    // sql cache
+    public static GaugeMetric<Long> GAUGE_SQL_CACHE_NUM;
+    public static LongCounterMetric COUNTER_SQL_CACHE_ADDED;
+    public static LongCounterMetric COUNTER_SQL_CACHE_HIT;
+    public static LongCounterMetric COUNTER_SQL_SQL_CACHE_TOTAL_SEARCH_TIMES;
 
-    public static LongCounterMetric COUNTER_CACHE_ADDED_SQL;
-    public static LongCounterMetric COUNTER_CACHE_ADDED_PARTITION;
-    public static LongCounterMetric COUNTER_CACHE_HIT_SQL;
-    public static LongCounterMetric COUNTER_CACHE_HIT_PARTITION;
+    public static LongCounterMetric COUNTER_UPDATE_TABLET_STAT_FAILED;
+
+    public static GaugeMetric<Long> GAUGE_TABLET_ACCESS_RECENT;
+    public static GaugeMetric<Long> GAUGE_TABLET_ACCESS_TOTAL;
 
     public static LongCounterMetric COUNTER_EDIT_LOG_WRITE;
     public static LongCounterMetric COUNTER_EDIT_LOG_READ;
@@ -106,7 +127,10 @@ public final class MetricRepo {
     public static LongCounterMetric COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES;
     public static LongCounterMetric COUNTER_EDIT_LOG_CLEAN_SUCCESS;
     public static LongCounterMetric COUNTER_EDIT_LOG_CLEAN_FAILED;
+    public static LongCounterMetric COUNTER_LARGE_EDIT_LOG;
+
     public static Histogram HISTO_EDIT_LOG_WRITE_LATENCY;
+    public static Histogram HISTO_JOURNAL_WRITE_LATENCY;
     public static Histogram HISTO_JOURNAL_BATCH_SIZE;
     public static Histogram HISTO_JOURNAL_BATCH_DATA_SIZE;
     public static Histogram HISTO_HTTP_COPY_INTO_UPLOAD_LATENCY;
@@ -131,6 +155,27 @@ public final class MetricRepo {
     public static LongCounterMetric COUNTER_ROUTINE_LOAD_ROWS;
     public static LongCounterMetric COUNTER_ROUTINE_LOAD_RECEIVED_BYTES;
     public static LongCounterMetric COUNTER_ROUTINE_LOAD_ERROR_ROWS;
+
+    public static GaugeMetric<Long> GAUGE_ROUTINE_LOAD_PROGRESS;
+    public static GaugeMetric<Long> GAUGE_ROUTINE_LOAD_LAG;
+    public static GaugeMetric<Long> GAUGE_ROUTINE_LOAD_ABORT_TASK_NUM;
+    public static LongCounterMetric COUNTER_ROUTINE_LOAD_GET_META_LANTENCY;
+    public static LongCounterMetric COUNTER_ROUTINE_LOAD_GET_META_COUNT;
+    public static LongCounterMetric COUNTER_ROUTINE_LOAD_GET_META_FAIL_COUNT;
+    public static LongCounterMetric COUNTER_ROUTINE_LOAD_TASK_EXECUTE_TIME;
+    public static LongCounterMetric COUNTER_ROUTINE_LOAD_TASK_EXECUTE_COUNT;
+
+    // Streaming job
+    public static LongCounterMetric COUNTER_STREAMING_JOB_GET_META_LANTENCY;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_GET_META_COUNT;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_GET_META_FAIL_COUNT;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_TASK_EXECUTE_TIME;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_TASK_EXECUTE_COUNT;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_TASK_FAILED_COUNT;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_TOTAL_ROWS;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_FILTER_ROWS;
+    public static LongCounterMetric COUNTER_STREAMING_JOB_LOAD_BYTES;
+
     public static LongCounterMetric COUNTER_HIT_SQL_BLOCK_RULE;
 
     public static AutoMappedMetric<LongCounterMetric> THRIFT_COUNTER_RPC_ALL;
@@ -140,19 +185,118 @@ public final class MetricRepo {
     public static GaugeMetricImpl<Double> GAUGE_QUERY_PER_SECOND;
     public static GaugeMetricImpl<Double> GAUGE_REQUEST_PER_SECOND;
     public static GaugeMetricImpl<Double> GAUGE_QUERY_ERR_RATE;
+    public static GaugeMetricImpl<Double> GAUGE_QUERY_SLOW_RATE;
     public static GaugeMetricImpl<Long> GAUGE_MAX_TABLET_COMPACTION_SCORE;
+
+    public static Histogram HISTO_COMMIT_AND_PUBLISH_LATENCY;
+
+    public static Histogram HISTO_GET_DELETE_BITMAP_UPDATE_LOCK_LATENCY;
+    public static Histogram HISTO_GET_COMMIT_LOCK_LATENCY;
+    public static Histogram HISTO_CALCULATE_DELETE_BITMAP_LATENCY;
+    public static Histogram HISTO_COMMIT_TO_MS_LATENCY;
+
+    // Catlaog/Database/Table num
+    public static GaugeMetric<Integer> GAUGE_CATALOG_NUM;
+    public static GaugeMetric<Integer> GAUGE_INTERNAL_DATABASE_NUM;
+    public static GaugeMetric<Integer> GAUGE_INTERNAL_TABLE_NUM;
+
+    // PLAN
+    public static GaugeMetric<Long> GAUGE_PLAN_NUM;
+    public static Histogram HISTO_PLAN_PARSE_DURATION;
+    public static Histogram HISTO_PLAN_ANALYZE_DURATION;
+    public static Histogram HISTO_PLAN_REWRITE_DURATION;
+    public static Histogram HISTO_PLAN_FOLD_CONST_BY_BE_DURATION;
+    public static Histogram HISTO_PLAN_OPTIMIZE_DURATION;
+    public static Histogram HISTO_PLAN_TRANSLATE_DURATION;
+    public static Histogram HISTO_PLAN_INIT_SCAN_NODE_DURATION;
+    public static Histogram HISTO_PLAN_FINALIZE_SCAN_NODE_DURATION;
+    public static Histogram HISTO_PLAN_CREATE_SCAN_RANGE_DURATION;
+    public static Histogram HISTO_PLAN_DISTRIBUTE_DURATION;
+    public static Histogram HISTO_PLAN_DURATION;
+    public static Histogram HISTO_PLAN_EXTERNAL_CATALOG_META_DURATION;
+    public static Histogram HISTO_PLAN_EXTERNAL_TVF_INIT_DURATION;
+    public static Histogram HISTO_PLAN_LOCK_TABLES_DURATION;
+    public static Histogram HISTO_PLAN_PARTITION_PRUNE_DURATION;
+    public static Histogram HISTO_PLAN_CLOUD_META_DURATION;
+    public static Histogram HISTO_PLAN_MATERIALIZED_VIEW_REWRITE_DURATION;
+
+    // MTMV
+    public static Histogram HISTO_ASYNC_MATERIALIZED_VIEW_TASK_DURATION;
+    public static LongCounterMetric COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SUCCESS_NUM;
+    public static LongCounterMetric COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_FAILED_NUM;
+    public static LongCounterMetric COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SKIP_NUM;
+    public static GaugeMetric<Integer> GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_RUNNING_NUM;
+    public static GaugeMetric<Integer> GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_PENDING_NUM;
+
+    // Statistics
+    public static GaugeMetric<Double> GAUGE_STATISTICS_UNHEALTHY_TABLE_RATE;
+    public static GaugeMetric<Double> GAUGE_STATISTICS_UNHEALTHY_COLUMN_RATE;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_UNHEALTHY_TABLE_NUM;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_UNHEALTHY_COLUMN_NUM;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_HIGH_PRIORITY_QUEUE_LENGTH;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_MID_PRIORITY_QUEUE_LENGTH;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_LOW_PRIORITY_QUEUE_LENGTH;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_VERY_LOW_PRIORITY_QUEUE_LENGTH;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_NOT_ANALYZED_TABLE_NUM;
+    public static GaugeMetric<Integer> GAUGE_STATISTICS_EMPTY_TABLE_NUM;
+    public static LongCounterMetric COUNTER_STATISTICS_SUCCEED_ANALYZE_JOB;
+    public static LongCounterMetric COUNTER_STATISTICS_FAILED_ANALYZE_JOB;
+    public static LongCounterMetric COUNTER_STATISTICS_SUCCEED_ANALYZE_TASK;
+    public static LongCounterMetric COUNTER_STATISTICS_FAILED_ANALYZE_TASK;
+    public static LongCounterMetric COUNTER_STATISTICS_INVALID_STATS;
+
+    // Table/Partition/Tablet DataSize
+    public static GaugeMetricImpl<Long> GAUGE_MAX_TABLE_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_MAX_PARTITION_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_MAX_TABLET_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_MIN_TABLE_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_MIN_PARTITION_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_MIN_TABLET_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_AVG_TABLE_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_AVG_PARTITION_SIZE_BYTES;
+    public static GaugeMetricImpl<Long> GAUGE_AVG_TABLET_SIZE_BYTES;
+
+    // Agent task
+    public static LongCounterMetric COUNTER_AGENT_TASK_REQUEST_TOTAL;
+    public static AutoMappedMetric<LongCounterMetric> COUNTER_AGENT_TASK_TOTAL;
+    public static AutoMappedMetric<LongCounterMetric> COUNTER_AGENT_TASK_RESEND_TOTAL;
 
     private static Map<Pair<EtlJobType, JobState>, Long> loadJobNum = Maps.newHashMap();
 
-    private static ScheduledThreadPoolExecutor metricTimer = ThreadPoolManager.newDaemonScheduledThreadPool(1,
+    private static final ScheduledThreadPoolExecutor metricTimer = ThreadPoolManager.newDaemonScheduledThreadPool(1,
             "metric-timer-pool", true);
-    private static MetricCalculator metricCalculator = new MetricCalculator();
+    private static final MetricCalculator metricCalculator = new MetricCalculator();
 
-    // init() should only be called after catalog is contructed.
+    // init() should only be called after catalog is constructed.
     public static synchronized void init() {
         if (isInit) {
             return;
         }
+
+        // version
+        GaugeMetric<Long> feVersion = new GaugeMetric<Long>("version", MetricUnit.NOUNIT, "") {
+            @Override
+            public Long getValue() {
+                try {
+                    String verStr = Version.DORIS_BUILD_VERSION_MAJOR + "0" + Version.DORIS_BUILD_VERSION_MINOR + "0"
+                            + Version.DORIS_BUILD_VERSION_PATCH;
+                    if (Version.DORIS_BUILD_VERSION_HOTFIX > 0) {
+                        verStr += ("0" + Version.DORIS_BUILD_VERSION_HOTFIX);
+                    }
+                    return Long.parseLong(verStr);
+                } catch (Throwable t) {
+                    LOG.warn("failed to init version metrics", t);
+                    return 0L;
+                }
+            }
+        };
+        feVersion.addLabel(new MetricLabel("version", Version.DORIS_BUILD_VERSION));
+        feVersion.addLabel(new MetricLabel("major", String.valueOf(Version.DORIS_BUILD_VERSION_MAJOR)));
+        feVersion.addLabel(new MetricLabel("minor", String.valueOf(Version.DORIS_BUILD_VERSION_MINOR)));
+        feVersion.addLabel(new MetricLabel("patch", String.valueOf(Version.DORIS_BUILD_VERSION_PATCH)));
+        feVersion.addLabel(new MetricLabel("hotfix", String.valueOf(Version.DORIS_BUILD_VERSION_HOTFIX)));
+        feVersion.addLabel(new MetricLabel("short_hash", Version.DORIS_BUILD_SHORT_HASH));
+        DORIS_METRIC_REGISTER.addMetrics(feVersion);
 
         // load jobs
         for (EtlJobType jobType : EtlJobType.values()) {
@@ -175,25 +319,8 @@ public final class MetricRepo {
             }
         }
 
-        //  routine load jobs
-        RoutineLoadManager routineLoadManager = Env.getCurrentEnv().getRoutineLoadManager();
-        for (RoutineLoadJob.JobState jobState : RoutineLoadJob.JobState.values()) {
-            GaugeMetric<Long> gauge = new GaugeMetric<Long>("job", MetricUnit.NOUNIT, "routine load job statistics") {
-                @Override
-                public Long getValue() {
-                    if (!Env.getCurrentEnv().isMaster()) {
-                        return 0L;
-                    }
-                    Set<RoutineLoadJob.JobState> states = Sets.newHashSet();
-                    states.add(jobState);
-                    List<RoutineLoadJob> jobs = routineLoadManager.getRoutineLoadJobByState(states);
-                    return Long.valueOf(jobs.size());
-                }
-            };
-            gauge.addLabel(new MetricLabel("job", "load")).addLabel(new MetricLabel("type", "ROUTINE_LOAD"))
-                    .addLabel(new MetricLabel("state", jobState.name()));
-            DORIS_METRIC_REGISTER.addMetrics(gauge);
-        }
+        initRoutineLoadJobMetrics();
+        initStreamingJobMetrics();
 
         // running alter job
         Alter alter = Env.getCurrentEnv().getAlterInstance();
@@ -225,11 +352,47 @@ public final class MetricRepo {
         // capacity
         generateBackendsTabletMetrics();
 
+        // tablet sliding window access stats
+        GAUGE_TABLET_ACCESS_RECENT = new GaugeMetric<Long>(TABLET_ACCESS_RECENT, MetricUnit.REQUESTS,
+                "total tablet access count within sliding window") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                if (!Config.enable_active_tablet_sliding_window_access_stats) {
+                    return 0L;
+                }
+                return TabletSlidingWindowAccessStats.getInstance().getRecentAccessCountInWindow();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_TABLET_ACCESS_RECENT);
+
+        GAUGE_TABLET_ACCESS_TOTAL = new GaugeMetric<Long>(TABLET_ACCESS_TOTAL, MetricUnit.REQUESTS,
+                "total tablet access count since FE start") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                if (!Config.enable_active_tablet_sliding_window_access_stats) {
+                    return 0L;
+                }
+                return TabletSlidingWindowAccessStats.getInstance().getTotalAccessCount();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_TABLET_ACCESS_TOTAL);
+
         // connections
-        GaugeMetric<Integer> connections = new GaugeMetric<Integer>("connection_total", MetricUnit.CONNECTIONS,
-                "total connections") {
+        USER_GAUGE_CONNECTIONS = addLabeledMetrics("user", () ->
+                new GaugeMetricImpl<>("connection_total", MetricUnit.CONNECTIONS,
+                        "total connections", 0));
+        GaugeMetric<Integer> connections = new GaugeMetric<Integer>("connection_total",
+                MetricUnit.CONNECTIONS, "total connections") {
             @Override
             public Integer getValue() {
+                ExecuteEnv.getInstance().getScheduler().getUserConnectionMap()
+                        .forEach((k, v) -> USER_GAUGE_CONNECTIONS.getOrAdd(k).setValue(v.get()));
                 return ExecuteEnv.getInstance().getScheduler().getConnectionNum();
             }
         };
@@ -285,6 +448,8 @@ public final class MetricRepo {
         DORIS_METRIC_REGISTER.addMetrics(GAUGE_REQUEST_PER_SECOND);
         GAUGE_QUERY_ERR_RATE = new GaugeMetricImpl<>("query_err_rate", MetricUnit.NOUNIT, "query error rate", 0.0);
         DORIS_METRIC_REGISTER.addMetrics(GAUGE_QUERY_ERR_RATE);
+        GAUGE_QUERY_SLOW_RATE = new GaugeMetricImpl<>("query_slow_rate", MetricUnit.NOUNIT, "query slow rate", 0.0);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_QUERY_SLOW_RATE);
         GAUGE_MAX_TABLET_COMPACTION_SCORE = new GaugeMetricImpl<>("max_tablet_compaction_score", MetricUnit.NOUNIT,
                 "max tablet compaction score of all backends", 0L);
         DORIS_METRIC_REGISTER.addMetrics(GAUGE_MAX_TABLET_COMPACTION_SCORE);
@@ -296,6 +461,8 @@ public final class MetricRepo {
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_QUERY_ALL);
         COUNTER_QUERY_ERR = new LongCounterMetric("query_err", MetricUnit.REQUESTS, "total error query");
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_QUERY_ERR);
+        COUNTER_QUERY_SLOW = new LongCounterMetric("query_slow", MetricUnit.REQUESTS, "total slow query");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_QUERY_SLOW);
         COUNTER_QUERY_TABLE = new LongCounterMetric("query_table", MetricUnit.REQUESTS, "total query from table");
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_QUERY_TABLE);
         COUNTER_QUERY_OLAP_TABLE = new LongCounterMetric("query_olap_table", MetricUnit.REQUESTS,
@@ -305,14 +472,14 @@ public final class MetricRepo {
                 "total query from hive table");
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_QUERY_HIVE_TABLE);
         USER_COUNTER_QUERY_ALL = new AutoMappedMetric<>(name -> {
-            LongCounterMetric userCountQueryAll  = new LongCounterMetric("query_total", MetricUnit.REQUESTS,
+            LongCounterMetric userCountQueryAll = new LongCounterMetric("query_total", MetricUnit.REQUESTS,
                     "total query for single user");
             userCountQueryAll.addLabel(new MetricLabel("user", name));
             DORIS_METRIC_REGISTER.addMetrics(userCountQueryAll);
             return userCountQueryAll;
         });
         USER_COUNTER_QUERY_ERR = new AutoMappedMetric<>(name -> {
-            LongCounterMetric userCountQueryErr  = new LongCounterMetric("query_err", MetricUnit.REQUESTS,
+            LongCounterMetric userCountQueryErr = new LongCounterMetric("query_err", MetricUnit.REQUESTS,
                     "total error query for single user");
             userCountQueryErr.addLabel(new MetricLabel("user", name));
             DORIS_METRIC_REGISTER.addMetrics(userCountQueryErr);
@@ -326,10 +493,10 @@ public final class MetricRepo {
         });
         USER_COUNTER_QUERY_INSTANCE_BEGIN = addLabeledMetrics("user", () ->
                 new LongCounterMetric("query_instance_begin", MetricUnit.NOUNIT,
-                "number of query instance begin"));
+                        "number of query instance begin"));
         USER_GAUGE_QUERY_INSTANCE_NUM = addLabeledMetrics("user", () ->
                 new GaugeMetricImpl<>("query_instance_num", MetricUnit.NOUNIT,
-                "number of running query instances of current user", 0L));
+                        "number of running query instances of current user", 0L));
         GaugeMetric<Long> queryInstanceNum = new GaugeMetric<Long>("query_instance_num",
                 MetricUnit.NOUNIT, "number of query instances of all current users") {
             @Override
@@ -346,29 +513,35 @@ public final class MetricRepo {
         };
         DORIS_METRIC_REGISTER.addMetrics(queryInstanceNum);
         BE_COUNTER_QUERY_RPC_ALL = addLabeledMetrics("be", () ->
-            new LongCounterMetric("query_rpc_total", MetricUnit.NOUNIT, ""));
+                new LongCounterMetric("query_rpc_total", MetricUnit.NOUNIT, ""));
         BE_COUNTER_QUERY_RPC_FAILED = addLabeledMetrics("be", () ->
-            new LongCounterMetric("query_rpc_failed", MetricUnit.NOUNIT, ""));
+                new LongCounterMetric("query_rpc_failed", MetricUnit.NOUNIT, ""));
         BE_COUNTER_QUERY_RPC_SIZE = addLabeledMetrics("be", () ->
-            new LongCounterMetric("query_rpc_size", MetricUnit.BYTES, ""));
+                new LongCounterMetric("query_rpc_size", MetricUnit.BYTES, ""));
 
-        // cache
-        COUNTER_CACHE_ADDED_SQL = new LongCounterMetric("cache_added", MetricUnit.REQUESTS,
-                "Number of SQL mode cache added");
-        COUNTER_CACHE_ADDED_SQL.addLabel(new MetricLabel("type", "sql"));
-        DORIS_METRIC_REGISTER.addMetrics(COUNTER_CACHE_ADDED_SQL);
-        COUNTER_CACHE_ADDED_PARTITION = new LongCounterMetric("cache_added", MetricUnit.REQUESTS,
-                "Number of Partition mode cache added");
-        COUNTER_CACHE_ADDED_PARTITION.addLabel(new MetricLabel("type", "partition"));
-        DORIS_METRIC_REGISTER.addMetrics(COUNTER_CACHE_ADDED_PARTITION);
-        COUNTER_CACHE_HIT_SQL = new LongCounterMetric("cache_hit", MetricUnit.REQUESTS,
-                "total hits query by sql model");
-        COUNTER_CACHE_HIT_SQL.addLabel(new MetricLabel("type", "sql"));
-        DORIS_METRIC_REGISTER.addMetrics(COUNTER_CACHE_HIT_SQL);
-        COUNTER_CACHE_HIT_PARTITION = new LongCounterMetric("cache_hit", MetricUnit.REQUESTS,
-                "total hits query by partition model");
-        COUNTER_CACHE_HIT_PARTITION.addLabel(new MetricLabel("type", "partition"));
-        DORIS_METRIC_REGISTER.addMetrics(COUNTER_CACHE_HIT_PARTITION);
+        // sql cache
+        GAUGE_SQL_CACHE_NUM = new GaugeMetric<Long>(
+                "sql_cache_num",
+                MetricUnit.NOUNIT, "Number of SQL cache") {
+            @Override
+            public Long getValue() {
+                return Env.getCurrentEnv().getSqlCacheManager().getSqlCacheNum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_SQL_CACHE_NUM);
+
+        COUNTER_SQL_CACHE_ADDED = new LongCounterMetric("sql_cache_added", MetricUnit.REQUESTS,
+                "Number of SQL cache added");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_SQL_CACHE_ADDED);
+
+        COUNTER_SQL_CACHE_HIT = new LongCounterMetric("sql_cache_hit", MetricUnit.REQUESTS,
+                "total hits query by sql cache");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_SQL_CACHE_HIT);
+
+        COUNTER_SQL_SQL_CACHE_TOTAL_SEARCH_TIMES = new LongCounterMetric("sql_cache_total_search_times",
+                MetricUnit.REQUESTS,
+                "sql cache total search times");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_SQL_SQL_CACHE_TOTAL_SEARCH_TIMES);
 
         // edit log
         COUNTER_EDIT_LOG_WRITE = new LongCounterMetric("edit_log", MetricUnit.OPERATIONS,
@@ -391,8 +564,16 @@ public final class MetricRepo {
                 "size of current edit log");
         COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES.addLabel(new MetricLabel("type", "current_bytes"));
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES);
+
+        COUNTER_LARGE_EDIT_LOG = new LongCounterMetric("edit_log", MetricUnit.OPERATIONS,
+                "counter of large edit log write into bdbje");
+        COUNTER_LARGE_EDIT_LOG.addLabel(new MetricLabel("type", "large_write"));
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_LARGE_EDIT_LOG);
+
         HISTO_EDIT_LOG_WRITE_LATENCY = METRIC_REGISTER.histogram(
                 MetricRegistry.name("editlog", "write", "latency", "ms"));
+        HISTO_JOURNAL_WRITE_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("journal", "write", "latency", "ms"));
         HISTO_JOURNAL_BATCH_SIZE = METRIC_REGISTER.histogram(
                 MetricRegistry.name("journal", "write", "batch_size"));
         HISTO_JOURNAL_BATCH_DATA_SIZE = METRIC_REGISTER.histogram(
@@ -400,11 +581,11 @@ public final class MetricRepo {
 
         // edit log clean
         COUNTER_EDIT_LOG_CLEAN_SUCCESS = new LongCounterMetric("edit_log_clean", MetricUnit.OPERATIONS,
-            "counter of edit log succeed in cleaning");
+                "counter of edit log succeed in cleaning");
         COUNTER_EDIT_LOG_CLEAN_SUCCESS.addLabel(new MetricLabel("type", "success"));
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_EDIT_LOG_CLEAN_SUCCESS);
         COUNTER_EDIT_LOG_CLEAN_FAILED = new LongCounterMetric("edit_log_clean", MetricUnit.OPERATIONS,
-            "counter of edit log failed to clean");
+                "counter of edit log failed to clean");
         COUNTER_EDIT_LOG_CLEAN_FAILED.addLabel(new MetricLabel("type", "failed"));
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_EDIT_LOG_CLEAN_FAILED);
 
@@ -454,10 +635,14 @@ public final class MetricRepo {
                 "counter of failed transactions");
         COUNTER_TXN_FAILED.addLabel(new MetricLabel("type", "failed"));
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_TXN_FAILED);
+        COUNTER_UPDATE_TABLET_STAT_FAILED = new LongCounterMetric("update_tablet_stat_failed", MetricUnit.REQUESTS,
+                "counter of failed to update tablet stat");
+        COUNTER_UPDATE_TABLET_STAT_FAILED.addLabel(new MetricLabel("type", "failed"));
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_UPDATE_TABLET_STAT_FAILED);
         HISTO_TXN_EXEC_LATENCY = METRIC_REGISTER.histogram(
-            MetricRegistry.name("txn", "exec", "latency", "ms"));
+                MetricRegistry.name("txn", "exec", "latency", "ms"));
         HISTO_TXN_PUBLISH_LATENCY = METRIC_REGISTER.histogram(
-            MetricRegistry.name("txn", "publish", "latency", "ms"));
+                MetricRegistry.name("txn", "publish", "latency", "ms"));
         GaugeMetric<Long> txnNum = new GaugeMetric<Long>("txn_num", MetricUnit.NOUNIT,
                 "number of running transactions") {
             @Override
@@ -478,7 +663,7 @@ public final class MetricRepo {
         DORIS_METRIC_REGISTER.addMetrics(publishTxnNum);
         DB_GAUGE_PUBLISH_TXN_NUM = addLabeledMetrics("db",
                 () -> new GaugeMetricImpl<>("publish_txn_num", MetricUnit.NOUNIT,
-                "number of publish transactions", 0L));
+                        "number of publish transactions", 0L));
         COUNTER_ROUTINE_LOAD_ROWS = new LongCounterMetric("routine_load_rows", MetricUnit.ROWS,
                 "total rows of routine load");
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_ROWS);
@@ -488,6 +673,50 @@ public final class MetricRepo {
         COUNTER_ROUTINE_LOAD_ERROR_ROWS = new LongCounterMetric("routine_load_error_rows", MetricUnit.ROWS,
                 "total error rows of routine load");
         DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_ERROR_ROWS);
+        COUNTER_ROUTINE_LOAD_GET_META_LANTENCY = new LongCounterMetric("routine_load_get_meta_latency",
+                MetricUnit.MILLISECONDS, "get meta lantency of routine load");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_GET_META_LANTENCY);
+        COUNTER_ROUTINE_LOAD_GET_META_COUNT = new LongCounterMetric("routine_load_get_meta_count", MetricUnit.NOUNIT,
+                "get meta count of routine load");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_GET_META_COUNT);
+        COUNTER_ROUTINE_LOAD_GET_META_FAIL_COUNT = new LongCounterMetric("routine_load_get_meta_fail_count",
+                MetricUnit.NOUNIT, "get meta fail count of routine load");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_GET_META_FAIL_COUNT);
+        COUNTER_ROUTINE_LOAD_TASK_EXECUTE_TIME = new LongCounterMetric("routine_load_task_execute_time",
+                MetricUnit.MILLISECONDS, "task execute time of routine load");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_TASK_EXECUTE_TIME);
+        COUNTER_ROUTINE_LOAD_TASK_EXECUTE_COUNT = new LongCounterMetric("routine_load_task_execute_count",
+                MetricUnit.NOUNIT, "task execute count of routine load");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ROUTINE_LOAD_TASK_EXECUTE_COUNT);
+
+        // streaming job metrics
+        COUNTER_STREAMING_JOB_GET_META_LANTENCY = new LongCounterMetric("streaming_job_get_meta_latency",
+                MetricUnit.MILLISECONDS, "get meta lantency of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_GET_META_LANTENCY);
+        COUNTER_STREAMING_JOB_GET_META_COUNT = new LongCounterMetric("streaming_job_get_meta_count",
+                MetricUnit.NOUNIT, "get meta count of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_GET_META_COUNT);
+        COUNTER_STREAMING_JOB_GET_META_FAIL_COUNT = new LongCounterMetric("streaming_job_get_meta_fail_count",
+                MetricUnit.NOUNIT, "get meta fail count of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_GET_META_FAIL_COUNT);
+        COUNTER_STREAMING_JOB_TASK_EXECUTE_TIME = new LongCounterMetric("streaming_job_task_execute_time",
+                MetricUnit.MILLISECONDS, "task execute time of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_TASK_EXECUTE_TIME);
+        COUNTER_STREAMING_JOB_TASK_EXECUTE_COUNT = new LongCounterMetric("streaming_job_task_execute_count",
+                MetricUnit.NOUNIT, "task execute count of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_TASK_EXECUTE_COUNT);
+        COUNTER_STREAMING_JOB_TASK_FAILED_COUNT = new LongCounterMetric("streaming_job_task_failed_count",
+                MetricUnit.NOUNIT, "task failed count of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_TASK_FAILED_COUNT);
+        COUNTER_STREAMING_JOB_TOTAL_ROWS = new LongCounterMetric("streaming_job_total_rows", MetricUnit.ROWS,
+                "total rows of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_TOTAL_ROWS);
+        COUNTER_STREAMING_JOB_FILTER_ROWS = new LongCounterMetric("streaming_job_filter_rows", MetricUnit.ROWS,
+                "filter rows of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_FILTER_ROWS);
+        COUNTER_STREAMING_JOB_LOAD_BYTES = new LongCounterMetric("streaming_job_load_bytes", MetricUnit.BYTES,
+                "load bytes of streaming job");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STREAMING_JOB_LOAD_BYTES);
 
         COUNTER_HIT_SQL_BLOCK_RULE = new LongCounterMetric("counter_hit_sql_block_rule", MetricUnit.ROWS,
                 "total hit sql block rule query");
@@ -512,9 +741,312 @@ public final class MetricRepo {
                 MetricUnit.REQUESTS, "http copy into err query request");
         DORIS_METRIC_REGISTER.addMetrics(HTTP_COUNTER_COPY_INFO_QUERY_ERR);
         HISTO_HTTP_COPY_INTO_UPLOAD_LATENCY = METRIC_REGISTER.histogram(
-            MetricRegistry.name("http_copy_into_upload", "latency", "ms"));
+                MetricRegistry.name("http_copy_into_upload", "latency", "ms"));
         HISTO_HTTP_COPY_INTO_QUERY_LATENCY = METRIC_REGISTER.histogram(
-            MetricRegistry.name("http_copy_into_query", "latency", "ms"));
+                MetricRegistry.name("http_copy_into_query", "latency", "ms"));
+
+        HISTO_COMMIT_AND_PUBLISH_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("txn_commit_and_publish", "latency", "ms"));
+
+        GaugeMetric<Integer> commitQueueLength = new GaugeMetric<Integer>("commit_queue_length",
+                MetricUnit.NOUNIT, "commit queue length") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getGlobalTransactionMgr().getQueueLength();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(commitQueueLength);
+
+        HISTO_GET_DELETE_BITMAP_UPDATE_LOCK_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("get_delete_bitmap_update_lock", "latency", "ms"));
+        HISTO_GET_COMMIT_LOCK_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("get_commit_lock", "latency", "ms"));
+        HISTO_CALCULATE_DELETE_BITMAP_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("calculate_delete_bitmap", "latency", "ms"));
+        HISTO_COMMIT_TO_MS_LATENCY = METRIC_REGISTER.histogram(
+                MetricRegistry.name("commit_to_ms", "latency", "ms"));
+
+        GAUGE_CATALOG_NUM = new GaugeMetric<Integer>("catalog_num",
+                MetricUnit.NOUNIT, "total catalog num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getCatalogMgr().getCatalogNum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_CATALOG_NUM);
+
+        GAUGE_INTERNAL_DATABASE_NUM = new GaugeMetric<Integer>("internal_database_num",
+                MetricUnit.NOUNIT, "total internal database num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getCatalogMgr().getInternalCatalog().getDbNum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_INTERNAL_DATABASE_NUM);
+
+        GAUGE_INTERNAL_TABLE_NUM = new GaugeMetric<Integer>("internal_table_num",
+                MetricUnit.NOUNIT, "total internal table num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getCatalogMgr().getInternalCatalog().getAllDbs().stream()
+                        .map(d -> (Database) d).map(Database::getTableNum).reduce(0, Integer::sum);
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_INTERNAL_TABLE_NUM);
+
+        // statistics
+        // succeeed job num
+        COUNTER_STATISTICS_SUCCEED_ANALYZE_JOB = new LongCounterMetric("statistics_succeed_analyze_job",
+                MetricUnit.NOUNIT,
+                "succeed analyze job num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STATISTICS_SUCCEED_ANALYZE_JOB);
+        // failed job num
+        COUNTER_STATISTICS_FAILED_ANALYZE_JOB = new LongCounterMetric("statistics_failed_analyze_job",
+                MetricUnit.NOUNIT,
+                "failed analyze job num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STATISTICS_FAILED_ANALYZE_JOB);
+        // succeeed task num
+        COUNTER_STATISTICS_SUCCEED_ANALYZE_TASK = new LongCounterMetric("statistics_succeed_analyze_task",
+                MetricUnit.NOUNIT,
+                "succeed analyze task num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STATISTICS_SUCCEED_ANALYZE_TASK);
+        // failed task num
+        COUNTER_STATISTICS_FAILED_ANALYZE_TASK = new LongCounterMetric("statistics_failed_analyze_task",
+                MetricUnit.NOUNIT,
+                "failed analyze task num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STATISTICS_FAILED_ANALYZE_TASK);
+        // skip by ndv/count
+        COUNTER_STATISTICS_INVALID_STATS = new LongCounterMetric("statistics_invalid_stats", MetricUnit.NOUNIT,
+                "invalid stats");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_STATISTICS_INVALID_STATS);
+        // unhealthy table rate
+        GAUGE_STATISTICS_UNHEALTHY_TABLE_RATE = new GaugeMetric<Double>("statistics_unhealthy_table_rate",
+                MetricUnit.NOUNIT, "unhealthy table rate") {
+            @Override
+            public Double getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getUnhealthyTableRate();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_UNHEALTHY_TABLE_RATE);
+        // unhealthy column rate
+        GAUGE_STATISTICS_UNHEALTHY_COLUMN_RATE = new GaugeMetric<Double>("statistics_unhealthy_column_rate",
+                MetricUnit.NOUNIT, "unhealthy column rate") {
+            @Override
+            public Double getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getUnhealthyColumnRate();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_UNHEALTHY_COLUMN_RATE);
+        // unhealthy table num
+        GAUGE_STATISTICS_UNHEALTHY_TABLE_NUM = new GaugeMetric<Integer>("statistics_unhealthy_table_num",
+                MetricUnit.NOUNIT, "unhealthy table num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getUnhealthyTableCount();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_UNHEALTHY_TABLE_NUM);
+        // unhealthy column num
+        GAUGE_STATISTICS_UNHEALTHY_COLUMN_NUM = new GaugeMetric<Integer>("statistics_unhealthy_column_num",
+                MetricUnit.NOUNIT, "unhealthy column num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getUnhealthyColumnCount();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_UNHEALTHY_COLUMN_NUM);
+        // not analyzed table num
+        GAUGE_STATISTICS_NOT_ANALYZED_TABLE_NUM = new GaugeMetric<Integer>("statistics_not_analyzed_table_num",
+                MetricUnit.NOUNIT, "not analyzed table num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getNotAnalyzedTableCount();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_NOT_ANALYZED_TABLE_NUM);
+        // empty table num
+        GAUGE_STATISTICS_EMPTY_TABLE_NUM = new GaugeMetric<Integer>("statistics_empty_table_num",
+                MetricUnit.NOUNIT, "empty table num") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getStatisticsMetricCollector().getEmptyTableCount();
+            }
+        };
+        // high priority queue length
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_EMPTY_TABLE_NUM);
+        GAUGE_STATISTICS_HIGH_PRIORITY_QUEUE_LENGTH = new GaugeMetric<Integer>("statistics_high_priority_queue_length",
+                MetricUnit.NOUNIT, "high priority queue length") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getAnalysisManager().highPriorityJobs.size();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_HIGH_PRIORITY_QUEUE_LENGTH);
+        // mid priority queue length
+        GAUGE_STATISTICS_MID_PRIORITY_QUEUE_LENGTH = new GaugeMetric<Integer>("statistics_mid_priority_queue_length",
+                MetricUnit.NOUNIT, "mid priority queue length") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getAnalysisManager().midPriorityJobs.size();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_MID_PRIORITY_QUEUE_LENGTH);
+        // low priority queue length
+        GAUGE_STATISTICS_LOW_PRIORITY_QUEUE_LENGTH = new GaugeMetric<Integer>("statistics_low_priority_queue_length",
+                MetricUnit.NOUNIT, "low priority queue length") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getAnalysisManager().lowPriorityJobs.size();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_LOW_PRIORITY_QUEUE_LENGTH);
+        // very low priority queue length
+        GAUGE_STATISTICS_VERY_LOW_PRIORITY_QUEUE_LENGTH = new GaugeMetric<Integer>(
+                "statistics_very_low_priority_queue_length",
+                MetricUnit.NOUNIT, "very low priority queue length") {
+            @Override
+            public Integer getValue() {
+                return Env.getCurrentEnv().getAnalysisManager().veryLowPriorityJobs.size();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_STATISTICS_VERY_LOW_PRIORITY_QUEUE_LENGTH);
+
+        // PLAN
+        GAUGE_PLAN_NUM = new GaugeMetric<Long>(
+                "plan_num",
+                MetricUnit.NOUNIT, "plan running num") {
+            @Override
+            public Long getValue() {
+                return NereidsPlanner.runningPlanNum.get();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_PLAN_NUM);
+        HISTO_PLAN_PARSE_DURATION = METRIC_REGISTER.histogram(MetricRegistry.name("plan_parse", "duration", "ms"));
+        HISTO_PLAN_ANALYZE_DURATION = METRIC_REGISTER.histogram(MetricRegistry.name("plan_analyze", "duration", "ms"));
+        HISTO_PLAN_REWRITE_DURATION = METRIC_REGISTER.histogram(MetricRegistry.name("plan_rewrite", "duration", "ms"));
+        HISTO_PLAN_FOLD_CONST_BY_BE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_fold_const_by_be", "duration", "ms"));
+        HISTO_PLAN_OPTIMIZE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_optimize", "duration", "ms"));
+        HISTO_PLAN_TRANSLATE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_translate", "duration", "ms"));
+        HISTO_PLAN_INIT_SCAN_NODE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_init_scan_node", "duration", "ms"));
+        HISTO_PLAN_FINALIZE_SCAN_NODE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_finalize_scan_node", "duration", "ms"));
+        HISTO_PLAN_CREATE_SCAN_RANGE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_create_scan_range", "duration", "ms"));
+        HISTO_PLAN_DISTRIBUTE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_distribute", "duration", "ms"));
+        HISTO_PLAN_DURATION = METRIC_REGISTER.histogram(MetricRegistry.name("plan", "duration", "ms"));
+        HISTO_PLAN_EXTERNAL_CATALOG_META_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_external_catalog_meta", "duration", "ms"));
+        HISTO_PLAN_EXTERNAL_TVF_INIT_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_external_tvf_init", "duration", "ms"));
+        HISTO_PLAN_LOCK_TABLES_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_lock_tables", "duration", "ms"));
+        HISTO_PLAN_PARTITION_PRUNE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_partition_prune", "duration", "ms"));
+        HISTO_PLAN_CLOUD_META_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_cloud_meta", "duration", "ms"));
+        HISTO_PLAN_MATERIALIZED_VIEW_REWRITE_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("plan_materialized_view_rewrite", "duration", "ms"));
+        // MTMV
+        // count
+        for (RefreshTrigger trigger : RefreshTrigger.values()) {
+            for (RefreshMethod method : RefreshMethod.values()) {
+                for (MTMVPartitionType partitionType : MTMVPartitionType.values()) {
+                    GaugeMetric<Integer> gauge = new GaugeMetric<Integer>("async_materialized_view_num",
+                            MetricUnit.NOUNIT, "async materialized view num") {
+                        @Override
+                        public Integer getValue() {
+                            return Env.getCurrentEnv().getCatalogMgr().getInternalCatalog().getAllDbs().stream()
+                                    .map(d -> (Database) d).map(db -> db.getMTMVNum(trigger, method, partitionType))
+                                    .reduce(0, Integer::sum);
+                        }
+                    };
+                    gauge.addLabel(new MetricLabel("trigger", trigger.name()))
+                            .addLabel(new MetricLabel("method", method.name()))
+                            .addLabel(new MetricLabel("partitionType", partitionType.name()));
+                    DORIS_METRIC_REGISTER.addMetrics(gauge);
+                }
+            }
+        }
+
+        // task duration
+        HISTO_ASYNC_MATERIALIZED_VIEW_TASK_DURATION = METRIC_REGISTER.histogram(
+                MetricRegistry.name("async_materialized_view_task", "duration", "ms"));
+
+        // task success num
+        COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SUCCESS_NUM = new LongCounterMetric(
+                "async_materialized_view_task_success_num", MetricUnit.NOUNIT,
+                "async materialized view task success num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SUCCESS_NUM);
+        // task failed num
+        COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_FAILED_NUM = new LongCounterMetric(
+                "async_materialized_view_task_failed_num", MetricUnit.NOUNIT,
+                "async materialized view task failed num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_FAILED_NUM);
+        // task skip num
+        COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SKIP_NUM = new LongCounterMetric("async_materialized_view_task_skip_num",
+                MetricUnit.NOUNIT,
+                "async materialized view task skip num");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_ASYNC_MATERIALIZED_VIEW_TASK_SKIP_NUM);
+        // task running num
+        GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_RUNNING_NUM = new GaugeMetric<Integer>(
+                "async_materialized_view_task_running_num",
+                MetricUnit.NOUNIT, "async materialized view task running num") {
+            @Override
+            public Integer getValue() {
+                return MTMVUtil.getTaskNum(TaskStatus.RUNNING);
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_RUNNING_NUM);
+
+        // task pending num
+        GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_PENDING_NUM = new GaugeMetric<Integer>(
+                "async_materialized_view_task_pending_num",
+                MetricUnit.NOUNIT, "async materialized view task pending num") {
+            @Override
+            public Integer getValue() {
+                return MTMVUtil.getTaskNum(TaskStatus.PENDING);
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_ASYNC_MATERIALIZED_VIEW_TASK_PENDING_NUM);
+        GAUGE_MAX_TABLE_SIZE_BYTES = new GaugeMetricImpl<>("max_table_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MAX_TABLE_SIZE_BYTES);
+
+        GAUGE_MAX_PARTITION_SIZE_BYTES = new GaugeMetricImpl<>("max_partition_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MAX_PARTITION_SIZE_BYTES);
+
+        GAUGE_MAX_TABLET_SIZE_BYTES = new GaugeMetricImpl<>("max_tablet_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MAX_TABLET_SIZE_BYTES);
+
+        GAUGE_MIN_TABLE_SIZE_BYTES = new GaugeMetricImpl<>("min_table_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MIN_TABLE_SIZE_BYTES);
+
+        GAUGE_MIN_PARTITION_SIZE_BYTES = new GaugeMetricImpl<>("min_partition_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MIN_PARTITION_SIZE_BYTES);
+
+        GAUGE_MIN_TABLET_SIZE_BYTES = new GaugeMetricImpl<>("min_tablet_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_MIN_TABLET_SIZE_BYTES);
+
+        GAUGE_AVG_TABLE_SIZE_BYTES = new GaugeMetricImpl<>("avg_table_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_AVG_TABLE_SIZE_BYTES);
+
+        GAUGE_AVG_PARTITION_SIZE_BYTES = new GaugeMetricImpl<>("avg_partition_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_AVG_PARTITION_SIZE_BYTES);
+
+        GAUGE_AVG_TABLET_SIZE_BYTES = new GaugeMetricImpl<>("avg_tablet_size_bytes", MetricUnit.BYTES, "", 0L);
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_AVG_TABLET_SIZE_BYTES);
+
+        COUNTER_AGENT_TASK_REQUEST_TOTAL = new LongCounterMetric("agent_task_request_total", MetricUnit.NOUNIT,
+                "total agent batch task request send to BE");
+        DORIS_METRIC_REGISTER.addMetrics(COUNTER_AGENT_TASK_REQUEST_TOTAL);
+        COUNTER_AGENT_TASK_TOTAL = addLabeledMetrics("task", () ->
+                new LongCounterMetric("agent_task_total", MetricUnit.NOUNIT, "total agent task"));
+        COUNTER_AGENT_TASK_RESEND_TOTAL = addLabeledMetrics("task", () ->
+                new LongCounterMetric("agent_task_resend_total", MetricUnit.NOUNIT, "total agent task resend"));
 
         // init system metrics
         initSystemMetrics();
@@ -526,6 +1058,129 @@ public final class MetricRepo {
         if (Config.enable_metric_calculator) {
             metricTimer.scheduleAtFixedRate(metricCalculator, 0, 15 * 1000L, TimeUnit.MILLISECONDS);
         }
+    }
+
+    private static void initRoutineLoadJobMetrics() {
+        //  routine load jobs
+        RoutineLoadManager routineLoadManager = Env.getCurrentEnv().getRoutineLoadManager();
+        for (RoutineLoadJob.JobState jobState : RoutineLoadJob.JobState.values()) {
+            if (jobState == RoutineLoadJob.JobState.PAUSED) {
+                addRoutineLoadJobStateGaugeMetric(routineLoadManager, jobState, "USER_PAUSED",
+                        job -> job.getPauseReason() != null
+                                && job.getPauseReason().getCode() == InternalErrorCode.MANUAL_PAUSE_ERR);
+                addRoutineLoadJobStateGaugeMetric(routineLoadManager, jobState, "ABNORMAL_PAUSED",
+                        job -> job.getPauseReason() != null
+                                && job.getPauseReason().getCode() != InternalErrorCode.MANUAL_PAUSE_ERR);
+            }
+            addRoutineLoadJobStateGaugeMetric(routineLoadManager, jobState, jobState.name(), job -> true);
+        }
+        GAUGE_ROUTINE_LOAD_PROGRESS = new GaugeMetric<Long>("routine_load_progress",
+                MetricUnit.NOUNIT, "total routine load progress") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                return routineLoadManager
+                        .getActiveRoutineLoadJobs().stream()
+                        .mapToLong(RoutineLoadJob::totalProgress)
+                        .sum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_ROUTINE_LOAD_PROGRESS);
+        GAUGE_ROUTINE_LOAD_LAG = new GaugeMetric<Long>("routine_load_lag",
+                MetricUnit.NOUNIT, "total routine load lag") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                return routineLoadManager
+                        .getActiveRoutineLoadJobs().stream()
+                        .mapToLong(RoutineLoadJob::totalLag)
+                        .sum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_ROUTINE_LOAD_LAG);
+        GAUGE_ROUTINE_LOAD_ABORT_TASK_NUM = new GaugeMetric<Long>("routine_load_abort_task_num",
+                MetricUnit.NOUNIT, "total number of aborted tasks in active routine load jobs") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                return routineLoadManager
+                        .getActiveRoutineLoadJobs().stream()
+                        .mapToLong(job -> job.getRoutineLoadStatistic().abortedTaskNum)
+                        .sum();
+            }
+        };
+        DORIS_METRIC_REGISTER.addMetrics(GAUGE_ROUTINE_LOAD_ABORT_TASK_NUM);
+    }
+
+    private static void addRoutineLoadJobStateGaugeMetric(RoutineLoadManager routineLoadManager,
+            RoutineLoadJob.JobState jobState,
+            String stateLabel, Predicate<RoutineLoadJob> filter) {
+        GaugeMetric<Long> gauge = new GaugeMetric<Long>("job", MetricUnit.NOUNIT, "routine load job statistics") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                return routineLoadManager
+                        .getRoutineLoadJobByState(Collections.singleton(jobState))
+                        .stream()
+                        .filter(filter)
+                        .count();
+            }
+        };
+        gauge.addLabel(new MetricLabel("job", "load"))
+                .addLabel(new MetricLabel("type", "ROUTINE_LOAD"))
+                .addLabel(new MetricLabel("state", stateLabel));
+        DORIS_METRIC_REGISTER.addMetrics(gauge);
+    }
+
+    private static void initStreamingJobMetrics() {
+        // streaming insert jobs
+        for (JobStatus jobStatus : JobStatus.values()) {
+            if (jobStatus == JobStatus.PAUSED) {
+                addStreamingJobStateGaugeMetric(jobStatus, "USER_PAUSED",
+                        job -> job.getFailureReason() != null
+                                && job.getFailureReason().getCode() == InternalErrorCode.MANUAL_PAUSE_ERR);
+                addStreamingJobStateGaugeMetric(jobStatus, "ABNORMAL_PAUSED",
+                        job -> job.getFailureReason() != null
+                                && job.getFailureReason().getCode() != InternalErrorCode.MANUAL_PAUSE_ERR);
+            }
+            addStreamingJobStateGaugeMetric(jobStatus, jobStatus.name(), job -> true);
+        }
+    }
+
+    private static void addStreamingJobStateGaugeMetric(
+            JobStatus jobStatus, String stateLabel, Predicate<StreamingInsertJob> filter) {
+
+        GaugeMetric<Long> gauge = new GaugeMetric<Long>(
+                "job", MetricUnit.NOUNIT, "streaming job statistics") {
+            @Override
+            public Long getValue() {
+                if (!Env.getCurrentEnv().isMaster()) {
+                    return 0L;
+                }
+                List<org.apache.doris.job.base.AbstractJob> jobs =
+                        Env.getCurrentEnv().getJobManager().queryJobs(org.apache.doris.job.common.JobType.INSERT);
+
+                return jobs.stream()
+                        .filter(job -> job instanceof StreamingInsertJob)
+                        .map(job -> (StreamingInsertJob) job)
+                        .filter(job -> job.getJobStatus() == jobStatus)
+                        .filter(filter)
+                        .count();
+            }
+        };
+
+        gauge.addLabel(new MetricLabel("job", "load"))
+                .addLabel(new MetricLabel("type", "STREAMING_JOB"))
+                .addLabel(new MetricLabel("state", stateLabel));
+        DORIS_METRIC_REGISTER.addMetrics(gauge);
     }
 
     private static void initSystemMetrics() {
@@ -638,7 +1293,6 @@ public final class MetricRepo {
         DORIS_METRIC_REGISTER.removeMetrics(TABLET_MAX_COMPACTION_SCORE);
 
         SystemInfoService infoService = Env.getCurrentSystemInfo();
-        TabletInvertedIndex invertedIndex = Env.getCurrentInvertedIndex();
 
         for (Long beId : infoService.getAllBackendIds(false)) {
             Backend be = infoService.getBackend(beId);
@@ -653,7 +1307,7 @@ public final class MetricRepo {
                     if (!Env.getCurrentEnv().isMaster()) {
                         return 0L;
                     }
-                    return (long) invertedIndex.getTabletNumByBackendId(beId);
+                    return (long) infoService.getTabletNumByBackendId(beId);
                 }
             };
             tabletNum.addLabel(new MetricLabel("backend",
@@ -707,6 +1361,8 @@ public final class MetricRepo {
 
         visitor.visitCloudTableStats();
 
+        visitor.visitWorkloadGroup();
+
         return visitor.finish();
     }
 
@@ -758,6 +1414,20 @@ public final class MetricRepo {
         queryErrCounter.setLabels(labels);
         MetricRepo.DORIS_METRIC_REGISTER.addMetrics(queryErrCounter);
 
+        LongCounterMetric warmUpJobExecCounter = CloudMetrics.CLUSTER_WARM_UP_JOB_EXEC_COUNT.getOrAdd(clusterId);
+        warmUpJobExecCounter.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(warmUpJobExecCounter);
+
+        LongCounterMetric warmUpJobRequestedTablets =
+                CloudMetrics.CLUSTER_WARM_UP_JOB_REQUESTED_TABLETS.getOrAdd(clusterId);
+        warmUpJobRequestedTablets.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(warmUpJobRequestedTablets);
+
+        LongCounterMetric warmUpJobFinishedTablets =
+                CloudMetrics.CLUSTER_WARM_UP_JOB_FINISHED_TABLETS.getOrAdd(clusterId);
+        warmUpJobFinishedTablets.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(warmUpJobFinishedTablets);
+
         GaugeMetricImpl<Double> requestPerSecondGauge = CloudMetrics.CLUSTER_REQUEST_PER_SECOND_GAUGE
                 .getOrAdd(clusterId);
         requestPerSecondGauge.setLabels(labels);
@@ -773,6 +1443,32 @@ public final class MetricRepo {
 
         String key = clusterId + CloudMetrics.CLOUD_CLUSTER_DELIMITER + clusterName;
         CloudMetrics.CLUSTER_QUERY_LATENCY_HISTO.getOrAdd(key);
+
+        LongCounterMetric clusterCloudPartitionBalanceNum =
+                CloudMetrics.CLUSTER_CLOUD_PARTITION_BALANCE_NUM.getOrAdd(clusterId);
+        clusterCloudPartitionBalanceNum.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(clusterCloudPartitionBalanceNum);
+
+        LongCounterMetric clusterCloudTableBalanceNum =
+                CloudMetrics.CLUSTER_CLOUD_TABLE_BALANCE_NUM.getOrAdd(clusterId);
+        clusterCloudTableBalanceNum.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(clusterCloudTableBalanceNum);
+
+        LongCounterMetric clusterCloudGlobalBalanceNum =
+                CloudMetrics.CLUSTER_CLOUD_GLOBAL_BALANCE_NUM.getOrAdd(clusterId);
+        clusterCloudGlobalBalanceNum.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(clusterCloudGlobalBalanceNum);
+
+        LongCounterMetric clusterCloudSmoothUpgradeBalanceNum =
+                CloudMetrics.CLUSTER_CLOUD_SMOOTH_UPGRADE_BALANCE_NUM.getOrAdd(clusterId);
+        clusterCloudSmoothUpgradeBalanceNum.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(clusterCloudSmoothUpgradeBalanceNum);
+
+        LongCounterMetric clusterCloudWarmUpBalanceNum =
+                CloudMetrics.CLUSTER_CLOUD_WARM_UP_CACHE_BALANCE_NUM.getOrAdd(clusterId);
+        clusterCloudWarmUpBalanceNum.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(clusterCloudWarmUpBalanceNum);
+
     }
 
     public static void increaseClusterRequestAll(String clusterName) {
@@ -780,7 +1476,7 @@ public final class MetricRepo {
             return;
         }
         String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
-                .getCloudClusterNameToId().get(clusterName);
+                .getCloudClusterNameToId(true).get(clusterName);
         if (Strings.isNullOrEmpty(clusterId)) {
             return;
         }
@@ -798,7 +1494,7 @@ public final class MetricRepo {
             return;
         }
         String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
-                .getCloudClusterNameToId().get(clusterName);
+                .getCloudClusterNameToId(true).get(clusterName);
         if (Strings.isNullOrEmpty(clusterId)) {
             return;
         }
@@ -816,7 +1512,7 @@ public final class MetricRepo {
             return;
         }
         String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
-                .getCloudClusterNameToId().get(clusterName);
+                .getCloudClusterNameToId(true).get(clusterName);
         if (Strings.isNullOrEmpty(clusterId)) {
             return;
         }
@@ -827,6 +1523,90 @@ public final class MetricRepo {
         labels.add(new MetricLabel("cluster_name", clusterName));
         counter.setLabels(labels);
         MetricRepo.DORIS_METRIC_REGISTER.addMetrics(counter);
+    }
+
+    public static void increaseClusterWarmUpJobExecCount(String clusterName) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(clusterName)) {
+            return;
+        }
+        String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
+                .getCloudClusterNameToId(true).get(clusterName);
+        if (Strings.isNullOrEmpty(clusterId)) {
+            return;
+        }
+        LongCounterMetric counter = CloudMetrics.CLUSTER_WARM_UP_JOB_EXEC_COUNT.getOrAdd(clusterId);
+        List<MetricLabel> labels = new ArrayList<>();
+        counter.increase(1L);
+        labels.add(new MetricLabel("cluster_id", clusterId));
+        labels.add(new MetricLabel("cluster_name", clusterName));
+        counter.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(counter);
+    }
+
+    public static void increaseClusterWarmUpJobRequestedTablets(String clusterName, long tablets) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(clusterName)) {
+            return;
+        }
+        String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
+                .getCloudClusterNameToId(true).get(clusterName);
+        if (Strings.isNullOrEmpty(clusterId)) {
+            return;
+        }
+        LongCounterMetric counter = CloudMetrics.CLUSTER_WARM_UP_JOB_REQUESTED_TABLETS.getOrAdd(clusterId);
+        List<MetricLabel> labels = new ArrayList<>();
+        counter.increase(tablets);
+        labels.add(new MetricLabel("cluster_id", clusterId));
+        labels.add(new MetricLabel("cluster_name", clusterName));
+        counter.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(counter);
+    }
+
+    public static void increaseClusterWarmUpJobFinishedTablets(String clusterName, long bytes) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(clusterName)) {
+            return;
+        }
+        String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
+                .getCloudClusterNameToId(true).get(clusterName);
+        if (Strings.isNullOrEmpty(clusterId)) {
+            return;
+        }
+        LongCounterMetric counter = CloudMetrics.CLUSTER_WARM_UP_JOB_FINISHED_TABLETS.getOrAdd(clusterId);
+        List<MetricLabel> labels = new ArrayList<>();
+        counter.increase(bytes);
+        labels.add(new MetricLabel("cluster_id", clusterId));
+        labels.add(new MetricLabel("cluster_name", clusterName));
+        counter.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(counter);
+    }
+
+    public static void updateClusterWarmUpJobLatestStartTime(
+            String jobId, String srcClusterName, String dstClusterName, long timeMs) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(jobId)) {
+            return;
+        }
+        LongCounterMetric time = CloudMetrics.CLUSTER_WARM_UP_JOB_LATEST_START_TIME.getOrAdd(jobId);
+        List<MetricLabel> labels = new ArrayList<>();
+        time.update(timeMs);
+        labels.add(new MetricLabel("job_id", jobId));
+        labels.add(new MetricLabel("src_cluster_name", srcClusterName));
+        labels.add(new MetricLabel("dst_cluster_name", dstClusterName));
+        time.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(time);
+    }
+
+    public static void updateClusterWarmUpJobLastFinishTime(
+            String jobId, String srcClusterName, String dstClusterName, long timeMs) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(jobId)) {
+            return;
+        }
+        LongCounterMetric time = CloudMetrics.CLUSTER_WARM_UP_JOB_LAST_FINISH_TIME.getOrAdd(jobId);
+        List<MetricLabel> labels = new ArrayList<>();
+        time.update(timeMs);
+        labels.add(new MetricLabel("job_id", jobId));
+        labels.add(new MetricLabel("src_cluster_name", srcClusterName));
+        labels.add(new MetricLabel("dst_cluster_name", dstClusterName));
+        time.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(time);
     }
 
     public static void updateClusterRequestPerSecond(String clusterId, double value, List<MetricLabel> labels) {
@@ -854,6 +1634,16 @@ public final class MetricRepo {
             return;
         }
         GaugeMetricImpl<Double> gauge = CloudMetrics.CLUSTER_QUERY_ERR_RATE_GAUGE.getOrAdd(clusterId);
+        gauge.setValue(value);
+        gauge.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(gauge);
+    }
+
+    public static void updateMetaServiceRpcPerSecond(String methodName, double value, List<MetricLabel> labels) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(methodName)) {
+            return;
+        }
+        GaugeMetricImpl<Double> gauge = CloudMetrics.META_SERVICE_RPC_PER_SECOND.getOrAdd(methodName);
         gauge.setValue(value);
         gauge.setLabels(labels);
         MetricRepo.DORIS_METRIC_REGISTER.addMetrics(gauge);
@@ -895,11 +1685,148 @@ public final class MetricRepo {
             return;
         }
         String clusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
-                .getCloudClusterNameToId().get(clusterName);
+                .getCloudClusterNameToId(true).get(clusterName);
         if (Strings.isNullOrEmpty(clusterId)) {
             return;
         }
         String key = clusterId + CloudMetrics.CLOUD_CLUSTER_DELIMITER + clusterName;
         CloudMetrics.CLUSTER_QUERY_LATENCY_HISTO.getOrAdd(key).update(elapseMs);
+    }
+
+    public static void updateClusterCloudBalanceNum(String clusterName, String clusterId,
+                                                    CloudTabletRebalancer.StatType type, long num) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(clusterName)
+                || Strings.isNullOrEmpty(clusterId)) {
+            return;
+        }
+        LongCounterMetric counter = null;
+        switch (type) {
+            case PARTITION:
+                counter = CloudMetrics.CLUSTER_CLOUD_PARTITION_BALANCE_NUM.getOrAdd(clusterId);
+                break;
+            case TABLE:
+                counter = CloudMetrics.CLUSTER_CLOUD_TABLE_BALANCE_NUM.getOrAdd(clusterId);
+                break;
+            case GLOBAL:
+                counter = CloudMetrics.CLUSTER_CLOUD_GLOBAL_BALANCE_NUM.getOrAdd(clusterId);
+                break;
+            case SMOOTH_UPGRADE:
+                counter = CloudMetrics.CLUSTER_CLOUD_SMOOTH_UPGRADE_BALANCE_NUM.getOrAdd(clusterId);
+                break;
+            case WARM_UP_CACHE:
+                counter = CloudMetrics.CLUSTER_CLOUD_WARM_UP_CACHE_BALANCE_NUM.getOrAdd(clusterId);
+                break;
+            default:
+                return;
+        }
+        List<MetricLabel> labels = new ArrayList<>();
+        counter.update(num);
+        labels.add(new MetricLabel("cluster_id", clusterId));
+        labels.add(new MetricLabel("cluster_name", clusterName));
+        counter.setLabels(labels);
+        MetricRepo.DORIS_METRIC_REGISTER.addMetrics(counter);
+    }
+
+    public static void unregisterCloudMetrics(String clusterId, String clusterName, List<Backend> backends) {
+        if (!MetricRepo.isInit || Config.isNotCloudMode() || Strings.isNullOrEmpty(clusterId)) {
+            return;
+        }
+        LOG.debug("unregister cloud metrics for cluster {}", clusterId);
+        try {
+            List<MetricLabel> labels = new ArrayList<>();
+            labels.add(new MetricLabel("cluster_id", clusterId));
+            labels.add(new MetricLabel("cluster_name", clusterName));
+
+            LongCounterMetric requestAllCounter = CloudMetrics.CLUSTER_REQUEST_ALL_COUNTER.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_REQUEST_ALL_COUNTER.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(requestAllCounter.getName(), labels);
+
+            LongCounterMetric queryAllCounter = CloudMetrics.CLUSTER_QUERY_ALL_COUNTER.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_QUERY_ALL_COUNTER.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(queryAllCounter.getName(), labels);
+
+            LongCounterMetric queryErrCounter = CloudMetrics.CLUSTER_QUERY_ERR_COUNTER.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_QUERY_ERR_COUNTER.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(queryErrCounter.getName(), labels);
+
+            LongCounterMetric warmUpJobExecCounter = CloudMetrics.CLUSTER_WARM_UP_JOB_EXEC_COUNT.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_WARM_UP_JOB_EXEC_COUNT.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(warmUpJobExecCounter.getName(), labels);
+
+            LongCounterMetric warmUpJobRequestedTablets =
+                    CloudMetrics.CLUSTER_WARM_UP_JOB_REQUESTED_TABLETS.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_WARM_UP_JOB_REQUESTED_TABLETS.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(warmUpJobRequestedTablets.getName(), labels);
+
+            LongCounterMetric warmUpJobFinishedTablets =
+                    CloudMetrics.CLUSTER_WARM_UP_JOB_FINISHED_TABLETS.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_WARM_UP_JOB_FINISHED_TABLETS.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(warmUpJobFinishedTablets.getName(), labels);
+
+            GaugeMetricImpl<Double> requestPerSecondGauge = CloudMetrics.CLUSTER_REQUEST_PER_SECOND_GAUGE
+                    .getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_REQUEST_PER_SECOND_GAUGE.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(requestPerSecondGauge.getName(), labels);
+
+            GaugeMetricImpl<Double> queryPerSecondGauge = CloudMetrics.CLUSTER_QUERY_PER_SECOND_GAUGE
+                    .getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_QUERY_PER_SECOND_GAUGE.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(queryPerSecondGauge.getName(), labels);
+
+            GaugeMetricImpl<Double> queryErrRateGauge = CloudMetrics.CLUSTER_QUERY_ERR_RATE_GAUGE.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_QUERY_ERR_RATE_GAUGE.remove(clusterId);
+            DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(queryErrRateGauge.getName(), labels);
+
+            LongCounterMetric clusterCloudPartitionBalanceNum = CloudMetrics
+                    .CLUSTER_CLOUD_PARTITION_BALANCE_NUM.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_CLOUD_PARTITION_BALANCE_NUM.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER
+                .removeMetricsByNameAndLabels(clusterCloudPartitionBalanceNum.getName(), labels);
+
+            LongCounterMetric clusterCloudTableBalanceNum = CloudMetrics
+                    .CLUSTER_CLOUD_TABLE_BALANCE_NUM.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_CLOUD_TABLE_BALANCE_NUM.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER
+                .removeMetricsByNameAndLabels(clusterCloudTableBalanceNum.getName(), labels);
+
+            LongCounterMetric clusterCloudGlobalBalanceNum = CloudMetrics
+                    .CLUSTER_CLOUD_GLOBAL_BALANCE_NUM.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_CLOUD_GLOBAL_BALANCE_NUM.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER
+                .removeMetricsByNameAndLabels(clusterCloudGlobalBalanceNum.getName(), labels);
+
+            LongCounterMetric clusterCloudUpgradeBalanceNum = CloudMetrics
+                    .CLUSTER_CLOUD_SMOOTH_UPGRADE_BALANCE_NUM.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_CLOUD_SMOOTH_UPGRADE_BALANCE_NUM.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER
+                .removeMetricsByNameAndLabels(clusterCloudUpgradeBalanceNum.getName(), labels);
+
+            LongCounterMetric clusterCloudWarmUpBalanceNum = CloudMetrics
+                    .CLUSTER_CLOUD_WARM_UP_CACHE_BALANCE_NUM.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_CLOUD_WARM_UP_CACHE_BALANCE_NUM.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER
+                .removeMetricsByNameAndLabels(clusterCloudWarmUpBalanceNum.getName(), labels);
+
+            METRIC_REGISTER.getHistograms().keySet().stream()
+                    .filter(k -> k.contains(clusterId))
+                    .forEach(METRIC_REGISTER::remove);
+
+            for (Backend backend : backends) {
+                List<MetricLabel> backendLabels = new ArrayList<>();
+                backendLabels.add(new MetricLabel("cluster_id", clusterId));
+                backendLabels.add(new MetricLabel("cluster_name", clusterName));
+                backendLabels.add(new MetricLabel("address", backend.getAddress()));
+                String key = clusterId + "_" + backend.getAddress();
+                GaugeMetricImpl<Integer> metric = CloudMetrics.CLUSTER_BACKEND_ALIVE.getOrAdd(key);
+                MetricRepo.DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(metric.getName(), backendLabels);
+            }
+
+            GaugeMetricImpl<Integer> backendAliveTotal = CloudMetrics.CLUSTER_BACKEND_ALIVE_TOTAL.getOrAdd(clusterId);
+            CloudMetrics.CLUSTER_BACKEND_ALIVE_TOTAL.remove(clusterId);
+            MetricRepo.DORIS_METRIC_REGISTER.removeMetricsByNameAndLabels(backendAliveTotal.getName(), labels);
+
+        } catch (Throwable t) {
+            LOG.warn("unregister cloud metrics for cluster {} failed", clusterId, t);
+        }
     }
 }

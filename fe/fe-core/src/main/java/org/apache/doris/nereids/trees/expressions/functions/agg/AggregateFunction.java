@@ -28,6 +28,7 @@ import org.apache.doris.nereids.types.VarcharType;
 
 import com.google.common.collect.ImmutableList;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -38,23 +39,27 @@ import java.util.stream.Collectors;
 public abstract class AggregateFunction extends BoundFunction implements ExpectsInputTypes {
 
     protected final boolean distinct;
-
-    public AggregateFunction(String name, Expression... arguments) {
-        this(name, false, arguments);
-    }
+    protected final boolean isSkew;
 
     public AggregateFunction(String name, boolean distinct, Expression... arguments) {
-        super(name, arguments);
-        this.distinct = distinct;
+        this(name, distinct, false, Arrays.asList(arguments));
     }
 
     public AggregateFunction(String name, List<Expression> children) {
-        this(name, false, children);
+        this(name, false, false, children);
     }
 
-    public AggregateFunction(String name, boolean distinct, List<Expression> children) {
+    public AggregateFunction(String name, boolean distinct, boolean isSkew, List<Expression> children) {
         super(name, children);
         this.distinct = distinct;
+        this.isSkew = isSkew;
+    }
+
+    /** constructor for withChildren and reuse signature */
+    protected AggregateFunction(AggregateFunctionParams functionParams) {
+        super(functionParams);
+        this.distinct = functionParams.isDistinct;
+        this.isSkew = functionParams.isSkew;
     }
 
     protected List<DataType> intermediateTypes() {
@@ -66,15 +71,36 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
         return withDistinctAndChildren(distinct, children);
     }
 
+    public boolean forceSkipRegulator(AggregatePhase aggregatePhase) {
+        return false;
+    }
+
     public abstract AggregateFunction withDistinctAndChildren(boolean distinct, List<Expression> children);
 
     /** getIntermediateTypes */
     public final PartialAggType getIntermediateTypes() {
-        return new PartialAggType(getArguments(), intermediateTypes());
+        return new PartialAggType(intermediateTypes());
     }
 
     public boolean isDistinct() {
         return distinct;
+    }
+
+    @Override
+    public AggregateFunctionParams getFunctionParams(List<Expression> arguments) {
+        return new AggregateFunctionParams(this, getName(), isDistinct(), isSkew(), arguments, isInferred());
+    }
+
+    public AggregateFunctionParams getFunctionParams(boolean isDistinct, List<Expression> arguments) {
+        return new AggregateFunctionParams(
+                this, getName(), isDistinct, isSkew(), arguments, isInferred()
+        );
+    }
+
+    public AggregateFunctionParams getFunctionParams(boolean isDistinct, boolean isSkew, List<Expression> arguments) {
+        return new AggregateFunctionParams(
+                this, getName(), isDistinct, isSkew, arguments, isInferred()
+        );
     }
 
     @Override
@@ -92,8 +118,13 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(distinct, getName(), children);
+    }
+
+    @Override
+    public boolean foldable() {
+        return false;
     }
 
     @Override
@@ -107,7 +138,7 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
     }
 
     @Override
-    public String toSql() throws UnboundException {
+    public String computeToSql() throws UnboundException {
         StringBuilder sql = new StringBuilder(getName()).append("(");
         if (distinct) {
             sql.append("DISTINCT ");
@@ -131,7 +162,37 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
         return getName() + "(" + (distinct ? "DISTINCT " : "") + args + ")";
     }
 
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder(getName()).append("(");
+        if (distinct) {
+            sb.append("DISTINCT ");
+        }
+        sb.append(
+                children.stream().map(Expression::toDigest)
+                        .collect(Collectors.joining(", "))
+        );
+        sb.append(")");
+        return sb.toString();
+    }
+
+    public boolean supportAggregatePhase(AggregatePhase aggregatePhase) {
+        return true;
+    }
+
     public List<Expression> getDistinctArguments() {
         return distinct ? getArguments() : ImmutableList.of();
+    }
+
+    public boolean mustUseMultiDistinctAgg() {
+        return false;
+    }
+
+    public Expression withIsSkew(boolean isSkew) {
+        throw new RuntimeException("current expression has not impl the withIsSkew method");
+    }
+
+    public boolean isSkew() {
+        return isSkew;
     }
 }

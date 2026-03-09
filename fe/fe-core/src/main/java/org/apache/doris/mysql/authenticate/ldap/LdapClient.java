@@ -25,6 +25,7 @@ import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.common.util.SymmetricEncryption;
 import org.apache.doris.persist.LdapInfo;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import lombok.Data;
 import org.apache.logging.log4j.LogManager;
@@ -72,6 +73,7 @@ public class LdapClient {
             contextSource.setPassword(ldapPassword);
             contextSource.afterPropertiesSet();
             ldapTemplateNoPool = new LdapTemplate(contextSource);
+            ldapTemplateNoPool.setIgnorePartialResultException(true);
         }
 
         private void setLdapTemplatePool(String ldapPassword) {
@@ -100,6 +102,7 @@ public class LdapClient {
 
             TransactionAwareContextSourceProxy proxy = new TransactionAwareContextSourceProxy(poolingContextSource);
             ldapTemplatePool = new LdapTemplate(proxy);
+            ldapTemplatePool.setIgnorePartialResultException(true);
         }
 
         public boolean checkUpdate(String ldapPassword) {
@@ -110,9 +113,9 @@ public class LdapClient {
     private void init() {
         LdapInfo ldapInfo = Env.getCurrentEnv().getAuth().getLdapInfo();
         if (ldapInfo == null || !ldapInfo.isValid()) {
-            LOG.error("info is null, maybe no ldap admin password is set.");
+            LOG.error("LDAP configuration is incorrect or LDAP admin password is not set.");
             ErrorReport.report(ErrorCode.ERROR_LDAP_CONFIGURATION_ERR);
-            throw new RuntimeException("ldapTemplate is not initialized");
+            throw new RuntimeException("LDAP configuration is incorrect or LDAP admin password is not set.");
         }
 
         String ldapPassword = SymmetricEncryption.decrypt(ldapInfo.getLdapPasswdEncrypted(),
@@ -145,6 +148,7 @@ public class LdapClient {
                     .filter(getUserFilter(LdapConfig.ldap_user_filter, userName)), password);
             return true;
         } catch (Exception e) {
+            LOG.info("ldap client checkPassword failed, userName: {}", userName, e);
             return false;
         }
     }
@@ -159,9 +163,21 @@ public class LdapClient {
         if (userDn == null) {
             return groups;
         }
-        List<String> groupDns = getDn(org.springframework.ldap.query.LdapQueryBuilder.query()
-                .base(LdapConfig.ldap_group_basedn)
-                .where("member").is(userDn));
+        List<String> groupDns;
+        if (!LdapConfig.ldap_group_filter.isEmpty()) {
+            // Support Open Directory implementations
+            String filter = LdapConfig.ldap_group_filter.replace("{login}", userName);
+            groupDns = getDn(org.springframework.ldap.query.LdapQueryBuilder.query()
+                    .attributes("dn")
+                    .base(LdapConfig.ldap_group_basedn)
+                    .filter(filter));
+        } else {
+            // Standard LDAP using member attribute
+            groupDns = getDn(org.springframework.ldap.query.LdapQueryBuilder.query()
+                    .base(LdapConfig.ldap_group_basedn)
+                    .where("member").is(userDn));
+        }
+
         if (groupDns == null) {
             return groups;
         }
@@ -183,26 +199,32 @@ public class LdapClient {
             return null;
         }
         if (userDns.size() > 1) {
-            LOG.error("{} not unique in LDAP server:{}",
+            String msg = String.format("[%s] not unique in LDAP server: [%s]",
                     getUserFilter(LdapConfig.ldap_user_filter, userName), userDns);
+            LOG.error(msg);
             ErrorReport.report(ErrorCode.ERROR_LDAP_USER_NOT_UNIQUE_ERR, userName);
-            throw new RuntimeException("User is not unique");
+            throw new RuntimeException(msg);
         }
         return userDns.get(0);
     }
 
-    private List<String> getDn(LdapQuery query) {
+    @VisibleForTesting
+    public List<String> getDn(LdapQuery query) {
         init();
         try {
-            return clientInfo.getLdapTemplatePool().search(query, new AbstractContextMapper<String>() {
-                protected String doMapFromContext(DirContextOperations ctx) {
-                    return ctx.getNameInNamespace();
-                }
-            });
+            return clientInfo.getLdapTemplatePool().search(query,
+                    new AbstractContextMapper<String>() {
+                        protected String doMapFromContext(DirContextOperations ctx) {
+                            return ctx.getNameInNamespace();
+                        }
+                    });
         } catch (Exception e) {
-            LOG.error("Get user dn fail.", e);
+            String msg
+                    = "Failed to retrieve the user's Distinguished Name (DN),"
+                    + "This may be due to incorrect LDAP configuration or an unset/incorrect LDAP admin password.";
+            LOG.error(msg, e);
             ErrorReport.report(ErrorCode.ERROR_LDAP_CONFIGURATION_ERR);
-            throw e;
+            throw new RuntimeException(msg);
         }
     }
 

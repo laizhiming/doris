@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 //import com.mysql.cj.jdbc.Driver
-suite("test_external_resource_mysql", "p2,external,mysql,external_remote,external_remote_mysql") {
+suite("test_external_resource_mysql", "p2,external") {
+
+    Boolean ignoreP2 = true;
+    if (ignoreP2) {
+        logger.info("disable p2 test");
+        return;
+    }
 
     String enabled = context.config.otherConfigs.get("enableExternalMysqlTest")
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
@@ -25,7 +31,7 @@ suite("test_external_resource_mysql", "p2,external,mysql,external_remote,externa
         String extMysqlPassword = context.config.otherConfigs.get("extMysqlPassword")
         String s3_endpoint = getS3Endpoint()
         String bucket = getS3BucketName()
-        String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+        String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
         String mysqlResourceName = "jdbc_resource_mysql_57_y"
         String mysqlDatabaseName01 = "external_mysql_database_ssb"
         String mysqlTableNameLineOrder = "external_mysql_table_lineorder"

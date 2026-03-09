@@ -18,11 +18,6 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite("test_jsonb_predict_is_null", "p0") {
-    sql """ set experimental_enable_nereids_planner = false """
-    
-    sql """ set experimental_enable_nereids_planner = true """
-    sql """ set enable_fallback_to_original_planner = true """
-
     sql "DROP TABLE IF EXISTS jb_pred"
 
     sql """
@@ -83,6 +78,11 @@ suite("test_jsonb_predict_is_null", "p0") {
     qt_select_pred "select * from jb_pred order by id"
 
     qt_select_drop "alter table jb_pred DROP COLUMN j"
+
+    waitForSchemaChangeDone {
+        sql """ SHOW ALTER TABLE COLUMN WHERE TableName='jb_pred' ORDER BY createtime DESC LIMIT 1 """
+        time 600
+    }
 
     qt_select "select * from jb_pred order by id"
 }

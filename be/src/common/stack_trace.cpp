@@ -20,10 +20,6 @@
 
 #include "common/stack_trace.h"
 
-#include <common/dwarf.h>
-#include <common/elf.h>
-#include <common/memory_sanitizer.h>
-#include <common/symbol_index.h>
 #include <fmt/format.h>
 
 #include <atomic>
@@ -33,12 +29,16 @@
 #include <sstream>
 #include <unordered_map>
 
-#include "config.h"
+#include "common/config.h"
+#include "common/demangle.h"
+#include "common/dwarf.h"
+#include "common/elf.h"
+#include "common/memory_sanitizer.h"
+#include "common/symbol_index.h"
+#include "exec/common/hex.h"
 #include "util/string_util.h"
-#include "vec/common/demangle.h"
-#include "vec/common/hex.h"
 
-#if USE_UNWIND && defined(__x86_64__)
+#if defined(USE_UNWIND) && USE_UNWIND && defined(__x86_64__)
 #include <libunwind.h>
 #else
 #include <execinfo.h>
@@ -299,7 +299,7 @@ StackTrace::StackTrace(const ucontext_t& signal_context) {
 void StackTrace::tryCapture() {
     // When unw_backtrace is not available, fall back on the standard
     // `backtrace` function from execinfo.h.
-#if USE_UNWIND && defined(__x86_64__) // TODO
+#if defined(USE_UNWIND) && USE_UNWIND && defined(__x86_64__) // TODO
     size = unw_backtrace(frame_pointers.data(), capacity);
 #else
     size = backtrace(frame_pointers.data(), capacity);

@@ -28,9 +28,13 @@ import com.google.gson.annotations.SerializedName;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class TruncateTableInfo implements Writable {
+    @SerializedName(value = "ctl")
+    private String ctl;
     @SerializedName(value = "dbId")
     private long dbId;
     @SerializedName(value = "db")
@@ -41,17 +45,30 @@ public class TruncateTableInfo implements Writable {
     private String table;
     @SerializedName(value = "partitions")
     private List<Partition> partitions = Lists.newArrayList();
+    // Only for external table
+    @SerializedName(value = "extParts")
+    private List<String> extPartNames = Lists.newArrayList();
     @SerializedName(value = "isEntireTable")
     private boolean isEntireTable = false;
     @SerializedName(value = "rawSql")
     private String rawSql = "";
+    @SerializedName(value = "op")
+    private Map<Long, String> oldPartitions = new HashMap<>();
+    @SerializedName(value = "force")
+    private boolean force = true; // older version it was forced always.
+    @SerializedName(value = "ur")
+    private Map<Long, Long> updateRecords;
+    @SerializedName(value = "ut")
+    private long updateTime;
 
     public TruncateTableInfo() {
 
     }
 
+    // for internal table
     public TruncateTableInfo(long dbId, String db, long tblId, String table, List<Partition> partitions,
-                             boolean isEntireTable, String rawSql) {
+            boolean isEntireTable, String rawSql, List<Partition> oldPartitions, boolean force,
+            Map<Long, Long> updateRecords) {
         this.dbId = dbId;
         this.db = db;
         this.tblId = tblId;
@@ -59,6 +76,24 @@ public class TruncateTableInfo implements Writable {
         this.partitions = partitions;
         this.isEntireTable = isEntireTable;
         this.rawSql = rawSql;
+        for (Partition partition : oldPartitions) {
+            this.oldPartitions.put(partition.getId(), partition.getName());
+        }
+        this.force = force;
+        this.updateRecords = updateRecords;
+    }
+
+    // for external table
+    public TruncateTableInfo(String ctl, String db, String table, List<String> partNames, long updateTime) {
+        this.ctl = ctl;
+        this.db = db;
+        this.table = table;
+        this.extPartNames = partNames;
+        this.updateTime = updateTime;
+    }
+
+    public String getCtl() {
+        return ctl;
     }
 
     public long getDbId() {
@@ -81,12 +116,32 @@ public class TruncateTableInfo implements Writable {
         return partitions;
     }
 
+    public List<String> getExtPartNames() {
+        return extPartNames;
+    }
+
+    public Map<Long, String> getOldPartitions() {
+        return oldPartitions == null ? new HashMap<>() : oldPartitions;
+    }
+
     public boolean isEntireTable() {
         return isEntireTable;
     }
 
+    public boolean getForce() {
+        return force;
+    }
+
     public String getRawSql() {
         return rawSql;
+    }
+
+    public Map<Long, Long> getUpdateRecords() {
+        return updateRecords;
+    }
+
+    public long getUpdateTime() {
+        return updateTime;
     }
 
     public static TruncateTableInfo read(DataInput in) throws IOException {
@@ -106,6 +161,16 @@ public class TruncateTableInfo implements Writable {
 
     @Override
     public String toString() {
-        return toJson();
+        return "TruncateTableInfo{"
+                + "ctl=" + ctl
+                + ", dbId=" + dbId
+                + ", db='" + db + '\''
+                + ", tblId=" + tblId
+                + ", table='" + table + '\''
+                + ", isEntireTable=" + isEntireTable
+                + ", rawSql='" + rawSql + '\''
+                + ", partitions_size=" + (partitions == null ? "0" : partitions.size())
+                + ", extPartNames_size=" + (extPartNames == null ? "0" : extPartNames.size())
+                + '}';
     }
 }

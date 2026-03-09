@@ -18,17 +18,52 @@
 
 export SPARK_MASTER_HOST=doris--spark-iceberg
 
+# wait iceberg-rest start
+while [[ ! $(curl -s --fail http://rest:8181/v1/config) ]]; do
+    sleep 1
+done
+
+set -ex
+
+# remove /opt/spark/jars/iceberg-aws-bundle-1.5.0.jar\:/opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar
+rm /opt/spark/jars/iceberg-aws-bundle-1.5.0.jar
+rm /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar
+
 start-master.sh -p 7077
 start-worker.sh spark://doris--spark-iceberg:7077
 start-history-server.sh
 start-thriftserver.sh --driver-java-options "-Dderby.system.home=/tmp/derby"
 
-# Entrypoint, for example notebook, pyspark or spark-sql
-if [[ $# -gt 0 ]]; then
-    eval "$1"
-fi
+# The creation of a Spark SQL client is time-consuming,
+# and reopening a new client for each SQL file execution leads to significant overhead.
+# To reduce the time spent on creating clients,
+# we group these files together and execute them using a single client.
+# This approach can reduce the time from 150s to 40s.
 
-# Avoid container exit
-while true; do
-    sleep 1
-done
+START_TIME1=$(date +%s)
+find /mnt/scripts/create_preinstalled_scripts/iceberg -name '*.sql' | sed 's|^|source |' | sed 's|$|;|'> iceberg_total.sql
+spark-sql --master spark://doris--spark-iceberg:7077 --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions -f iceberg_total.sql 
+END_TIME1=$(date +%s)
+EXECUTION_TIME1=$((END_TIME1 - START_TIME1))
+echo "Script iceberg total: {} executed in $EXECUTION_TIME1 seconds"
+
+START_TIME2=$(date +%s)
+find /mnt/scripts/create_preinstalled_scripts/paimon -name '*.sql' | sed 's|^|source |' | sed 's|$|;|'> paimon_total.sql
+spark-sql  --master  spark://doris--spark-iceberg:7077 --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions -f paimon_total.sql
+END_TIME2=$(date +%s)
+EXECUTION_TIME2=$((END_TIME2 - START_TIME2))
+echo "Script paimon total: {} executed in $EXECUTION_TIME2 seconds"
+
+
+
+ls /mnt/scripts/create_preinstalled_scripts/iceberg_scala/*.scala | xargs -n 1 -I {} bash -c '
+    START_TIME=$(date +%s)
+    spark-shell --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions -I {} 
+    END_TIME=$(date +%s)
+    EXECUTION_TIME=$((END_TIME - START_TIME))
+    echo "Script: {} executed in $EXECUTION_TIME seconds"
+'
+
+touch /mnt/SUCCESS;
+
+tail -f /dev/null

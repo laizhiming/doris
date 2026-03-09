@@ -77,6 +77,7 @@ suite('complex_insert') {
     sql 'sync'
     qt_sql_uni 'select * from uni_comp_t order by id, ksint'
 
+    sql "set enable_insert_strict=false"
     sql 'truncate table dup_comp_t'
     sql '''
         insert into dup_comp_t (kint, ksint) 
@@ -109,6 +110,7 @@ suite('complex_insert') {
     '''
     sql 'sync'
     qt_sql_uni 'select * from uni_comp_t order by id, ksint, kint'
+    sql "set enable_insert_strict=true"
 
     sql 'drop table if exists t1'
     sql 'drop table if exists t2'
@@ -177,15 +179,15 @@ suite('complex_insert') {
 
     sql 'insert into t1(id, c1, c2, c3) select id, c1 * 2, c2, c3 from t1'
     sql 'sync'
-    qt_sql_1 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t3.id'
+    qt_sql_1 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t2.c1, t3.id'
 
     sql 'insert into t2(id, c1, c2, c3) select id, c1, c2 * 2, c3 from t2'
     sql 'sync'
-    qt_sql_2 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t3.id'
+    qt_sql_2 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t2.c1, t3.id'
 
     sql 'insert into t2(c1, c3) select c1 + 1, c3 + 1 from (select id, c1, c3 from t1 order by id, c1 limit 10) t1, t3'
     sql 'sync'
-    qt_sql_3 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t3.id'
+    qt_sql_3 'select * from t1, t2, t3 order by t1.id, t1.id1, t2.id, t2.c1, t3.id'
 
     sql 'drop table if exists agg_have_dup_base'
 
@@ -202,7 +204,7 @@ suite('complex_insert') {
         properties("replication_num" = "1");
     '''
     
-    createMV("create materialized view k12s3m as select k1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
+    createMV("create materialized view k12s3m as select k1 as a1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
 
     sql 'insert into agg_have_dup_base select -4, -4, -4, \'d\''
     sql 'sync'

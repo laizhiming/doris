@@ -19,13 +19,13 @@ package org.apache.doris.nereids.jobs.rewrite;
 
 import org.apache.doris.nereids.jobs.JobContext;
 import org.apache.doris.nereids.jobs.JobType;
-import org.apache.doris.nereids.rules.Rule;
+import org.apache.doris.nereids.rules.Rules;
 import org.apache.doris.nereids.trees.plans.Plan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * PlanTreeRewriteBottomUpJob
@@ -40,7 +40,7 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
     // so we will do specified action for each node based on their 'RewriteState'.
     private static final String REWRITE_STATE_KEY = "rewrite_state";
     private final RewriteJobContext rewriteJobContext;
-    private final List<Rule> rules;
+    private final Rules rules;
     private final int batchId;
 
     enum RewriteState {
@@ -55,8 +55,10 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
         ENSURE_CHILDREN_REWRITTEN
     }
 
-    public PlanTreeRewriteBottomUpJob(RewriteJobContext rewriteJobContext, JobContext context, List<Rule> rules) {
-        super(JobType.BOTTOM_UP_REWRITE, context);
+    public PlanTreeRewriteBottomUpJob(
+            RewriteJobContext rewriteJobContext, JobContext context,
+            Predicate<Plan> isTraverseChildren, Rules rules) {
+        super(JobType.BOTTOM_UP_REWRITE, context, isTraverseChildren);
         this.rewriteJobContext = Objects.requireNonNull(rewriteJobContext, "rewriteContext cannot be null");
         this.rules = Objects.requireNonNull(rules, "rules cannot be null");
         this.batchId = rewriteJobContext.batchId;
@@ -86,6 +88,13 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
     private void rewriteThis() {
         // Link the current node with the sub-plan to get the current plan which is used in the rewrite phase later.
         Plan plan = linkChildren(rewriteJobContext.plan, rewriteJobContext.childrenContext);
+        if (rules.getCurrentAndChildrenRules(plan).isEmpty()) {
+            // No new plan is generated, so just set the state of the current plan to 'REWRITTEN'.
+            setState(plan, RewriteState.REWRITTEN, batchId);
+            rewriteJobContext.setResult(plan);
+            return;
+        }
+
         RewriteResult rewriteResult = rewrite(plan, rules, rewriteJobContext);
         if (rewriteResult.hasNewPlan) {
             RewriteJobContext newJobContext = rewriteJobContext.withPlan(rewriteResult.plan);
@@ -97,7 +106,7 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
                 return;
             }
             // After the rewrite take effect, we should handle the children part again.
-            pushJob(new PlanTreeRewriteBottomUpJob(newJobContext, context, rules));
+            pushJob(new PlanTreeRewriteBottomUpJob(newJobContext, context, isTraverseChildren, rules));
             setState(rewriteResult.plan, RewriteState.ENSURE_CHILDREN_REWRITTEN, batchId);
         } else {
             // No new plan is generated, so just set the state of the current plan to 'REWRITTEN'.
@@ -108,14 +117,20 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
 
     private void ensureChildrenRewritten() {
         Plan plan = rewriteJobContext.plan;
+        if (rules.getCurrentAndChildrenRules(plan).isEmpty()) {
+            // No new plan is generated, so just set the state of the current plan to 'REWRITTEN'.
+            setState(plan, RewriteState.REWRITTEN, batchId);
+            rewriteJobContext.setResult(plan);
+            return;
+        }
+
         int batchId = rewriteJobContext.batchId;
         setState(plan, RewriteState.REWRITE_THIS, batchId);
-        pushJob(new PlanTreeRewriteBottomUpJob(rewriteJobContext, context, rules));
+        pushJob(new PlanTreeRewriteBottomUpJob(rewriteJobContext, context, isTraverseChildren, rules));
 
         // some rule return new plan tree, which the number of new plan node > 1,
         // we should transform this new plan nodes too.
-        // NOTICE: this relay on pull up cte anchor
-        if (!(rewriteJobContext.plan instanceof LogicalCTEAnchor)) {
+        if (isTraverseChildren.test(plan)) {
             pushChildrenJobs(plan);
         }
     }
@@ -128,30 +143,30 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
                 Plan child = children.get(0);
                 RewriteJobContext childRewriteJobContext = new RewriteJobContext(
                         child, rewriteJobContext, 0, false, batchId);
-                pushJob(new PlanTreeRewriteBottomUpJob(childRewriteJobContext, context, rules));
+                pushJob(new PlanTreeRewriteBottomUpJob(childRewriteJobContext, context, isTraverseChildren, rules));
                 return;
             case 2:
                 Plan right = children.get(1);
                 RewriteJobContext rightRewriteJobContext = new RewriteJobContext(
                         right, rewriteJobContext, 1, false, batchId);
-                pushJob(new PlanTreeRewriteBottomUpJob(rightRewriteJobContext, context, rules));
+                pushJob(new PlanTreeRewriteBottomUpJob(rightRewriteJobContext, context, isTraverseChildren, rules));
 
                 Plan left = children.get(0);
                 RewriteJobContext leftRewriteJobContext = new RewriteJobContext(
                         left, rewriteJobContext, 0, false, batchId);
-                pushJob(new PlanTreeRewriteBottomUpJob(leftRewriteJobContext, context, rules));
+                pushJob(new PlanTreeRewriteBottomUpJob(leftRewriteJobContext, context, isTraverseChildren, rules));
                 return;
             default:
                 for (int i = children.size() - 1; i >= 0; i--) {
                     child = children.get(i);
                     childRewriteJobContext = new RewriteJobContext(
                             child, rewriteJobContext, i, false, batchId);
-                    pushJob(new PlanTreeRewriteBottomUpJob(childRewriteJobContext, context, rules));
+                    pushJob(new PlanTreeRewriteBottomUpJob(childRewriteJobContext, context, isTraverseChildren, rules));
                 }
         }
     }
 
-    private static RewriteState getState(Plan plan, int currentBatchId) {
+    static RewriteState getState(Plan plan, int currentBatchId) {
         Optional<RewriteStateContext> state = plan.getMutableState(REWRITE_STATE_KEY);
         if (!state.isPresent()) {
             return RewriteState.ENSURE_CHILDREN_REWRITTEN;
@@ -163,7 +178,7 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
         return context.rewriteState;
     }
 
-    private static void setState(Plan plan, RewriteState state, int batchId) {
+    static void setState(Plan plan, RewriteState state, int batchId) {
         plan.setMutableState(REWRITE_STATE_KEY, new RewriteStateContext(state, batchId));
     }
 
@@ -174,6 +189,11 @@ public class PlanTreeRewriteBottomUpJob extends PlanTreeRewriteJob {
         public RewriteStateContext(RewriteState rewriteState, int batchId) {
             this.rewriteState = rewriteState;
             this.batchId = batchId;
+        }
+
+        @Override
+        public String toString() {
+            return "RewriteStateContext{rewriteState=" + rewriteState + ", batchId=" + batchId + '}';
         }
     }
 }

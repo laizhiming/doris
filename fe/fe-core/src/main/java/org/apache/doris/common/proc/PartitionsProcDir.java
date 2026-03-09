@@ -22,20 +22,26 @@ import org.apache.doris.analysis.DateLiteral;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.LimitElement;
+import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DistributionInfo;
 import org.apache.doris.catalog.DistributionInfo.DistributionInfoType;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.HashDistributionInfo;
 import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionType;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.cloud.catalog.CloudEnv;
+import org.apache.doris.cloud.catalog.CloudPartition;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
@@ -43,9 +49,33 @@ import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.ListComparator;
+import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.common.util.OrderByPair;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.mtmv.MTMVPartitionUtil;
+import org.apache.doris.mtmv.MTMVUtil;
+import org.apache.doris.nereids.trees.expressions.ComparisonPredicate;
+import org.apache.doris.nereids.trees.expressions.EqualTo;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.GreaterThan;
+import org.apache.doris.nereids.trees.expressions.GreaterThanEqual;
+import org.apache.doris.nereids.trees.expressions.LessThan;
+import org.apache.doris.nereids.trees.expressions.LessThanEqual;
+import org.apache.doris.nereids.trees.expressions.Not;
+import org.apache.doris.nereids.trees.expressions.NullSafeEqual;
+import org.apache.doris.nereids.trees.expressions.literal.DateTimeLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.DateTimeV2Literal;
+import org.apache.doris.nereids.trees.expressions.literal.DateV2Literal;
+import org.apache.doris.nereids.trees.expressions.literal.IntegerLikeLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
+import org.apache.doris.nereids.types.DateTimeType;
+import org.apache.doris.nereids.types.DateTimeV2Type;
+import org.apache.doris.nereids.types.DateV2Type;
+import org.apache.doris.nereids.types.coercion.DateLikeType;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.rpc.RpcException;
 import org.apache.doris.thrift.TCell;
 import org.apache.doris.thrift.TRow;
 
@@ -53,11 +83,15 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -69,13 +103,16 @@ import java.util.stream.Collectors;
  * show [temp] partitions' detail info within a table
  */
 public class PartitionsProcDir implements ProcDirInterface {
+    private static final Logger LOG = LogManager.getLogger(PartitionsProcDir.class);
+
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("PartitionId").add("PartitionName")
             .add("VisibleVersion").add("VisibleVersionTime")
             .add("State").add("PartitionKey").add("Range").add("DistributionKey")
             .add("Buckets").add("ReplicationNum").add("StorageMedium").add("CooldownTime").add("RemoteStoragePolicy")
             .add("LastConsistencyCheckTime").add("DataSize").add("IsInMemory").add("ReplicaAllocation")
-            .add("IsMutable").add("SyncWithBaseTables").add("UnsyncTables")
+            .add("IsMutable").add("SyncWithBaseTables").add("UnsyncTables").add("CommittedVersion")
+            .add("RowCount")
             .build();
 
     private Database db;
@@ -93,11 +130,16 @@ public class PartitionsProcDir implements ProcDirInterface {
         if (filterMap == null) {
             return true;
         }
-        Expr subExpr = filterMap.get(columnName.toLowerCase());
+        Expr subExpr = filterMap.get(columnName.toLowerCase()); // predicate on this column.
         if (subExpr == null) {
             return true;
         }
         if (subExpr instanceof BinaryPredicate) {
+            // show partitions only provide very limited filtering capacity in FE. so restrict here.
+            if (!(subExpr.getChild(1) instanceof LiteralExpr)) {
+                throw new AnalysisException("Not Supported. Use `select * from partitions(...)` instead");
+            }
+
             BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
             if (subExpr.getChild(1) instanceof StringLiteral
                     && binaryPredicate.getOp() == BinaryPredicate.Operator.EQ) {
@@ -116,6 +158,7 @@ public class PartitionsProcDir implements ProcDirInterface {
                         type = Type.DATETIMEV2;
                         break;
                     case DATETIMEV2:
+                    case TIMESTAMPTZ:
                         type = subExpr.getChild(1).getType();
                         break;
                     default:
@@ -150,6 +193,77 @@ public class PartitionsProcDir implements ProcDirInterface {
         return true;
     }
 
+    private static boolean filterSubExpression(Expression expr, Comparable element) throws AnalysisException {
+        // show partitions only provide very limited filtering capacity in FE. so restrict here.
+        if (!(expr.child(1) instanceof Literal)) {
+            throw new AnalysisException("Not Supported. Use `select * from partitions(...)` instead");
+        }
+
+        if (expr instanceof EqualTo && expr.child(1) instanceof StringLikeLiteral) {
+            return ((StringLikeLiteral) expr.child(1)).getValue().equals(element.toString());
+        }
+        long leftVal;
+        long rightVal;
+        if (expr.child(1) instanceof org.apache.doris.nereids.trees.expressions.literal.DateLiteral) {
+            DateLikeType dateLikeType;
+            if (expr.child(1) instanceof DateV2Literal) {
+                dateLikeType = DateV2Type.INSTANCE;
+            } else if (expr.child(1) instanceof DateTimeLiteral) {
+                dateLikeType = DateTimeType.INSTANCE;
+            } else if (expr.child(1) instanceof DateTimeV2Literal) {
+                dateLikeType = DateTimeV2Type.MAX;
+            } else {
+                throw new AnalysisException("Invalid date type: " + expr.child(1).getDataType());
+            }
+            leftVal = (new org.apache.doris.nereids.trees.expressions.literal.DateLiteral(
+                    dateLikeType, (String) element)).getValue();
+            rightVal = ((org.apache.doris.nereids.trees.expressions.literal.DateLiteral) expr.child(1)).getValue();
+        } else {
+            leftVal = Long.parseLong(element.toString());
+            rightVal = ((IntegerLikeLiteral) expr.child(1)).getLongValue();
+        }
+
+        if (expr instanceof EqualTo) {
+            return leftVal == rightVal;
+        } else if (expr instanceof NullSafeEqual) {
+            return leftVal == rightVal;
+        } else if (expr instanceof GreaterThan) {
+            return leftVal > rightVal;
+        } else if (expr instanceof GreaterThanEqual) {
+            return leftVal >= rightVal;
+        } else if (expr instanceof LessThan) {
+            return leftVal < rightVal;
+        } else if (expr instanceof LessThanEqual) {
+            return leftVal <= rightVal;
+        } else {
+            Preconditions.checkState(false, "No defined binary operator.");
+        }
+        return true;
+    }
+
+    public static boolean filterExpression(String columnName, Comparable element, Map<String, Expression> filterMap)
+            throws AnalysisException {
+        if (filterMap == null) {
+            return true;
+        }
+        Expression subExpr = filterMap.get(columnName.toLowerCase()); // predicate on this column.
+        if (subExpr == null) {
+            return true;
+        }
+
+        if (subExpr instanceof ComparisonPredicate) {
+            return filterSubExpression(subExpr, element);
+        } else if (subExpr instanceof Not) {
+            subExpr = subExpr.child(0);
+            if (subExpr instanceof EqualTo) {
+                return !filterSubExpression(subExpr, element);
+            }
+        } else {
+            return like(element.toString(), ((StringLikeLiteral) subExpr.child(1)).getStringValue());
+        }
+        return false;
+    }
+
     public static boolean like(String str, String expr) {
         expr = expr.toLowerCase();
         expr = expr.replace(".", "\\.");
@@ -157,6 +271,61 @@ public class PartitionsProcDir implements ProcDirInterface {
         expr = expr.replace("%", ".*");
         str = str.toLowerCase();
         return str.matches(expr);
+    }
+
+    public ProcResult fetchResultByExpressionFilter(Map<String, Expression> filterMap, List<OrderByPair> orderByPairs,
+                                                        LimitElement limitElement) throws AnalysisException {
+        List<List<Comparable>> partitionInfos = getPartitionInfos();
+        List<List<Comparable>> filterPartitionInfos;
+        //where
+        if (filterMap == null || filterMap.isEmpty()) {
+            filterPartitionInfos = partitionInfos;
+        } else {
+            filterPartitionInfos = Lists.newArrayList();
+            // TODO: we should change the order of loops to speed up. use filters to filter column value.
+            for (List<Comparable> partitionInfo : partitionInfos) {
+                if (partitionInfo.size() != TITLE_NAMES.size()) {
+                    throw new AnalysisException("PartitionInfos.size() " + partitionInfos.size()
+                        + " not equal TITLE_NAMES.size() " + TITLE_NAMES.size());
+                }
+                boolean isNeed = true;
+                for (int i = 0; i < partitionInfo.size(); i++) {
+                    isNeed = filterExpression(TITLE_NAMES.get(i), partitionInfo.get(i), filterMap);
+                    if (!isNeed) {
+                        break;
+                    }
+                }
+
+                if (isNeed) {
+                    filterPartitionInfos.add(partitionInfo);
+                }
+            }
+        }
+
+        // order by
+        if (orderByPairs != null) {
+            ListComparator<List<Comparable>> comparator;
+            OrderByPair[] orderByPairArr = new OrderByPair[orderByPairs.size()];
+            comparator = new ListComparator<>(orderByPairs.toArray(orderByPairArr));
+            filterPartitionInfos.sort(comparator);
+        }
+
+        //limit
+        if (limitElement != null && limitElement.hasLimit()) {
+            int beginIndex = (int) limitElement.getOffset();
+            int endIndex = (int) (beginIndex + limitElement.getLimit());
+            if (endIndex > filterPartitionInfos.size()) {
+                endIndex = filterPartitionInfos.size();
+            }
+
+            // means that beginIndex is bigger than filterPartitionInfos.size(), just return empty
+            if (beginIndex > endIndex) {
+                beginIndex = endIndex;
+            }
+            filterPartitionInfos = filterPartitionInfos.subList(beginIndex, endIndex);
+        }
+
+        return getBasicProcResult(filterPartitionInfos);
     }
 
     public ProcResult fetchResultByFilter(Map<String, Expr> filterMap, List<OrderByPair> orderByPairs,
@@ -168,6 +337,7 @@ public class PartitionsProcDir implements ProcDirInterface {
             filterPartitionInfos = partitionInfos;
         } else {
             filterPartitionInfos = Lists.newArrayList();
+            // TODO: we should change the order of loops to speed up. use filters to filter column value.
             for (List<Comparable> partitionInfo : partitionInfos) {
                 if (partitionInfo.size() != TITLE_NAMES.size()) {
                     throw new AnalysisException("PartitionInfos.size() " + partitionInfos.size()
@@ -202,6 +372,11 @@ public class PartitionsProcDir implements ProcDirInterface {
             if (endIndex > filterPartitionInfos.size()) {
                 endIndex = filterPartitionInfos.size();
             }
+
+            // means that beginIndex is bigger than filterPartitionInfos.size(), just return empty
+            if (beginIndex > endIndex) {
+                beginIndex = endIndex;
+            }
             filterPartitionInfos = filterPartitionInfos.subList(beginIndex, endIndex);
         }
 
@@ -233,6 +408,60 @@ public class PartitionsProcDir implements ProcDirInterface {
         return partitionInfosInrernal.stream().map(pair -> pair.second).collect(Collectors.toList());
     }
 
+    private List<Long> getPartitionVersions(OlapTable olapTable, List<Long> partitionIds)
+            throws AnalysisException {
+        List<Long> partitionVersions;
+        if (Config.isNotCloudMode()) {
+            partitionVersions = partitionIds.stream().map(id -> olapTable.getPartition(id).getVisibleVersion())
+                    .collect(Collectors.toList());
+        } else if (ConnectContext.get() != null && ConnectContext.get().getSessionVariable().cloudForceSyncVersion) {
+            LOG.info("cloud force sync version for table: {}, partitionNum: {}", olapTable, partitionIds.size());
+            long dbId = olapTable.getDatabase().getId();
+            // sync table version
+            // Note: does not update table version cache to avoid that when getting partition version fails,
+            // the table version cache is updated but partition version cache is not updated.
+            List<Long> tableVersions = OlapTable.getVisibleVersionFromMeta(Lists.newArrayList(dbId),
+                    Lists.newArrayList(olapTable.getId()));
+            List<Pair<OlapTable, Long>> tableVersionMap = Lists.newArrayList(Pair.of(olapTable, tableVersions.get(0)));
+            // sync partition version
+            List<CloudPartition> partitions = partitionIds.stream()
+                    .map(id -> (CloudPartition) (olapTable.getPartition(id))).collect(Collectors.toList());
+            try {
+                partitionVersions = new ArrayList<>(partitionIds.size());
+                int batchSize = Config.cloud_get_version_task_batch_size;
+                for (int start = 0; start < partitions.size(); start += batchSize) {
+                    int end = Math.min(start + batchSize, partitions.size());
+                    List<CloudPartition> batch = partitions.subList(start, end);
+                    partitionVersions.addAll(CloudPartition.getSnapshotVisibleVersionFromMs(batch, false));
+                }
+            } catch (RpcException e) {
+                LOG.warn("get partition versions failed for table: {}", olapTable, e);
+                throw new AnalysisException("get partition versions failed", e);
+            }
+            Map<CloudPartition, Pair<Long, Long>> partitionVersionMap = new HashMap<>(partitionIds.size());
+            for (int i = 0; i < partitionIds.size(); i++) {
+                CloudPartition partition = partitions.get(i);
+                long version = partitionVersions.get(i);
+                partitionVersionMap.put(partition, Pair.of(version, partition.getVisibleVersionTime()));
+            }
+            // push to other fes
+            ((CloudEnv) (Env.getCurrentEnv())).getCloudFEVersionSynchronizer()
+                    .pushVersionAsync(dbId, tableVersionMap, partitionVersionMap);
+        } else {
+            List<CloudPartition> partitions = partitionIds.stream()
+                    .map(id -> (CloudPartition) (olapTable.getPartition(id))).collect(Collectors.toList());
+            try {
+                partitionVersions = CloudPartition.getSnapshotVisibleVersion(partitions);
+            } catch (RpcException e) {
+                LOG.warn("get partition versions failed for table: {}", olapTable, e);
+                throw new AnalysisException("get partition versions failed", e);
+            }
+        }
+        Preconditions.checkState(partitionVersions.size() == partitionIds.size(),
+                "versions size %s not equal partition size %s", partitionVersions.size(), partitionIds.size());
+        return partitionVersions;
+    }
+
     private List<Pair<List<Comparable>, TRow>> getPartitionInfosInrernal() throws AnalysisException {
         Preconditions.checkNotNull(db);
         Preconditions.checkNotNull(olapTable);
@@ -240,14 +469,40 @@ public class PartitionsProcDir implements ProcDirInterface {
 
         // get info
         List<Pair<List<Comparable>, TRow>> partitionInfos = new ArrayList<Pair<List<Comparable>, TRow>>();
-        olapTable.readLock();
+        Map<Long, List<String>> partitionsUnSyncTables = null;
+        String mtmvPartitionSyncErrorMsg = null;
+
+        List<TableIf> needLocked = Lists.newArrayList();
+        needLocked.add(olapTable);
+        if (olapTable instanceof MTMV) {
+            MTMV mtmv = (MTMV) olapTable;
+            for (BaseTableInfo baseTableInfo : mtmv.getRelation().getBaseTables()) {
+                try {
+                    TableIf baseTable = MTMVUtil.getTable(baseTableInfo);
+                    needLocked.add(baseTable);
+                } catch (Exception e) {
+                    // do nothing, ignore not existed table
+                }
+            }
+            needLocked.sort(Comparator.comparing(TableIf::getId));
+        }
+        MetaLockUtils.readLockTables(needLocked);
         try {
+            if (olapTable instanceof MTMV) {
+                try {
+                    partitionsUnSyncTables = MTMVPartitionUtil
+                            .getPartitionsUnSyncTables((MTMV) olapTable);
+                } catch (AnalysisException e) {
+                    mtmvPartitionSyncErrorMsg = e.getMessage();
+                }
+            }
             List<Long> partitionIds;
             PartitionInfo tblPartitionInfo = olapTable.getPartitionInfo();
 
             // for range partitions, we return partitions in ascending range order by default.
             // this is to be consistent with the behaviour before 0.12
-            if (tblPartitionInfo.getType() == PartitionType.RANGE || tblPartitionInfo.getType() == PartitionType.LIST) {
+            if (tblPartitionInfo.getType() == PartitionType.RANGE
+                    || tblPartitionInfo.getType() == PartitionType.LIST) {
                 partitionIds = tblPartitionInfo.getPartitionItemEntryList(isTempPartition, true).stream()
                         .map(Map.Entry::getKey).collect(Collectors.toList());
             } else {
@@ -256,18 +511,10 @@ public class PartitionsProcDir implements ProcDirInterface {
                 partitionIds = partitions.stream().map(Partition::getId).collect(Collectors.toList());
             }
 
+            List<Long> partitionVersions = getPartitionVersions(olapTable, partitionIds);
             Joiner joiner = Joiner.on(", ");
-            Map<Long, List<String>> partitionsUnSyncTables = null;
-            String mtmvPartitionSyncErrorMsg = null;
-            if (olapTable instanceof MTMV) {
-                try {
-                    partitionsUnSyncTables = MTMVPartitionUtil
-                            .getPartitionsUnSyncTables((MTMV) olapTable, partitionIds);
-                } catch (AnalysisException e) {
-                    mtmvPartitionSyncErrorMsg = e.getMessage();
-                }
-            }
-            for (Long partitionId : partitionIds) {
+            for (int j = 0; j < partitionIds.size(); j++) {
+                long partitionId = partitionIds.get(j);
                 Partition partition = olapTable.getPartition(partitionId);
 
                 List<Comparable> partitionInfo = new ArrayList<Comparable>();
@@ -277,8 +524,9 @@ public class PartitionsProcDir implements ProcDirInterface {
                 trow.addToColumnValue(new TCell().setLongVal(partitionId));
                 partitionInfo.add(partitionName);
                 trow.addToColumnValue(new TCell().setStringVal(partitionName));
-                partitionInfo.add(partition.getVisibleVersion());
-                trow.addToColumnValue(new TCell().setLongVal(partition.getVisibleVersion()));
+                long partitionVersion = partitionVersions.get(j);
+                partitionInfo.add(partitionVersion);
+                trow.addToColumnValue(new TCell().setLongVal(partitionVersion));
                 String visibleTime = TimeUtils.longToTimeString(partition.getVisibleVersionTime());
                 partitionInfo.add(visibleTime);
                 trow.addToColumnValue(new TCell().setStringVal(visibleTime));
@@ -294,7 +542,7 @@ public class PartitionsProcDir implements ProcDirInterface {
                     String colNamesStr = joiner.join(colNames);
                     partitionInfo.add(colNamesStr);
                     trow.addToColumnValue(new TCell().setStringVal(colNamesStr));
-                    String itemStr = tblPartitionInfo.getItem(partitionId).getItems().toString();
+                    String itemStr = tblPartitionInfo.getPartitionRangeString(partitionId);
                     partitionInfo.add(itemStr);
                     trow.addToColumnValue(new TCell().setStringVal(itemStr));
                 } else {
@@ -362,11 +610,16 @@ public class PartitionsProcDir implements ProcDirInterface {
                     if (StringUtils.isEmpty(mtmvPartitionSyncErrorMsg)) {
                         List<String> partitionUnSyncTables = partitionsUnSyncTables.getOrDefault(partitionId,
                                 Lists.newArrayList());
-                        boolean isSync = CollectionUtils.isEmpty(partitionUnSyncTables);
+                        boolean isSync = partitionsUnSyncTables.containsKey(partitionId) && CollectionUtils.isEmpty(
+                                partitionUnSyncTables);
                         partitionInfo.add(isSync);
                         trow.addToColumnValue(new TCell().setBoolVal(isSync));
-                        partitionInfo.add(partitionUnSyncTables.toString());
-                        trow.addToColumnValue(new TCell().setStringVal(partitionUnSyncTables.toString()));
+                        // The calculation logic of partitionsUnSyncTables is not protected in the current lock,
+                        // so the obtained partition list may not be consistent with here
+                        String unSyncTables = partitionsUnSyncTables.containsKey(partitionId)
+                                ? partitionUnSyncTables.toString() : "not sure, please try again";
+                        partitionInfo.add(unSyncTables);
+                        trow.addToColumnValue(new TCell().setStringVal(unSyncTables));
                     } else {
                         partitionInfo.add(false);
                         trow.addToColumnValue(new TCell().setBoolVal(false));
@@ -380,10 +633,16 @@ public class PartitionsProcDir implements ProcDirInterface {
                     trow.addToColumnValue(new TCell().setStringVal(FeConstants.null_string));
                 }
 
+                partitionInfo.add(partition.getCommittedVersion());
+                trow.addToColumnValue(new TCell().setLongVal(partition.getCommittedVersion()));
+
+                partitionInfo.add(partition.getRowCount());
+                trow.addToColumnValue(new TCell().setLongVal(partition.getRowCount()));
+
                 partitionInfos.add(Pair.of(partitionInfo, trow));
             }
         } finally {
-            olapTable.readUnlock();
+            MetaLockUtils.readUnlockTables(needLocked);
         }
         return partitionInfos;
     }

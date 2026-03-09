@@ -19,6 +19,7 @@ package org.apache.doris.nereids.jobs.rewrite;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.CascadesContext;
+import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.cost.Cost;
 import org.apache.doris.nereids.hint.Hint;
 import org.apache.doris.nereids.hint.UseCboRuleHint;
@@ -28,10 +29,12 @@ import org.apache.doris.nereids.jobs.executor.Rewriter;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
+import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.qe.ConnectContext;
 
+import com.google.common.collect.ImmutableList;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -57,7 +60,8 @@ public class CostBasedRewriteJob implements RewriteJob {
 
     @Override
     public void execute(JobContext jobContext) {
-        // checkHint.first means whether it use hint and checkHint.second means what kind of hint it used
+        // checkHint.first means whether it use hint and checkHint.second means what
+        // kind of hint it used
         Pair<Boolean, Hint> checkHint = checkRuleHint();
         // this means it no_use_cbo_rule(xxx) hint
         if (checkHint.first && checkHint.second == null) {
@@ -68,14 +72,18 @@ public class CostBasedRewriteJob implements RewriteJob {
         CascadesContext applyCboRuleCtx = CascadesContext.newCurrentTreeContext(currentCtx);
         // execute cbo rule on one candidate
         Rewriter.getCteChildrenRewriter(applyCboRuleCtx, rewriteJobs).execute();
+        Plan applyCboPlan = applyCboRuleCtx.getRewritePlan();
         if (skipCboRuleCtx.getRewritePlan().deepEquals(applyCboRuleCtx.getRewritePlan())) {
             // this means rewrite do not do anything
             return;
         }
 
+        StatementContext.CteEnvironmentSnapshot cteEnvSnapshot = currentCtx.getStatementContext().cacheCteEnvironment();
         // compare two candidates
         Optional<Pair<Cost, GroupExpression>> skipCboRuleCost = getCost(currentCtx, skipCboRuleCtx, jobContext);
+        currentCtx.getStatementContext().restoreCteEnvironment(cteEnvSnapshot);
         Optional<Pair<Cost, GroupExpression>> appliedCboRuleCost = getCost(currentCtx, applyCboRuleCtx, jobContext);
+        currentCtx.getStatementContext().restoreCteEnvironment(cteEnvSnapshot);
         // If one of them optimize failed, just return
         if (!skipCboRuleCost.isPresent() || !appliedCboRuleCost.isPresent()) {
             LOG.warn("Cbo rewrite execute failed on sql: {}, jobs are {}, plan is {}.",
@@ -85,42 +93,57 @@ public class CostBasedRewriteJob implements RewriteJob {
         }
         if (checkHint.first) {
             checkHint.second.setStatus(Hint.HintStatus.SUCCESS);
-            if (((UseCboRuleHint) checkHint.second).isNotUseCboRule()) {
+            if (!((UseCboRuleHint) checkHint.second).isNotUseCboRule()) {
+                currentCtx.addPlanProcesses(applyCboRuleCtx.getPlanProcesses());
                 currentCtx.setRewritePlan(applyCboRuleCtx.getRewritePlan());
             }
             return;
         }
-        // If the candidate applied cbo rule is better, replace the original plan with it.
+        // If the candidate applied cbo rule is better, replace the original plan with
+        // it.
         if (appliedCboRuleCost.get().first.getValue() < skipCboRuleCost.get().first.getValue()) {
-            currentCtx.setRewritePlan(applyCboRuleCtx.getRewritePlan());
+            currentCtx.setRewritePlan(applyCboPlan);
         }
     }
 
     /**
      * check if we have use rule hint or no use rule hint
-     *     return an optional object which checkHint.first means whether it use hint
-     *     and checkHint.second means what kind of hint it used
-     *     example, when we use *+ no_use_cbo_rule(xxx) * the optional would be (true, false)
-     *     which means it use hint and the hint forbid this kind of rule
+     * return an optional object which checkHint.first means whether it use hint
+     * and checkHint.second means what kind of hint it used
+     * example, when we use *+ no_use_cbo_rule(xxx) * the optional would be (true,
+     * false)
+     * which means it use hint and the hint forbid this kind of rule
      */
     private Pair<Boolean, Hint> checkRuleHint() {
         Pair<Boolean, Hint> checkResult = Pair.of(false, null);
-        if (rewriteJobs.get(0) instanceof RootPlanTreeRewriteJob) {
-            for (Rule rule : ((RootPlanTreeRewriteJob) rewriteJobs.get(0)).getRules()) {
-                checkResult = checkRuleHintWithHintName(rule.getRuleType());
-                if (checkResult.first) {
-                    return checkResult;
-                }
+        RewriteJob rewriteJob = rewriteJobs.get(0);
+        List<Rule> rules = ImmutableList.of();
+        if (rewriteJob instanceof AdaptiveTopDownRewriteJob) {
+            rules = ((AdaptiveTopDownRewriteJob) rewriteJob).getRules();
+        } else if (rewriteJob instanceof AdaptiveBottomUpRewriteJob) {
+            rules = ((AdaptiveBottomUpRewriteJob) rewriteJob).getRules();
+        } else if (rewriteJob instanceof RootPlanTreeRewriteJob) {
+            rules = ((RootPlanTreeRewriteJob) rewriteJob).getRules();
+        } else if (rewriteJob instanceof TopDownVisitorRewriteJob) {
+            rules = ((TopDownVisitorRewriteJob) rewriteJob).getRules().getAllRules();
+        } else if (rewriteJob instanceof BottomUpVisitorRewriteJob) {
+            rules = ((BottomUpVisitorRewriteJob) rewriteJob).getRules().getAllRules();
+        }
+        for (Rule rule : rules) {
+            checkResult = checkRuleHintWithHintName(rule.getRuleType());
+            if (checkResult.first) {
+                return checkResult;
             }
         }
-        if (rewriteJobs.get(0) instanceof CustomRewriteJob) {
-            checkResult = checkRuleHintWithHintName(((CustomRewriteJob) rewriteJobs.get(0)).getRuleType());
+        if (rewriteJob instanceof CustomRewriteJob) {
+            checkResult = checkRuleHintWithHintName(((CustomRewriteJob) rewriteJob).getRuleType());
         }
         return checkResult;
     }
 
     /**
-     * for these rules we need use_cbo_rule hint to enable it, otherwise it would be close by default
+     * for these rules we need use_cbo_rule hint to enable it, otherwise it would be
+     * close by default
      */
     private static boolean checkBlackList(RuleType ruleType) {
         List<RuleType> ruleWhiteList = new ArrayList<>(Arrays.asList(
@@ -158,20 +181,29 @@ public class CostBasedRewriteJob implements RewriteJob {
 
     private Optional<Pair<Cost, GroupExpression>> getCost(CascadesContext currentCtx,
             CascadesContext cboCtx, JobContext jobContext) {
-        // Do subtree rewrite
+        // Do subtree rewriter
         Rewriter.getCteChildrenRewriter(cboCtx, jobContext.getRemainJobs()).execute();
         CascadesContext rootCtx = currentCtx.getRoot();
         if (rootCtx.getRewritePlan() instanceof LogicalCTEAnchor) {
             // set subtree rewrite cache
             currentCtx.getStatementContext().getRewrittenCteProducer()
                     .put(currentCtx.getCurrentTree().orElse(null), (LogicalPlan) cboCtx.getRewritePlan());
+            // Do post tree rewrite
+            CascadesContext rootCtxCopy = CascadesContext.newCurrentTreeContext(rootCtx);
+            rootCtxCopy.withPlanProcess(currentCtx.showPlanProcess(), () -> {
+                Rewriter.getWholeTreeRewriterWithoutCostBasedJobs(rootCtxCopy).execute();
+            });
+            // Do optimize
+            new Optimizer(rootCtxCopy).execute();
+            return rootCtxCopy.getMemo().getRoot().getLowestCostPlan(
+                    rootCtxCopy.getCurrentJobContext().getRequiredProperties());
+        } else {
+            // Do post tree rewrite
+            CascadesContext cboCtxCopy = CascadesContext.newCurrentTreeContext(cboCtx);
+            // Do optimize
+            new Optimizer(cboCtxCopy).execute();
+            return cboCtxCopy.getMemo().getRoot().getLowestCostPlan(
+                    cboCtxCopy.getCurrentJobContext().getRequiredProperties());
         }
-        // Do post tree rewrite
-        CascadesContext rootCtxCopy = CascadesContext.newCurrentTreeContext(rootCtx);
-        Rewriter.getWholeTreeRewriterWithoutCostBasedJobs(rootCtxCopy).execute();
-        // Do optimize
-        new Optimizer(rootCtxCopy).execute();
-        return rootCtxCopy.getMemo().getRoot().getLowestCostPlan(
-                rootCtxCopy.getCurrentJobContext().getRequiredProperties());
     }
 }

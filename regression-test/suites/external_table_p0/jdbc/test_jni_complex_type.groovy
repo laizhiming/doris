@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_jni_complex_type", "p0,external,doris,external_docker,external_docker_doris") {
+suite("test_jni_complex_type", "p0,external") {
     qt_sql """select current_catalog()"""
 
     String jdbcUrl = context.config.jdbcUrl + "&sessionVariables=return_object_data_as_binary=true"
@@ -23,7 +23,7 @@ suite("test_jni_complex_type", "p0,external,doris,external_docker,external_docke
     String jdbcPassword = context.config.jdbcPassword
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
 
 

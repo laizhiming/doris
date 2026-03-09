@@ -57,6 +57,8 @@ struct FileReaderOptions {
     int64_t file_size = -1;
     // Use modification time to determine whether the file is changed
     int64_t mtime = 0;
+    // Used to query the location of the file cache
+    int64_t tablet_id = -1;
 
     static const FileReaderOptions DEFAULT;
 };
@@ -71,6 +73,8 @@ public:
     FileReader(const FileReader&) = delete;
     const FileReader& operator=(const FileReader&) = delete;
 
+    static const std::string VIRTUAL_REMOTE_DATA_DIR;
+
     /// If io_ctx is not null,
     /// the caller must ensure that the IOContext exists during the left cycle of read_at()
     Status read_at(size_t offset, Slice result, size_t* bytes_read,
@@ -83,6 +87,11 @@ public:
     virtual size_t size() const = 0;
 
     virtual bool closed() const = 0;
+
+    virtual const std::string& get_data_dir_path() { return VIRTUAL_REMOTE_DATA_DIR; }
+
+    // File modification time (seconds since epoch). Default to 0 meaning unknown.
+    virtual int64_t mtime() const = 0;
 
 protected:
     virtual Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,

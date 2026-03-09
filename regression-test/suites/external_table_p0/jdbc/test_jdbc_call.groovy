@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_jdbc_call", "p0,external,doris,external_docker,external_docker_doris") {
+suite("test_jdbc_call", "p0,external") {
     String jdbcUrl = context.config.jdbcUrl + "&sessionVariables=return_object_data_as_binary=true"
     String jdbcUser = context.config.jdbcUser
     String jdbcPassword = context.config.jdbcPassword
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
 
     String catalog_name = "jdbc_call";
     String non_jdbc_catalog_name = "non_jdbc_catalog";
@@ -82,7 +82,7 @@ suite("test_jdbc_call", "p0,external,doris,external_docker,external_docker_doris
 
     test {
         sql """call execute_stmt("${catalog_name}", "select 1")"""
-        exception "Can not issue SELECT via executeUpdate() or executeLargeUpdate()"
+        exception "Statement.executeUpdate() or Statement.executeLargeUpdate() cannot issue statements that produce result sets."
     }
 
     // execute insert
@@ -118,11 +118,11 @@ suite("test_jdbc_call", "p0,external,doris,external_docker,external_docker_doris
         def clusters = sql " SHOW CLUSTERS; "
         assertTrue(!clusters.isEmpty())
         def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user1}""";
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user2}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user1}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user2}""";
     }    
 
-    def result1 = connect(user="${user1}", password="", url=context.config.jdbcUrl) {
+    def result1 = connect("${user1}", "", context.config.jdbcUrl) {
         sql """set enable_nereids_planner=true;"""
         sql """set enable_fallback_to_original_planner=false;"""
         test {
@@ -131,7 +131,7 @@ suite("test_jdbc_call", "p0,external,doris,external_docker,external_docker_doris
         }
     }
 
-    def result2 = connect(user="${user2}", password="", url=context.config.jdbcUrl) {
+    def result2 = connect("${user2}", "", context.config.jdbcUrl) {
         sql """set enable_nereids_planner=true;"""
         sql """set enable_fallback_to_original_planner=false;"""
         sql """call execute_stmt("${catalog_name}", "insert into ${internal_db_name}.${internal_tbl_name} values (9, 10)")"""

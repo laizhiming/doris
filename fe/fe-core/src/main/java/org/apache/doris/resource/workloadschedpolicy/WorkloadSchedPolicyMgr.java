@@ -17,9 +17,6 @@
 
 package org.apache.doris.resource.workloadschedpolicy;
 
-import org.apache.doris.analysis.AlterWorkloadSchedPolicyStmt;
-import org.apache.doris.analysis.CreateWorkloadSchedPolicyStmt;
-import org.apache.doris.analysis.DropWorkloadSchedPolicyStmt;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
@@ -34,6 +31,7 @@ import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.resource.Tag;
 import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.thrift.TCompareOperator;
 import org.apache.doris.thrift.TUserIdentity;
@@ -62,6 +60,7 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, GsonPostProcessable {
@@ -69,7 +68,7 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
     private static final Logger LOG = LogManager.getLogger(WorkloadSchedPolicyMgr.class);
 
     @SerializedName(value = "idToPolicy")
-    private Map<Long, WorkloadSchedPolicy> idToPolicy = Maps.newConcurrentMap();
+    private ConcurrentMap<Long, WorkloadSchedPolicy> idToPolicy = Maps.newConcurrentMap();
     private Map<String, WorkloadSchedPolicy> nameToPolicy = Maps.newHashMap();
 
     private PolicyProcNode policyProcNode = new PolicyProcNode();
@@ -187,11 +186,10 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
     }
 
-    public void createWorkloadSchedPolicy(CreateWorkloadSchedPolicyStmt createStmt) throws UserException {
-        String policyName = createStmt.getPolicyName();
-
+    public void createWorkloadSchedPolicy(String policyName, boolean isIfNotExists,
+            List<WorkloadConditionMeta> originConditions, List<WorkloadActionMeta> originActions,
+            Map<String, String> propMap) throws UserException {
         // 1 create condition
-        List<WorkloadConditionMeta> originConditions = createStmt.getConditions();
         List<WorkloadCondition> policyConditionList = new ArrayList<>();
         for (WorkloadConditionMeta cm : originConditions) {
             WorkloadCondition cond = WorkloadCondition.createWorkloadCondition(cm);
@@ -200,7 +198,6 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         boolean feCondition = checkPolicyCondition(policyConditionList);
 
         // 2 create action
-        List<WorkloadActionMeta> originActions = createStmt.getActions();
         List<WorkloadAction> policyActionList = new ArrayList<>();
         for (WorkloadActionMeta workloadActionMeta : originActions) {
             // todo(wb) support move action
@@ -214,7 +211,6 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
 
         // 3 create policy
-        Map<String, String> propMap = createStmt.getProperties();
         if (propMap == null) {
             propMap = new HashMap<>();
         }
@@ -224,8 +220,8 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
         writeLock();
         try {
-            if (nameToPolicy.containsKey(createStmt.getPolicyName())) {
-                if (createStmt.isIfNotExists()) {
+            if (nameToPolicy.containsKey(policyName)) {
+                if (isIfNotExists) {
                     return;
                 } else {
                     throw new UserException("workload schedule policy " + policyName + " already exists ");
@@ -447,24 +443,36 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
 
         String workloadGroupNameStr = properties.get(WorkloadSchedPolicy.WORKLOAD_GROUP);
         if (workloadGroupNameStr != null && !workloadGroupNameStr.isEmpty()) {
-            Long wgId = Env.getCurrentEnv().getWorkloadGroupMgr().getWorkloadGroupIdByName(workloadGroupNameStr);
-            if (wgId == null) {
-                throw new UserException("unknown workload group:" + workloadGroupNameStr);
+            String cg = Config.isCloudMode() ? Tag.VALUE_DEFAULT_COMPUTE_GROUP_NAME : Tag.VALUE_DEFAULT_TAG;
+            String wg = "";
+            String[] ss = workloadGroupNameStr.split("\\.");
+            if (ss.length == 1) {
+                wg = ss[0];
+            } else if (ss.length == 2) {
+                cg = ss[0];
+                wg = ss[1];
+            } else {
+                throw new UserException("invalid workload group format: " + workloadGroupNameStr);
             }
+            ConnectContext tmpCtx = new ConnectContext();
+            tmpCtx.setComputeGroup(
+                    Env.getCurrentEnv().getComputeGroupMgr().getComputeGroupByName(cg));
+            tmpCtx.getSessionVariable().setWorkloadGroup(wg);
+            tmpCtx.setCurrentUserIdentity(UserIdentity.ROOT);
+            Long wgId = Env.getCurrentEnv().getWorkloadGroupMgr().getWorkloadGroup(tmpCtx)
+                    .get(0).getId();
             wgIdList.add(wgId);
         }
     }
 
-    public void alterWorkloadSchedPolicy(AlterWorkloadSchedPolicyStmt alterStmt) throws UserException {
+    public void alterWorkloadSchedPolicy(String policyName, Map<String, String> properties) throws UserException {
         writeLock();
         try {
-            String policyName = alterStmt.getPolicyName();
             WorkloadSchedPolicy policy = nameToPolicy.get(policyName);
             if (policy == null) {
                 throw new UserException("can not find workload schedule policy " + policyName);
             }
 
-            Map<String, String> properties = alterStmt.getProperties();
             List<Long> wgIdList = new ArrayList<>();
             checkProperties(properties, wgIdList);
             policy.updatePropertyIfNotNull(properties, wgIdList);
@@ -475,13 +483,12 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
     }
 
-    public void dropWorkloadSchedPolicy(DropWorkloadSchedPolicyStmt dropStmt) throws UserException {
+    public void dropWorkloadSchedPolicy(String policyName, boolean isExists) throws UserException {
         writeLock();
         try {
-            String policyName = dropStmt.getPolicyName();
             WorkloadSchedPolicy schedPolicy = nameToPolicy.get(policyName);
             if (schedPolicy == null) {
-                if (dropStmt.isIfExists()) {
+                if (isExists) {
                     return;
                 } else {
                     throw new UserException("workload schedule policy " + policyName + " not exists");

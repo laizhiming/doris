@@ -22,36 +22,46 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.datasource.SchemaCacheValue;
 
 import com.aliyun.odps.Table;
-import com.google.common.collect.Lists;
+import com.aliyun.odps.table.TableIdentifier;
 import lombok.Getter;
 import lombok.Setter;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 @Getter
 @Setter
 public class MaxComputeSchemaCacheValue extends SchemaCacheValue {
     private Table odpsTable;
+    private TableIdentifier tableIdentifier;
+    private List<String> partitionColumnNames;
     private List<String> partitionSpecs;
-    private Map<String, Column> partitionNameToColumns;
+    private List<Column> partitionColumns;
     private List<Type> partitionTypes;
+    private Map<String, com.aliyun.odps.Column> columnNameToOdpsColumn;
 
-    public MaxComputeSchemaCacheValue(List<Column> schema, Table odpsTable, List<String> partitionSpecs,
-            Map<String, Column> partitionNameToColumns, List<Type> partitionTypes) {
+    public MaxComputeSchemaCacheValue(List<Column> schema, Table odpsTable, TableIdentifier tableIdentifier,
+            List<String> partitionColumnNames, List<String> partitionSpecs, List<Column> partitionColumns,
+            List<Type> partitionTypes, Map<String, com.aliyun.odps.Column> columnNameToOdpsColumn) {
         super(schema);
         this.odpsTable = odpsTable;
+        this.tableIdentifier = tableIdentifier;
         this.partitionSpecs = partitionSpecs;
-        this.partitionNameToColumns = partitionNameToColumns;
+        this.partitionColumnNames = partitionColumnNames;
+        this.partitionColumns = partitionColumns;
         this.partitionTypes = partitionTypes;
-    }
-
-    public Set<String> getPartitionColNames() {
-        return partitionNameToColumns.keySet();
+        this.columnNameToOdpsColumn = columnNameToOdpsColumn;
     }
 
     public List<Column> getPartitionColumns() {
-        return Lists.newArrayList(partitionNameToColumns.values());
+        return partitionColumns;
+    }
+
+    public List<String> getPartitionColumnNames() {
+        return partitionColumnNames;
+    }
+
+    public Map<String, com.aliyun.odps.Column> getColumnNameToOdpsColumn() {
+        return columnNameToOdpsColumn;
     }
 }

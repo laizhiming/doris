@@ -24,7 +24,6 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEsScan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalExternalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalHudiScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJdbcScan;
@@ -35,6 +34,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSchemaScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTVFRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTestScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalWorkTableReference;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCatalogRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeOlapScan;
@@ -49,6 +49,7 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSchemaScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalTVFRelation;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalWorkTableReference;
 
 /**
  * relation visitor
@@ -95,16 +96,12 @@ public interface RelationVisitor<R, C> {
         return visitLogicalRelation(emptyRelation, context);
     }
 
-    default R visitLogicalExternalRelation(LogicalExternalRelation relation, C context) {
-        return visitLogicalCatalogRelation(relation, context);
-    }
-
     default R visitLogicalEsScan(LogicalEsScan esScan, C context) {
-        return visitLogicalExternalRelation(esScan, context);
+        return visitLogicalCatalogRelation(esScan, context);
     }
 
     default R visitLogicalFileScan(LogicalFileScan fileScan, C context) {
-        return visitLogicalExternalRelation(fileScan, context);
+        return visitLogicalCatalogRelation(fileScan, context);
     }
 
     default R visitLogicalHudiScan(LogicalHudiScan fileScan, C context) {
@@ -112,11 +109,11 @@ public interface RelationVisitor<R, C> {
     }
 
     default R visitLogicalJdbcScan(LogicalJdbcScan jdbcScan, C context) {
-        return visitLogicalExternalRelation(jdbcScan, context);
+        return visitLogicalCatalogRelation(jdbcScan, context);
     }
 
     default R visitLogicalOdbcScan(LogicalOdbcScan odbcScan, C context) {
-        return visitLogicalExternalRelation(odbcScan, context);
+        return visitLogicalCatalogRelation(odbcScan, context);
     }
 
     default R visitLogicalOlapScan(LogicalOlapScan olapScan, C context) {
@@ -142,6 +139,10 @@ public interface RelationVisitor<R, C> {
 
     default R visitLogicalTestScan(LogicalTestScan testScan, C context) {
         return visitLogicalCatalogRelation(testScan, context);
+    }
+
+    default R visitLogicalWorkTableReference(LogicalWorkTableReference logicalWorkTableReference, C context) {
+        return visitLogicalRelation(logicalWorkTableReference, context);
     }
 
     // *******************************
@@ -179,6 +180,10 @@ public interface RelationVisitor<R, C> {
     default R visitPhysicalDeferMaterializeOlapScan(
             PhysicalDeferMaterializeOlapScan deferMaterializeOlapScan, C context) {
         return visitPhysicalCatalogRelation(deferMaterializeOlapScan, context);
+    }
+
+    default R visitPhysicalWorkTableReference(PhysicalWorkTableReference workTableReference, C context) {
+        return visitPhysicalRelation(workTableReference, context);
     }
 
     default R visitPhysicalOneRowRelation(PhysicalOneRowRelation oneRowRelation, C context) {

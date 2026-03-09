@@ -19,6 +19,7 @@ package org.apache.doris.nereids.rules.exploration.mv;
 
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.mtmv.BaseColInfo;
 import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.rules.Rule;
@@ -81,22 +82,30 @@ public class MaterializedViewAggregateOnNoneAggregateRule extends AbstractMateri
         // any check result of join or scan is true, then return true
         PlanCheckContext joinCheckContext = PlanCheckContext.of(SUPPORTED_JOIN_TYPE_SET);
         boolean joinCheckResult = structInfo.getTopPlan().accept(StructInfo.PLAN_PATTERN_CHECKER, joinCheckContext)
-                && !joinCheckContext.isContainsTopAggregate();
+                && !joinCheckContext.isContainsTopAggregate()
+                && !joinCheckContext.isContainsTopLimit() && !joinCheckContext.isContainsTopTopN()
+                && !joinCheckContext.isContainsTopWindow();
         if (joinCheckResult) {
             return true;
         }
         PlanCheckContext scanCheckContext = PlanCheckContext.of(ImmutableSet.of());
         return structInfo.getTopPlan().accept(StructInfo.SCAN_PLAN_PATTERN_CHECKER, scanCheckContext)
-                && !scanCheckContext.isContainsTopAggregate();
+                && !scanCheckContext.isContainsTopAggregate()
+                && !joinCheckContext.isContainsTopLimit() && !joinCheckContext.isContainsTopTopN()
+                && !joinCheckContext.isContainsTopWindow();
     }
 
     @Override
-    protected Pair<Map<BaseTableInfo, Set<String>>, Map<BaseTableInfo, Set<String>>> calcInvalidPartitions(
-            Plan queryPlan, Plan rewrittenPlan, AsyncMaterializationContext materializationContext,
-            CascadesContext cascadesContext) throws AnalysisException {
-        Pair<Map<BaseTableInfo, Set<String>>, Map<BaseTableInfo, Set<String>>> invalidPartitions
-                = super.calcInvalidPartitions(queryPlan, rewrittenPlan, materializationContext, cascadesContext);
-        if (needUnionRewrite(invalidPartitions, cascadesContext)) {
+    protected Pair<Map<BaseTableInfo, Set<String>>, Map<BaseColInfo, Set<String>>> calcInvalidPartitions(
+            Map<List<String>, Set<String>> queryUsedBaseTablePartitionMap,
+            Plan rewrittenPlan,
+            CascadesContext cascadesContext,
+            AsyncMaterializationContext materializationContext)
+            throws AnalysisException {
+        Pair<Map<BaseTableInfo, Set<String>>, Map<BaseColInfo, Set<String>>> invalidPartitions
+                = super.calcInvalidPartitions(queryUsedBaseTablePartitionMap, rewrittenPlan, cascadesContext,
+                materializationContext);
+        if (PartitionCompensator.needUnionRewrite(invalidPartitions, cascadesContext)) {
             // if query use some invalid partition in mv, bail out
             return null;
         }
@@ -124,7 +133,7 @@ public class MaterializedViewAggregateOnNoneAggregateRule extends AbstractMateri
                     () -> String.format("query aggregate = %s", queryAggregate.treeString()));
             return null;
         }
-        return doRewriteQueryByView(queryStructInfo,
+        return aggregateRewriteByView(queryStructInfo,
                 viewToQuerySlotMapping,
                 queryTopPlanAndAggPair,
                 tempRewritedPlan,

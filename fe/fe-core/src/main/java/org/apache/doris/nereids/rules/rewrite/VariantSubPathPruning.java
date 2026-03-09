@@ -18,10 +18,10 @@
 package org.apache.doris.nereids.rules.rewrite;
 
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.jobs.JobContext;
 import org.apache.doris.nereids.properties.OrderKey;
-import org.apache.doris.nereids.rules.rewrite.ColumnPruning.PruneContext;
 import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -32,6 +32,7 @@ import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
 import org.apache.doris.nereids.trees.expressions.functions.ExpressionTrait;
 import org.apache.doris.nereids.trees.expressions.functions.Function;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ElementAt;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionVisitor;
@@ -56,18 +57,23 @@ import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.types.VariantType;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -81,13 +87,22 @@ import java.util.Set;
  * generating the slots for the required sub path on scan, union, and cte consumer.
  * Then, it replaces the element_at with the corresponding slot.
  */
-public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> implements CustomRewriter {
+public class VariantSubPathPruning implements CustomRewriter {
+    public static final Logger LOG = LogManager.getLogger(VariantSubPathPruning.class);
 
     @Override
     public Plan rewriteRoot(Plan plan, JobContext jobContext) {
         Context context = new Context();
         plan.accept(VariantSubPathCollector.INSTANCE, context);
         if (context.elementAtToSubPathMap.isEmpty()) {
+            return plan;
+        } else if (context.hasCircularReference()) {
+            if (SessionVariable.isFeDebug()) {
+                throw new AnalysisException("prune variant sub path have circular reference");
+            } else if (ConnectContext.get() != null) {
+                LOG.warn("prune variant sub path have circular reference, query id: {} ",
+                        DebugUtil.printId(ConnectContext.get().queryId()));
+            }
             return plan;
         } else {
             return plan.accept(VariantSubPathReplacer.INSTANCE, context);
@@ -123,7 +138,27 @@ public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> imp
         // same as elementAtToSlotsMap, record variant slot should be replaced by which slots.
         private final Map<Slot, Map<List<String>, SlotReference>> slotToSlotsMap = Maps.newHashMap();
 
+        public boolean hasCircularReference() {
+            // alias(a as b),  alias(b as c), alias(c as a) will cause dead loop
+            for (Slot key : slotToOriginalExprMap.keySet()) {
+                Set<Slot> visited = Sets.newHashSet();
+                Expression expr = key;
+                while (expr instanceof Slot) {
+                    Slot slot = (Slot) expr;
+                    if (!visited.add(slot)) {
+                        return true;
+                    }
+                    expr = slotToOriginalExprMap.get(slot);
+                }
+            }
+            return false;
+        }
+
         public void putSlotToOriginal(Slot slot, Expression expression) {
+            // alias(a#1 as a#1), skip to avoid dead loop
+            if (slot.equals(expression)) {
+                return;
+            }
             this.slotToOriginalExprMap.put(slot, expression);
             // update existed entry
             //   element_at(3, c) -> 3, ['c']
@@ -190,8 +225,8 @@ public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> imp
                 if (slot.getDataType() instanceof VariantType
                         && context.slotToSubPathsMap.containsKey((SlotReference) slot)) {
                     Set<List<String>> subPaths = context.slotToSubPathsMap.get(slot);
-                    if (((SlotReference) slot).getColumn().isPresent()) {
-                        colToSubPaths.put(((SlotReference) slot).getColumn().get().getName(), subPaths);
+                    if (((SlotReference) slot).getOriginalColumn().isPresent()) {
+                        colToSubPaths.put(((SlotReference) slot).getOriginalColumn().get().getName(), subPaths);
                     }
                 }
             }
@@ -305,11 +340,8 @@ public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> imp
 
                     }
                     SlotReference outputSlot = new SlotReference(StatementScopeIdGenerator.newExprId(),
-                            entry.getValue().get(0).getName(), VariantType.INSTANCE,
-                            true, ImmutableList.of(),
-                            null,
-                            null,
-                            Optional.empty());
+                            entry.getValue().get(0).getName(), entry.getValue().get(0).getDataType(),
+                            true, ImmutableList.of());
                     outputs.add(outputSlot);
                     // update element to slot map
                     Map<List<String>, SlotReference> s = oriSlotToSubPathToSlot.computeIfAbsent(
@@ -394,7 +426,7 @@ public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> imp
                 return cteConsumer;
             }
             Map<Slot, Slot> consumerToProducerOutputMap = Maps.newHashMap();
-            Map<Slot, Slot> producerToConsumerOutputMap = Maps.newHashMap();
+            Multimap<Slot, Slot> producerToConsumerOutputMap = LinkedHashMultimap.create();
             Map<Slot, Map<List<String>, SlotReference>> oriSlotToSubPathToSlot = Maps.newHashMap();
             for (Map.Entry<Slot, Slot> consumerToProducer : cteConsumer.getConsumerToProducerOutputMap().entrySet()) {
                 Slot consumer = consumerToProducer.getKey();
@@ -757,10 +789,14 @@ public class VariantSubPathPruning extends DefaultPlanRewriter<PruneContext> imp
             if (!(elementAt.left() instanceof ElementAt || elementAt.left() instanceof SlotReference)) {
                 return null;
             }
-            if (!(elementAt.right() instanceof StringLikeLiteral)) {
+            Expression key = elementAt.right();
+            if (key instanceof StringLikeLiteral) {
+                subPath.add(((StringLikeLiteral) key).getStringValue());
+            } else if (key instanceof Literal && key.getDataType().isIntegerLikeType()) {
+                subPath.add(((Literal) key).getStringValue());
+            } else {
                 return null;
             }
-            subPath.add(((StringLikeLiteral) elementAt.right()).getStringValue());
             if (elementAt.left() instanceof SlotReference) {
                 // ElementAt's left child is SlotReference
                 // reverse subPath because we put them by reverse order

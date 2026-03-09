@@ -40,15 +40,16 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.base64.Base64;
 import io.netty.util.CharsetUtil;
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.UUID;
-import javax.servlet.http.Cookie;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
+
 
 public class BaseController {
 
@@ -81,7 +82,6 @@ public class BaseController {
             addSession(request, response, value);
 
             ConnectContext ctx = new ConnectContext();
-            ctx.setQualifiedUser(authInfo.fullUserName);
             ctx.setRemoteIP(authInfo.remoteIp);
             ctx.setCurrentUserIdentity(currentUser);
             ctx.setEnv(Env.getCurrentEnv());
@@ -120,7 +120,7 @@ public class BaseController {
     }
 
     private ActionAuthorizationInfo checkCookie(HttpServletRequest request, HttpServletResponse response,
-                                                boolean checkAuth) {
+            boolean checkAuth) {
         List<String> sessionIds = getCookieValues(request, PALO_SESSION_ID, response);
         if (sessionIds.isEmpty()) {
             return null;
@@ -148,7 +148,6 @@ public class BaseController {
         updateCookieAge(request, PALO_SESSION_ID, PALO_SESSION_EXPIRED_TIME, response);
 
         ConnectContext ctx = new ConnectContext();
-        ctx.setQualifiedUser(sessionValue.currentUser.getQualifiedUser());
         ctx.setRemoteIP(request.getRemoteHost());
         ctx.setCurrentUserIdentity(sessionValue.currentUser);
         ctx.setEnv(Env.getCurrentEnv());
@@ -237,8 +236,14 @@ public class BaseController {
 
     protected void checkTblAuth(UserIdentity currentUser, String db, String tbl, PrivPredicate predicate)
             throws UnauthorizedException {
+        checkTblAuth(currentUser, InternalCatalog.INTERNAL_CATALOG_NAME, db, tbl, predicate);
+    }
+
+    protected void checkTblAuth(UserIdentity currentUser, String catalog, String db, String tbl,
+            PrivPredicate predicate)
+            throws UnauthorizedException {
         if (!Env.getCurrentEnv().getAccessManager()
-                .checkTblPriv(currentUser, InternalCatalog.INTERNAL_CATALOG_NAME, db, tbl, predicate)) {
+                .checkTblPriv(currentUser, catalog, db, tbl, predicate)) {
             throw new UnauthorizedException("Access denied; you need (at least one of) the "
                     + predicate.getPrivs().toString() + " privilege(s) for this operation");
         }

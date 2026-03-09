@@ -19,14 +19,12 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.FeMetaVersion;
-import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonPostProcessable;
-import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.proto.OlapFile.EncryptionAlgorithmPB;
 import org.apache.doris.thrift.TCompressionType;
+import org.apache.doris.thrift.TEncryptionAlgorithm;
 import org.apache.doris.thrift.TInvertedIndexFileStorageFormat;
 import org.apache.doris.thrift.TStorageFormat;
 import org.apache.doris.thrift.TStorageMedium;
@@ -41,8 +39,6 @@ import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -55,7 +51,7 @@ import java.util.Map;
  * Different properties is recognized by prefix such as dynamic_partition
  * If there is different type properties is added, write a method such as buildDynamicProperty to build it.
  */
-public class TableProperty implements Writable, GsonPostProcessable {
+public class TableProperty implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(TableProperty.class);
 
     @SerializedName(value = "properties")
@@ -68,6 +64,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
     private boolean isInMemory = false;
     private short minLoadReplicaNum = -1;
     private long ttlSeconds = 0L;
+    private int partitionRetentionCount = -1;
+    private boolean isInAtomicRestore = false;
 
     private String storagePolicy = "";
     private Boolean isBeingSynced = null;
@@ -96,11 +94,19 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     private boolean disableAutoCompaction = false;
 
+    private boolean variantEnableFlattenNested = false;
+
     private boolean enableSingleReplicaCompaction = false;
 
     private boolean storeRowColumn = false;
 
     private boolean skipWriteIndexOnLoad = false;
+
+    private long rowStorePageSize = PropertyAnalyzer.ROW_STORE_PAGE_SIZE_DEFAULT_VALUE;
+
+    private long storagePageSize = PropertyAnalyzer.STORAGE_PAGE_SIZE_DEFAULT_VALUE;
+
+    private long storageDictPageSize = PropertyAnalyzer.STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE;
 
     private String compactionPolicy = PropertyAnalyzer.SIZE_BASED_COMPACTION_POLICY;
 
@@ -119,7 +125,14 @@ public class TableProperty implements Writable, GsonPostProcessable {
     private long timeSeriesCompactionLevelThreshold
                                     = PropertyAnalyzer.TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE;
 
+    private String autoAnalyzePolicy = PropertyAnalyzer.ENABLE_AUTO_ANALYZE_POLICY;
+
+    private TEncryptionAlgorithm encryptionAlgorithm = TEncryptionAlgorithm.PLAINTEXT;
+
     private DataSortInfo dataSortInfo = new DataSortInfo();
+
+    // name mapping for show, it will be translated to unique id mapping when create tablet
+    private Map<String, List<String>> columnSeqMapping = null;
 
     public TableProperty(Map<String, String> properties) {
         this.properties = properties;
@@ -158,6 +171,9 @@ public class TableProperty implements Writable, GsonPostProcessable {
                 buildTimeSeriesCompactionEmptyRowsetsThreshold();
                 buildTimeSeriesCompactionLevelThreshold();
                 buildTTLSeconds();
+                buildAutoAnalyzeProperty();
+                buildPartitionRetentionCount();
+                buildColumnSeqMapping();
                 break;
             default:
                 break;
@@ -182,6 +198,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
         if (!reserveReplica) {
             setReplicaAlloc(replicaAlloc);
         }
+        // reset storage vault
+        clearStorageVault();
         return this;
     }
 
@@ -210,13 +228,56 @@ public class TableProperty implements Writable, GsonPostProcessable {
         return this;
     }
 
+    public TableProperty buildInAtomicRestore() {
+        isInAtomicRestore = Boolean.parseBoolean(properties.getOrDefault(
+                PropertyAnalyzer.PROPERTIES_IN_ATOMIC_RESTORE, "false"));
+        return this;
+    }
+
+    public boolean isInAtomicRestore() {
+        return isInAtomicRestore;
+    }
+
+    public TableProperty setInAtomicRestore() {
+        properties.put(PropertyAnalyzer.PROPERTIES_IN_ATOMIC_RESTORE, "true");
+        return this;
+    }
+
+    public TableProperty clearInAtomicRestore() {
+        properties.remove(PropertyAnalyzer.PROPERTIES_IN_ATOMIC_RESTORE);
+        return this;
+    }
+
+    public TableProperty clearStorageVault() {
+        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_VAULT_ID, "");
+        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_VAULT_NAME, "");
+        return this;
+    }
+
     public TableProperty buildTTLSeconds() {
         ttlSeconds = Long.parseLong(properties.getOrDefault(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS, "0"));
         return this;
     }
 
+    public TableProperty buildPartitionRetentionCount() {
+        String value = properties.get(PropertyAnalyzer.PROPERTIES_PARTITION_RETENTION_COUNT);
+        if (value != null) {
+            try {
+                int n = Integer.parseInt(value);
+                partitionRetentionCount = n > 0 ? n : -1;
+            } catch (NumberFormatException e) {
+                partitionRetentionCount = -1;
+            }
+        }
+        return this;
+    }
+
     public long getTTLSeconds() {
         return ttlSeconds;
+    }
+
+    public int getPartitionRetentionCount() {
+        return partitionRetentionCount;
     }
 
     public TableProperty buildEnableLightSchemaChange() {
@@ -231,8 +292,45 @@ public class TableProperty implements Writable, GsonPostProcessable {
         return this;
     }
 
+    public TableProperty buildAutoAnalyzeProperty() {
+        autoAnalyzePolicy = properties.getOrDefault(PropertyAnalyzer.PROPERTIES_AUTO_ANALYZE_POLICY,
+                PropertyAnalyzer.ENABLE_AUTO_ANALYZE_POLICY);
+        return this;
+    }
+
+    public void buildTDEAlgorithm() {
+        String tdeAlgorithmName = properties.getOrDefault(PropertyAnalyzer.PROPERTIES_TDE_ALGORITHM,
+                TEncryptionAlgorithm.PLAINTEXT.name());
+        encryptionAlgorithm = TEncryptionAlgorithm.valueOf(tdeAlgorithmName);
+    }
+
+    public TEncryptionAlgorithm getTDEAlgorithm() {
+        return encryptionAlgorithm;
+    }
+
+    public EncryptionAlgorithmPB getTDEAlgorithmPB() {
+        switch (encryptionAlgorithm) {
+            case AES256:
+                return EncryptionAlgorithmPB.AES_256_CTR;
+            case SM4:
+                return EncryptionAlgorithmPB.SM4_128_CTR;
+            default:
+                return EncryptionAlgorithmPB.PLAINTEXT;
+        }
+    }
+
     public boolean disableAutoCompaction() {
         return disableAutoCompaction;
+    }
+
+    public TableProperty buildVariantEnableFlattenNested() {
+        variantEnableFlattenNested = Boolean.parseBoolean(
+                properties.getOrDefault(PropertyAnalyzer.PROPERTIES_VARIANT_ENABLE_FLATTEN_NESTED, "false"));
+        return this;
+    }
+
+    public boolean variantEnableFlattenNested() {
+        return variantEnableFlattenNested;
     }
 
     public TableProperty buildEnableSingleReplicaCompaction() {
@@ -265,6 +363,39 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public boolean storeRowColumn() {
         return storeRowColumn;
+    }
+
+    public TableProperty buildRowStorePageSize() {
+        rowStorePageSize = Long.parseLong(
+                properties.getOrDefault(PropertyAnalyzer.PROPERTIES_ROW_STORE_PAGE_SIZE,
+                                        Long.toString(PropertyAnalyzer.ROW_STORE_PAGE_SIZE_DEFAULT_VALUE)));
+        return this;
+    }
+
+    public long rowStorePageSize() {
+        return rowStorePageSize;
+    }
+
+    public TableProperty buildStoragePageSize() {
+        storagePageSize = Long.parseLong(
+                properties.getOrDefault(PropertyAnalyzer.PROPERTIES_STORAGE_PAGE_SIZE,
+                                        Long.toString(PropertyAnalyzer.STORAGE_PAGE_SIZE_DEFAULT_VALUE)));
+        return this;
+    }
+
+    public long storagePageSize() {
+        return storagePageSize;
+    }
+
+    public TableProperty buildStorageDictPageSize() {
+        storageDictPageSize = Long.parseLong(
+            properties.getOrDefault(PropertyAnalyzer.PROPERTIES_STORAGE_DICT_PAGE_SIZE,
+                Long.toString(PropertyAnalyzer.STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE)));
+        return this;
+    }
+
+    public long storageDictPageSize() {
+        return storageDictPageSize;
     }
 
     public TableProperty buildSkipWriteIndexOnLoad() {
@@ -397,7 +528,10 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public void removeInvalidProperties() {
         properties.remove(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY);
+        storagePolicy = "";
         properties.remove(PropertyAnalyzer.PROPERTIES_COLOCATE_WITH);
+        properties.remove(DynamicPartitionProperty.STORAGE_POLICY);
+        dynamicPartitionProperty.clearStoragePolicy();
     }
 
     public List<String> getCopiedRowStoreColumns() {
@@ -459,8 +593,12 @@ public class TableProperty implements Writable, GsonPostProcessable {
     }
 
     public TableProperty buildCompressionType() {
-        compressionType = TCompressionType.valueOf(properties.getOrDefault(PropertyAnalyzer.PROPERTIES_COMPRESSION,
-                TCompressionType.LZ4F.name()));
+        try {
+            compressionType = PropertyAnalyzer.getCompressionTypeFromProperties(properties);
+        } catch (AnalysisException e) {
+            LOG.error("failed to analyze compression type", e);
+            compressionType = TCompressionType.ZSTD;
+        }
         return this;
     }
 
@@ -560,6 +698,11 @@ public class TableProperty implements Writable, GsonPostProcessable {
         properties.put(PropertyAnalyzer.ENABLE_UNIQUE_KEY_MERGE_ON_WRITE, Boolean.toString(enable));
     }
 
+    public boolean getEnableUniqueKeySkipBitmap() {
+        return Boolean.parseBoolean(properties.getOrDefault(
+            PropertyAnalyzer.ENABLE_UNIQUE_KEY_SKIP_BITMAP_COLUMN, "false"));
+    }
+
     // In order to ensure that unique tables without the `enable_unique_key_merge_on_write` property specified
     // before version 2.1 still maintain the merge-on-read implementation after the upgrade, we will keep
     // the default value here as false.
@@ -568,14 +711,14 @@ public class TableProperty implements Writable, GsonPostProcessable {
                 PropertyAnalyzer.ENABLE_UNIQUE_KEY_MERGE_ON_WRITE, "false"));
     }
 
-    public void setEnableDeleteOnDeletePredicate(boolean enable) {
-        properties.put(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_DELETE_ON_DELETE_PREDICATE, Boolean.toString(enable));
+    public void setEnableMowLightDelete(boolean enable) {
+        properties.put(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE, Boolean.toString(enable));
     }
 
-    public boolean getEnableDelteOnDeletePredicate() {
+    public boolean getEnableMowLightDelete() {
         return Boolean.parseBoolean(properties.getOrDefault(
-                PropertyAnalyzer.PROPERTIES_ENABLE_MOW_DELETE_ON_DELETE_PREDICATE,
-                Boolean.toString(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_DELETE_ON_DELETE_PREDICATE_DEFAULT_VALUE)));
+                PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE,
+                Boolean.toString(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE_DEFAULT_VALUE)));
     }
 
     public void setSequenceMapCol(String colName) {
@@ -615,7 +758,92 @@ public class TableProperty implements Writable, GsonPostProcessable {
             modifyTableProperties(PropertyAnalyzer.PROPERTIES_ROW_STORE_COLUMNS,
                     Joiner.on(",").join(rowStoreColumns));
             buildRowStoreColumns();
+        } else {
+            // clear row store columns
+            this.rowStoreColumns = null;
         }
+    }
+
+    public void buildColumnSeqMapping() {
+        String propertyPrefix = PropertyAnalyzer.PROPERTIES_SEQUENCE_MAPPING + ".";
+        Map<String, List<String>> columnSeqMapping = Maps.newHashMap();
+        for (String key : properties.keySet()) {
+            if (key.startsWith(propertyPrefix)) {
+                String seqName = key.substring(propertyPrefix.length());
+                String[] columnNames = properties.get(key).split(",");
+                if (columnNames.length == 1 && columnNames[0].isEmpty()) {
+                    columnSeqMapping.put(seqName, Lists.newArrayList());
+                } else {
+                    columnSeqMapping.put(seqName, Lists.newArrayList(columnNames));
+                }
+            }
+        }
+        if (columnSeqMapping.isEmpty()) {
+            // save memory if property is empty
+            this.columnSeqMapping = null;
+        } else {
+            this.columnSeqMapping = columnSeqMapping;
+        }
+    }
+
+    public void setColumnSeqMapping(Map<String, List<String>> columnSeqMapping) {
+        // remove old mapping
+        String propertyPrefix = PropertyAnalyzer.PROPERTIES_SEQUENCE_MAPPING + ".";
+        List<String> oldMappingKeys = Lists.newArrayList();
+        for (String key : properties.keySet()) {
+            if (key.startsWith(propertyPrefix)) {
+                oldMappingKeys.add(key);
+            }
+        }
+        oldMappingKeys.forEach(key -> {
+            properties.remove(key);
+        });
+        // add new mapping
+        if (columnSeqMapping != null && !columnSeqMapping.isEmpty()) {
+            for (Map.Entry<String, List<String>> entry : columnSeqMapping.entrySet()) {
+                String seqColumnName = entry.getKey();
+                String valueColumnNames = Joiner.on(",").join(entry.getValue());
+                modifyTableProperties(propertyPrefix + seqColumnName,
+                        valueColumnNames);
+            }
+        }
+        this.columnSeqMapping = columnSeqMapping;
+    }
+
+    public Map<String, List<String>> getColumnSeqMapping() {
+        return this.columnSeqMapping == null ? Maps.newHashMap() : this.columnSeqMapping;
+    }
+
+    public boolean hasColumnSeqMapping() {
+        return columnSeqMapping != null && !columnSeqMapping.isEmpty();
+    }
+
+    public boolean isSeqMappingKeyColumn(String column) {
+        Map<String, List<String>> columnSeqMapping = this.columnSeqMapping == null ? Maps.newHashMap()
+                : this.columnSeqMapping;
+        return columnSeqMapping.containsKey(column);
+    }
+
+    public boolean isSeqMappingValueColumn(String column) {
+        Map<String, List<String>> columnSeqMapping = this.columnSeqMapping == null ? Maps.newHashMap()
+                : this.columnSeqMapping;
+        for (List<String> valueColumns : columnSeqMapping.values()) {
+            if (valueColumns.contains(column)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public String getSeqMappingKey(String column) {
+        Map<String, List<String>> columnSeqMapping = this.columnSeqMapping == null ? Maps.newHashMap()
+                : this.columnSeqMapping;
+        for (Map.Entry<String, List<String>> columnSeq : columnSeqMapping.entrySet()) {
+            if (columnSeq.getValue().contains(column)) {
+                return columnSeq.getKey();
+            }
+        }
+        throw new IllegalArgumentException("can't find the corresponding seq mapping key");
     }
 
     public void buildReplicaAllocation() {
@@ -630,16 +858,6 @@ public class TableProperty implements Writable, GsonPostProcessable {
             LOG.error("should not happen when build replica allocation", e);
             this.replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
         }
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
-    }
-
-    public static TableProperty read(DataInput in) throws IOException {
-        TableProperty tableProperty = GsonUtils.GSON.fromJson(Text.readString(in), TableProperty.class);
-        return tableProperty;
     }
 
     public void gsonPostProcess() throws IOException {
@@ -657,6 +875,9 @@ public class TableProperty implements Writable, GsonPostProcessable {
         buildEnableLightSchemaChange();
         buildStoreRowColumn();
         buildRowStoreColumns();
+        buildRowStorePageSize();
+        buildStoragePageSize();
+        buildStorageDictPageSize();
         buildSkipWriteIndexOnLoad();
         buildCompactionPolicy();
         buildTimeSeriesCompactionGoalSizeMbytes();
@@ -667,21 +888,13 @@ public class TableProperty implements Writable, GsonPostProcessable {
         buildTimeSeriesCompactionEmptyRowsetsThreshold();
         buildTimeSeriesCompactionLevelThreshold();
         buildTTLSeconds();
-
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_105) {
-            // get replica num from property map and create replica allocation
-            String repNum = properties.remove(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM);
-            if (!Strings.isNullOrEmpty(repNum)) {
-                ReplicaAllocation replicaAlloc = new ReplicaAllocation(Short.valueOf(repNum));
-                properties.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
-                        replicaAlloc.toCreateStmt());
-            } else {
-                properties.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
-                        ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt());
-            }
-        }
+        buildVariantEnableFlattenNested();
+        buildInAtomicRestore();
+        buildPartitionRetentionCount();
         removeDuplicateReplicaNumProperty();
         buildReplicaAllocation();
+        buildTDEAlgorithm();
+        buildColumnSeqMapping();
     }
 
     // For some historical reason,
@@ -707,10 +920,6 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public String getStorageVaultName() {
         return properties.getOrDefault(PropertyAnalyzer.PROPERTIES_STORAGE_VAULT_NAME, "");
-    }
-
-    public void setStorageVaultName(String storageVaultName) {
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_VAULT_NAME, storageVaultName);
     }
 
     public String getPropertiesString() throws IOException {

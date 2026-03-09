@@ -23,10 +23,11 @@ import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
-import org.apache.doris.common.FeConstants;
-import org.apache.doris.common.InternalErrorCode;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.load.loadv2.InsertLoadJob;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSink;
 import org.apache.doris.planner.DataSink;
@@ -36,23 +37,30 @@ import org.apache.doris.qe.Coordinator;
 import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.QeProcessorImpl.QueryInfo;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.LoadEtlTask;
 import org.apache.doris.thrift.TQueryType;
+import org.apache.doris.thrift.TStatusCode;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Abstract insert executor.
  * The derived class should implement the abstract method for certain type of target table
  */
 public abstract class AbstractInsertExecutor {
+    protected static final long INVALID_TXN_ID = -1L;
     private static final Logger LOG = LogManager.getLogger(AbstractInsertExecutor.class);
+
     protected long jobId;
     protected final ConnectContext ctx;
     protected final Coordinator coordinator;
+    protected InsertLoadJob insertLoadJob;
     protected String labelName;
     protected final DatabaseIf database;
     protected final TableIf table;
@@ -63,19 +71,54 @@ public abstract class AbstractInsertExecutor {
     protected String errMsg = "";
     protected Optional<InsertCommandContext> insertCtx;
     protected final boolean emptyInsert;
+    protected long txnId = INVALID_TXN_ID;
 
     /**
-     * Constructor
+     * Insert executor listener
+     */
+    public interface InsertExecutorListener {
+        /**
+         * Called before insert execution begins
+         */
+
+        default void beforeComplete(AbstractInsertExecutor insertExecutor, StmtExecutor executor, long jobId)
+                throws Exception {
+        }
+
+        default void afterComplete(AbstractInsertExecutor insertExecutor, StmtExecutor executor, long jobId)
+                throws Exception {
+        }
+    }
+
+    private List<InsertExecutorListener> listeners = new CopyOnWriteArrayList<>();
+
+    /**
+     * constructor
      */
     public AbstractInsertExecutor(ConnectContext ctx, TableIf table, String labelName, NereidsPlanner planner,
-            Optional<InsertCommandContext> insertCtx, boolean emptyInsert) {
+            Optional<InsertCommandContext> insertCtx, boolean emptyInsert, long jobId) {
         this.ctx = ctx;
-        this.coordinator = EnvFactory.getInstance().createCoordinator(ctx, null, planner, ctx.getStatsErrorEstimator());
+        this.database = table.getDatabase();
+        this.insertLoadJob = new InsertLoadJob(database.getId(), labelName, jobId);
+        // Do not add load job if job id is -1.
+        if (jobId != -1) {
+            ctx.getEnv().getLoadManager().addLoadJob(insertLoadJob);
+        }
+        this.coordinator = EnvFactory.getInstance().createCoordinator(
+                ctx, planner, ctx.getStatsErrorEstimator(), insertLoadJob.getId());
         this.labelName = labelName;
         this.table = table;
-        this.database = table.getDatabase();
         this.insertCtx = insertCtx;
         this.emptyInsert = emptyInsert;
+        this.jobId = jobId;
+    }
+
+    public void registerListener(InsertExecutorListener listener) {
+        listeners.add(listener);
+    }
+
+    public void unregisterListener(InsertExecutorListener listener) {
+        listeners.remove(listener);
     }
 
     public Coordinator getCoordinator() {
@@ -94,6 +137,10 @@ public abstract class AbstractInsertExecutor {
         return labelName;
     }
 
+    public long getTxnId() {
+        return txnId;
+    }
+
     /**
      * begin transaction if necessary
      */
@@ -107,7 +154,7 @@ public abstract class AbstractInsertExecutor {
     /**
      * Do something before exec
      */
-    protected abstract void beforeExec();
+    protected abstract void beforeExec() throws UserException;
 
     /**
      * Do something after exec finished
@@ -124,23 +171,27 @@ public abstract class AbstractInsertExecutor {
      */
     protected abstract void afterExec(StmtExecutor executor);
 
-    protected final void execImpl(StmtExecutor executor, long jobId) throws Exception {
+    protected final void execImpl(StmtExecutor executor) throws Exception {
         String queryId = DebugUtil.printId(ctx.queryId());
-        this.jobId = jobId;
         coordinator.setLoadZeroTolerance(ctx.getSessionVariable().getEnableInsertStrict());
         coordinator.setQueryType(TQueryType.LOAD);
+        coordinator.setIsProfileSafeStmt(executor.isProfileSafeStmt());
         executor.getProfile().addExecutionProfile(coordinator.getExecutionProfile());
         QueryInfo queryInfo = new QueryInfo(ConnectContext.get(), executor.getOriginStmtInString(), coordinator);
         QeProcessorImpl.INSTANCE.registerQuery(ctx.queryId(), queryInfo);
         executor.updateProfile(false);
         coordinator.exec();
-        int execTimeout = ctx.getExecTimeout();
+        executor.getSummaryProfile().setQueryScheduleFinishTime(TimeUtils.getStartTimeMs());
+        executor.getSummaryProfile().setTempStartTime();
+        int execTimeout = ctx.getExecTimeoutS();
         if (LOG.isDebugEnabled()) {
             LOG.debug("insert [{}] with query id {} execution timeout is {}", labelName, queryId, execTimeout);
         }
         boolean notTimeout = coordinator.join(execTimeout);
+        executor.getSummaryProfile().freshFetchResultConsumeTime();
+        executor.getSummaryProfile().setQueryFetchResultFinishTime(TimeUtils.getStartTimeMs());
         if (!coordinator.isDone()) {
-            coordinator.cancel();
+            coordinator.cancel(new Status(TStatusCode.CANCELLED, "insert timeout"));
             if (notTimeout) {
                 errMsg = coordinator.getExecStatus().getErrorMsg();
                 ErrorReport.reportDdlException("there exists unhealthy backend. "
@@ -185,29 +236,23 @@ public abstract class AbstractInsertExecutor {
     /**
      * execute insert txn for insert into select command.
      */
-    public void executeSingleInsert(StmtExecutor executor, long jobId) throws Exception {
+    public void executeSingleInsert(StmtExecutor executor) throws Exception {
         beforeExec();
         try {
-            execImpl(executor, jobId);
+            executor.updateProfile(false);
+            execImpl(executor);
             checkStrictModeAndFilterRatio();
-            int retryTimes = 0;
-            while (retryTimes < Config.mow_insert_into_commit_retry_times) {
-                try {
-                    onComplete();
-                    break;
-                } catch (UserException e) {
-                    LOG.warn("failed to commit txn", e);
-                    if (e.getErrorCode() == InternalErrorCode.DELETE_BITMAP_LOCK_ERR) {
-                        retryTimes++;
-                    } else {
-                        throw e;
-                    }
-                }
+            for (InsertExecutorListener listener : listeners) {
+                listener.beforeComplete(this, executor, jobId);
+            }
+            onComplete();
+            for (InsertExecutorListener listener : listeners) {
+                listener.afterComplete(this, executor, jobId);
             }
         } catch (Throwable t) {
             onFail(t);
-            // retry insert into from select when meet E-230 in cloud
-            if (Config.isCloudMode() && t.getMessage().contains(FeConstants.CLOUD_RETRY_E230)) {
+            // retry insert into from select when meet "need re-plan error" or no scan node in cloud
+            if (Config.isCloudMode() && SystemInfoService.needRetryWithReplan(t.getMessage())) {
                 throw t;
             }
             return;

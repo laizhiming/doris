@@ -74,6 +74,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
     public static final Logger LOG = LogManager.getLogger(BDBJEJournal.class);
     private static final int OUTPUT_BUFFER_INIT_SIZE = 128;
     private static final int RETRY_TIME = 3;
+    private static final long RECOVERY_JOURNAL_ID_UNSET = -1L;
 
     private String environmentPath = null;
     private String selfNodeName;
@@ -146,10 +147,9 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                     DatabaseEntry theData = new DatabaseEntry(entity.getBinaryData());
                     currentJournalDB.put(txn, theKey, theData);  // Put with overwrite, it always success
                     dataSize += theData.getSize();
-                    if (i == 0) {
-                        if (LOG.isDebugEnabled()) {
-                            LOG.debug("opCode = {}, journal size = {}", entity.getOpCode(), theData.getSize());
-                        }
+                    if (i == 0 && LOG.isDebugEnabled()) {
+                        LOG.debug("opCode = {}, journal size = {}, batchNum = {}", entity.getOpCode(),
+                                theData.getSize(), entitySize);
                     }
                 }
 
@@ -163,12 +163,12 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                     MetricRepo.HISTO_JOURNAL_BATCH_DATA_SIZE.update(dataSize);
                 }
 
-                if (entitySize > 32) {
+                if (entitySize > Config.batch_edit_log_max_item_num) {
                     LOG.warn("write bdb journal batch is too large, batch size {}, the first journal id {}, "
                             + "data size {}", entitySize, firstId, dataSize);
                 }
 
-                if (dataSize > 640 * 1024) {  // 640KB
+                if (dataSize > Config.batch_edit_log_max_byte_size) {  // 640KB
                     LOG.warn("write bdb journal batch data is too large, data size {}, the first journal id {}, "
                             + "batch size {}", dataSize, firstId, entitySize);
                 }
@@ -212,6 +212,9 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                     LOG.warn("write bdb is too slow, cost {}ms, the first journal id, batch size {}, data size{}",
                             watch.getTime(), firstId, entitySize, dataSize);
                 }
+                if (MetricRepo.isInit) {
+                    MetricRepo.HISTO_JOURNAL_WRITE_LATENCY.update(watch.getTime());
+                }
             }
         }
 
@@ -225,6 +228,11 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
 
     @Override
     public synchronized long write(short op, Writable writable) throws IOException {
+        // The operation before may set the current thread as interrupted.
+        // MUST reset the interrupted flag of current thread to false,
+        // otherwise edit log writing may fail because it will call lock.tryLock(),
+        // which will check the interrupted flag.
+        Thread.interrupted();
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(op);
         entity.setData(writable);
@@ -243,7 +251,11 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
             MetricRepo.COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES.increase((long) theData.getSize());
         }
         if (LOG.isDebugEnabled() || theData.getSize() > (1 << 20)) {
-            LOG.info("opCode = {}, journal size = {}", op, theData.getSize());
+            LOG.info("opCode = {}, journal size = {}, log id: {}", op, theData.getSize(), id);
+            if (MetricRepo.isInit) {
+                MetricRepo.COUNTER_LARGE_EDIT_LOG.increase(1L);
+            }
+
         }
 
         // Write the key value pair to bdb.
@@ -369,6 +381,11 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
     @Override
     public JournalCursor read(long fromKey, long toKey) {
         return BDBJournalCursor.getJournalCursor(bdbEnvironment, fromKey, toKey);
+    }
+
+    @Override
+    public JournalCursor read(long fromKey, long toKey, boolean exitIfError) {
+        return BDBJournalCursor.getJournalCursor(bdbEnvironment, fromKey, toKey, exitIfError);
     }
 
     @Override
@@ -503,6 +520,8 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 LOG.error("catch an exception when setup bdb environment. will exit.", e);
                 System.exit(-1);
             }
+
+            truncateRecoveryJournalsIfNeeded(metadataFailureRecovery);
         }
 
         // Open a new journal database or get last existing one as current journal
@@ -575,6 +594,78 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         bdbEnvironment.close();
         bdbEnvironment.setup(new File(environmentPath), selfNodeName, selfNodeHostPort,
                 NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), helperNode.getPort()));
+    }
+
+    private void truncateRecoveryJournalsIfNeeded(boolean metadataFailureRecovery) {
+        if (!metadataFailureRecovery) {
+            return;
+        }
+
+        long recoveryJournalId = getRecoveryJournalIdOrUnset();
+        if (recoveryJournalId == RECOVERY_JOURNAL_ID_UNSET) {
+            return;
+        }
+
+        long maxJournalId = getMaxJournalIdWithoutCheck();
+        if (maxJournalId < 0) {
+            String msg = String.format("invalid metadata recovery truncate target %d, no journals in bdb",
+                    recoveryJournalId);
+            LOG.error(msg);
+            LogUtils.stderr(msg);
+            System.exit(-1);
+        }
+
+        if (recoveryJournalId >= maxJournalId) {
+            String msg = String.format("metadata recovery truncate target %d >= max journal id %d, no-op",
+                    recoveryJournalId, maxJournalId);
+            LOG.info(msg);
+            LogUtils.stdout(msg);
+            return;
+        }
+
+        long minJournalId = getMinJournalId();
+        if (minJournalId < 0 || recoveryJournalId < minJournalId) {
+            String msg = String.format("invalid metadata recovery truncate target %d, min journal id is %d",
+                    recoveryJournalId, minJournalId);
+            LOG.error(msg);
+            LogUtils.stderr(msg);
+            System.exit(-1);
+        }
+
+        try {
+            bdbEnvironment.truncateJournalsGreaterThan(recoveryJournalId);
+        } catch (Exception e) {
+            String msg = String.format("failed to truncate journals greater than %d in metadata recovery mode",
+                    recoveryJournalId);
+            LOG.error(msg, e);
+            LogUtils.stderr(msg + ", reason: " + e.getMessage());
+            System.exit(-1);
+        }
+        String msg = String.format("metadata recovery truncate finished, kept journals <= %d", recoveryJournalId);
+        LOG.info(msg);
+        LogUtils.stdout(msg);
+    }
+
+    private long getRecoveryJournalIdOrUnset() {
+        String journalIdStr = System.getProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY);
+        if (journalIdStr == null || journalIdStr.trim().isEmpty()) {
+            return RECOVERY_JOURNAL_ID_UNSET;
+        }
+
+        String trimmedJournalId = journalIdStr.trim();
+        try {
+            long journalId = Long.parseLong(trimmedJournalId);
+            if (journalId < 0) {
+                throw new NumberFormatException("recovery_journal_id must not be negative");
+            }
+            return journalId;
+        } catch (NumberFormatException e) {
+            String msg = String.format("invalid recovery_journal_id: %s", trimmedJournalId);
+            LOG.error(msg, e);
+            LogUtils.stderr(msg);
+            System.exit(-1);
+        }
+        return RECOVERY_JOURNAL_ID_UNSET;
     }
 
     @Override

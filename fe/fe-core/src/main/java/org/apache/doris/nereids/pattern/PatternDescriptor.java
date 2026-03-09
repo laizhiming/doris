@@ -51,6 +51,11 @@ public class PatternDescriptor<INPUT_TYPE extends Plan> {
         return new PatternDescriptor<>(pattern.withPredicates(predicates), defaultPromise);
     }
 
+    /** when with description, the description will be shown in diagnostic message when predicate fails */
+    public PatternDescriptor<INPUT_TYPE> when(String description, Predicate<INPUT_TYPE> predicate) {
+        return when(DescribedPredicate.of(description, predicate));
+    }
+
     public PatternDescriptor<INPUT_TYPE> whenNot(Predicate<INPUT_TYPE> predicate) {
         return when(predicate.negate());
     }
@@ -58,12 +63,12 @@ public class PatternDescriptor<INPUT_TYPE extends Plan> {
     public <OUTPUT_TYPE extends Plan> PatternMatcher<INPUT_TYPE, OUTPUT_TYPE> then(
             Function<INPUT_TYPE, OUTPUT_TYPE> matchedAction) {
         MatchedAction<INPUT_TYPE, OUTPUT_TYPE> adaptMatchedAction = ctx -> matchedAction.apply(ctx.root);
-        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction);
+        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction, matchedAction.getClass().getName());
     }
 
     public <OUTPUT_TYPE extends Plan> PatternMatcher<INPUT_TYPE, OUTPUT_TYPE> thenApply(
             MatchedAction<INPUT_TYPE, OUTPUT_TYPE> matchedAction) {
-        return new PatternMatcher<>(pattern, defaultPromise, matchedAction);
+        return new PatternMatcher<>(pattern, defaultPromise, matchedAction, matchedAction.getClass().getName());
     }
 
     /**
@@ -79,18 +84,18 @@ public class PatternDescriptor<INPUT_TYPE extends Plan> {
                 return null;
             }
         };
-        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction);
+        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction, matchedAction.getClass().getName());
     }
 
     public <OUTPUT_TYPE extends Plan> PatternMatcher<INPUT_TYPE, OUTPUT_TYPE> thenMulti(
             Function<INPUT_TYPE, List<OUTPUT_TYPE>> matchedAction) {
         MatchedMultiAction<INPUT_TYPE, OUTPUT_TYPE> adaptMatchedAction = ctx -> matchedAction.apply(ctx.root);
-        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction);
+        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedAction, matchedAction.getClass().getName());
     }
 
     public <OUTPUT_TYPE extends Plan> PatternMatcher<INPUT_TYPE, OUTPUT_TYPE> thenApplyMulti(
             MatchedMultiAction<INPUT_TYPE, OUTPUT_TYPE> matchedAction) {
-        return new PatternMatcher<>(pattern, defaultPromise, matchedAction);
+        return new PatternMatcher<>(pattern, defaultPromise, matchedAction, matchedAction.getClass().getName());
     }
 
     /**
@@ -106,7 +111,8 @@ public class PatternDescriptor<INPUT_TYPE extends Plan> {
                 return null;
             }
         };
-        return new PatternMatcher<>(pattern, defaultPromise, adaptMatchedMultiAction);
+        return new PatternMatcher<>(pattern, defaultPromise,
+                adaptMatchedMultiAction, matchedMultiAction.getClass().getName());
     }
 
     public Pattern<INPUT_TYPE> getPattern() {

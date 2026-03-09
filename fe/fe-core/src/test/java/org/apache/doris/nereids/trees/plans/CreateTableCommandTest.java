@@ -20,6 +20,7 @@ package org.apache.doris.nereids.trees.plans;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.PartitionDesc;
+import org.apache.doris.analysis.SinglePartitionDesc;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.catalog.AggregateType;
@@ -27,8 +28,8 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.ConfigException;
@@ -36,8 +37,15 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.ParseException;
 import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.trees.plans.commands.CreateMTMVCommand;
 import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateMTMVInfo;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateTableInfo;
+import org.apache.doris.nereids.trees.plans.commands.info.FixedRangePartition;
+import org.apache.doris.nereids.trees.plans.commands.info.InPartition;
+import org.apache.doris.nereids.trees.plans.commands.info.LessThanPartition;
+import org.apache.doris.nereids.trees.plans.commands.info.PartitionDefinition;
+import org.apache.doris.nereids.trees.plans.commands.info.PartitionTableInfo;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.utframe.TestWithFeService;
 
@@ -45,7 +53,6 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -80,8 +87,6 @@ public class CreateTableCommandTest extends TestWithFeService {
                 + "properties('replication_num' = '1','colocate_with'='test'); ";
         createTable(sql);
         Set<Long> tabletIdSetAfterCreateFirstTable = env.getTabletInvertedIndex().getReplicaMetaTable().rowKeySet();
-        Set<TabletMeta> tabletMetaSetBeforeCreateFirstTable =
-                new HashSet<>(env.getTabletInvertedIndex().getTabletMetaTable().values());
         Set<Long> colocateTableIdBeforeCreateFirstTable = env.getColocateTableIndex().getTable2Group().keySet();
         Assertions.assertTrue(colocateTableIdBeforeCreateFirstTable.size() > 0);
         Assertions.assertTrue(tabletIdSetAfterCreateFirstTable.size() > 0);
@@ -93,13 +98,10 @@ public class CreateTableCommandTest extends TestWithFeService {
         Set<Long> tabletIdSetAfterDuplicateCreateTable2 = env.getTabletInvertedIndex().getBackingReplicaMetaTable()
                 .columnKeySet();
         Set<Long> tabletIdSetAfterDuplicateCreateTable3 = env.getTabletInvertedIndex().getTabletMetaMap().keySet();
-        Set<TabletMeta> tabletIdSetAfterDuplicateCreateTable4 =
-                new HashSet<>(env.getTabletInvertedIndex().getTabletMetaTable().values());
 
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable1);
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable2);
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable3);
-        Assertions.assertEquals(tabletMetaSetBeforeCreateFirstTable, tabletIdSetAfterDuplicateCreateTable4);
 
         // check whether table id is cleared from colocate group after duplicate create table
         Set<Long> colocateTableIdAfterCreateFirstTable = env.getColocateTableIndex().getTable2Group().keySet();
@@ -241,12 +243,12 @@ public class CreateTableCommandTest extends TestWithFeService {
 
     @Test
     public void testAbnormal() throws ConfigException {
-        checkThrow(AnalysisException.class,
+        checkThrow(org.apache.doris.common.DdlException.class,
                 "Unknown properties: {aa=bb}",
                 () -> createTable("create table test.atbl1\n" + "(k1 int, k2 float)\n" + "duplicate key(k1)\n"
                         + "distributed by hash(k1) buckets 1\n" + "properties('replication_num' = '1','aa'='bb'); "));
 
-        checkThrow(AnalysisException.class,
+        checkThrow(org.apache.doris.common.DdlException.class,
                 "Floating point type should not be used in distribution column",
                 () -> createTable("create table test.atbl1\n" + "(k1 int, k2 float)\n" + "duplicate key(k1)\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1'); "));
@@ -257,18 +259,18 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + "partition by range(k3)\n" + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1'); "));
 
-        checkThrow(AnalysisException.class,
+        checkThrow(org.apache.doris.common.DdlException.class,
                 "Varchar should not in the middle of short keys",
                 () -> createTable("create table test.atbl3\n" + "(k1 varchar(40), k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n" + "distributed by hash(k1) buckets 1\n"
                         + "properties('replication_num' = '1', 'short_key' = '3');"));
 
-        checkThrow(AnalysisException.class, "Short key is too large. should less than: 3",
+        checkThrow(org.apache.doris.common.DdlException.class, "Short key is too large. should less than: 3",
                 () -> createTable("create table test.atbl4\n" + "(k1 int, k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n" + "distributed by hash(k1) buckets 1\n"
                         + "properties('replication_num' = '1', 'short_key' = '4');"));
 
-        checkThrow(AnalysisException.class,
+        checkThrow(org.apache.doris.common.DdlException.class,
                 "replication num should be less than the number of available backends. replication num is 3, available backend num is 1",
                 () -> createTable("create table test.atbl5\n" + "(k1 int, k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n" + "distributed by hash(k1) buckets 1\n"
@@ -278,48 +280,51 @@ public class CreateTableCommandTest extends TestWithFeService {
                 () -> createTable("create table test.atbl6\n" + "(k1 int, k2 int)\n" + "duplicate key(k1)\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1'); "));
 
-        checkThrow(AnalysisException.class, "Table 'atbl6' already exists",
+        checkThrow(org.apache.doris.common.DdlException.class, "Table 'atbl6' already exists",
                 () -> createTable("create table test.atbl6\n" + "(k1 int, k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n" + "distributed by hash(k1) buckets 1\n"
                         + "properties('replication_num' = '1');"));
 
         ConfigBase.setMutableConfig("disable_storage_medium_check", "false");
-        checkThrow(AnalysisException.class,
-                "Failed to find enough backend, please check the replication num,replication tag and storage medium.\n"
+        checkThrow(org.apache.doris.common.DdlException.class,
+                "Failed to find enough backend, please check the replication num,replication tag and storage medium and avail capacity of backends "
+                        + "or maybe all be on same host."
+                        + Env.getCurrentSystemInfo().getDetailsForCreateReplica(new ReplicaAllocation((short) 1)) + "\n"
                         + "Create failed replications:\n"
                         + "replication tag: {\"location\" : \"default\"}, replication num: 1, storage medium: SSD",
                 () -> createTable("create table test.tb7(key1 int, key2 varchar(10)) distributed by hash(key1) \n"
                         + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd');"));
 
-        checkThrow(AnalysisException.class, "sequence column only support UNIQUE_KEYS",
+        checkThrow(org.apache.doris.common.DdlException.class, "sequence column only support UNIQUE_KEYS",
                 () -> createTable("create table test.atbl8\n" + "(k1 varchar(40), k2 int, v1 int sum)\n"
                         + "aggregate key(k1, k2)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1',\n"
                         + "'function_column.sequence_type' = 'int');"));
 
-        checkThrow(AnalysisException.class, "sequence type only support integer types and date types",
+        checkThrow(org.apache.doris.common.DdlException.class,
+                "sequence type only support integer types and date types",
                 () -> createTable("create table test.atbl8\n" + "(k1 varchar(40), k2 int, v1 int)\n"
                         + "unique key(k1, k2)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1',\n"
                         + "'function_column.sequence_type' = 'double');"));
 
-        checkThrow(AnalysisException.class, "The sequence_col and sequence_type cannot be set at the same time",
+        checkThrow(org.apache.doris.common.DdlException.class, "The sequence_col and sequence_type cannot be set at the same time",
                 () -> createTable("create table test.atbl8\n" + "(k1 varchar(40), k2 int, v1 int)\n"
                         + "unique key(k1, k2)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1',\n"
                         + "'function_column.sequence_type' = 'int', 'function_column.sequence_col' = 'v1');"));
 
-        checkThrow(AnalysisException.class, "The specified sequence column[v3] not exists",
+        checkThrow(org.apache.doris.common.DdlException.class, "The specified sequence column[v3] not exists",
                 () -> createTable("create table test.atbl8\n" + "(k1 varchar(40), k2 int, v1 int)\n"
                         + "unique key(k1, k2)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n" + "properties('replication_num' = '1',\n"
                         + "'function_column.sequence_col' = 'v3');"));
 
-        checkThrow(AnalysisException.class, "Sequence type only support integer types and date types",
+        checkThrow(org.apache.doris.common.DdlException.class, "Sequence type only support integer types and date types",
                 () -> createTable("create table test.atbl8\n" + "(k1 varchar(40), k2 int, v1 int)\n"
                         + "unique key(k1, k2)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
@@ -355,7 +360,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + "properties('replication_num' = '1');"));
 
         // multi partition columns with single key
-        checkThrow(AnalysisException.class,
+        checkThrow(IllegalArgumentException.class,
                 "partition key desc list size[1] is not equal to partition column size[2]",
                 () -> createTable("create table test.tbl11\n"
                         + "(k1 int not null, k2 varchar(128) not null, k3 int, v1 int, v2 int)\n"
@@ -453,7 +458,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + "PROPERTIES(\"replication_num\" = \"1\");"));
 
         // range: partition content != partition key type
-        checkThrow(AnalysisException.class, "Invalid number format: beijing",
+        checkThrow(org.apache.doris.common.DdlException.class, "Invalid number format: beijing",
                 () -> createTable("CREATE TABLE test.tbl17 (\n"
                         + "    k1 int, k2 varchar(128), k3 int, v1 int, v2 int\n"
                         + ")\n"
@@ -466,7 +471,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + "PROPERTIES(\"replication_num\" = \"1\");"));
 
         // list: partition content != partition key type
-        checkThrow(AnalysisException.class, "Invalid number format: beijing",
+        checkThrow(org.apache.doris.common.DdlException.class, "Invalid number format: beijing",
                 () -> createTable("CREATE TABLE test.tbl18 (\n"
                         + "    k1 int not null, k2 varchar(128), k3 int, v1 int, v2 int\n"
                         + ")\n"
@@ -482,7 +487,7 @@ public class CreateTableCommandTest extends TestWithFeService {
          * dynamic partition table
          */
         // list partition with dynamic properties
-        checkThrow(AnalysisException.class, "Only support dynamic partition properties on range partition table",
+        checkThrow(org.apache.doris.common.DdlException.class, "Only support dynamic partition properties on range partition table",
                 () -> createTable("CREATE TABLE test.tbl19\n"
                         + "(\n"
                         + "    k1 DATE not null\n"
@@ -500,7 +505,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + ");\n"));
 
         // no partition table with dynamic properties
-        checkThrow(AnalysisException.class, "Only support dynamic partition properties on range partition table",
+        checkThrow(org.apache.doris.common.DdlException.class, "Only support dynamic partition properties on range partition table",
                 () -> createTable("CREATE TABLE test.tbl20\n"
                         + "(\n"
                         + "    k1 DATE\n"
@@ -558,7 +563,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + " 'data_sort.sort_type' = 'lexical');"));
 
         // create z-order sort table, default col_num
-        checkThrow(AnalysisException.class, "only support lexical method now!",
+        checkThrow(org.apache.doris.common.AnalysisException.class, "only support lexical method now!",
                 () -> createTable(
                         "create table test.zorder_tbl2\n" + "(k1 varchar(40), k2 int, k3 int)\n"
                                 + "duplicate key(k1, k2, k3)\n"
@@ -567,7 +572,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                                 + " 'data_sort.sort_type' = 'zorder');"));
 
         // create z-order sort table, define sort_col_num
-        checkThrow(AnalysisException.class, "only support lexical method now!",
+        checkThrow(org.apache.doris.common.AnalysisException.class, "only support lexical method now!",
                 () -> createTable(
                         "create table test.zorder_tbl3\n" + "(k1 varchar(40), k2 int, k3 int)\n"
                                 + "duplicate key(k1, k2, k3)\n"
@@ -576,7 +581,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                                 + " 'data_sort.sort_type' = 'zorder',"
                                 + " 'data_sort.col_num' = '2');"));
         // create z-order sort table, only 1 sort column
-        checkThrow(AnalysisException.class, "only support lexical method now!",
+        checkThrow(org.apache.doris.common.AnalysisException.class, "only support lexical method now!",
                 () -> createTable("create table test.zorder_tbl4\n" + "(k1 varchar(40), k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
@@ -584,7 +589,7 @@ public class CreateTableCommandTest extends TestWithFeService {
                         + " 'data_sort.sort_type' = 'zorder',"
                         + " 'data_sort.col_num' = '1');"));
         // create z-order sort table, sort column is empty
-        checkThrow(AnalysisException.class, "only support lexical method now!",
+        checkThrow(org.apache.doris.common.AnalysisException.class, "only support lexical method now!",
                 () -> createTable("create table test.zorder_tbl4\n" + "(k1 varchar(40), k2 int, k3 int)\n"
                         + "duplicate key(k1, k2, k3)\n"
                         + "partition by range(k2)\n" + "(partition p1 values less than(\"10\"))\n"
@@ -691,7 +696,7 @@ public class CreateTableCommandTest extends TestWithFeService {
 
     @Test
     public void testCreateTableWithInMemory() {
-        checkThrow(AnalysisException.class, "Not support set 'in_memory'='true' now!",
+        checkThrow(org.apache.doris.common.AnalysisException.class, "Not support set 'in_memory'='true' now!",
                 () -> createTable("create table test.test_inmemory(k1 INT, k2 INT) duplicate key (k1) "
                         + "distributed by hash(k1) buckets 1 properties('replication_num' = '1','in_memory'='true');"));
     }
@@ -769,7 +774,7 @@ public class CreateTableCommandTest extends TestWithFeService {
         Assertions.assertTrue(plan instanceof CreateTableCommand);
         CreateTableInfo createTableInfo = ((CreateTableCommand) plan).getCreateTableInfo();
         createTableInfo.validate(connectContext);
-        Assertions.assertNull(createTableInfo.translateToLegacyStmt().getPartitionDesc());
+        Assertions.assertNull(createTableInfo.getPartitionDesc());
 
         // test with multi partitions
         LogicalPlan plan2 = new NereidsParser().parseSingle(
@@ -778,7 +783,7 @@ public class CreateTableCommandTest extends TestWithFeService {
         Assertions.assertTrue(plan2 instanceof CreateTableCommand);
         CreateTableInfo createTableInfo2 = ((CreateTableCommand) plan2).getCreateTableInfo();
         createTableInfo2.validate(connectContext);
-        PartitionDesc partitionDesc2 = createTableInfo2.translateToLegacyStmt().getPartitionDesc();
+        PartitionDesc partitionDesc2 = createTableInfo2.getPartitionDesc();
         List<Expr> partitionFields2 = partitionDesc2.getPartitionExprs();
         Assertions.assertEquals(5, partitionFields2.size());
 
@@ -830,7 +835,7 @@ public class CreateTableCommandTest extends TestWithFeService {
         Assertions.assertTrue(plan instanceof CreateTableCommand);
         CreateTableInfo createTableInfo = ((CreateTableCommand) plan).getCreateTableInfo();
         createTableInfo.validate(connectContext);
-        return createTableInfo.translateToLegacyStmt().getPartitionDesc();
+        return createTableInfo.getPartitionDesc();
     }
 
     @Test
@@ -898,5 +903,250 @@ public class CreateTableCommandTest extends TestWithFeService {
         } catch (Exception e) {
             Assertions.assertEquals("The partition field must be at the end of the schema.", e.getMessage());
         }
+    }
+
+    @Test
+    public void testConvertToPartitionTableInfo() throws Exception {
+        testUnpartitionConvertToPartitionTableInfo();
+        testRangePartitionConvertToPartitionTableInfo();
+        testInPartitionConvertToPartitionTableInfo();
+        testLessThanPartitionConvertToPartitionTableInfo();
+    }
+
+    private void testUnpartitionConvertToPartitionTableInfo() throws Exception {
+        String partitionTable = "CREATE TABLE aa1 (\n"
+                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
+                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
+                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
+                + " ) ENGINE=OLAP\n"
+                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
+                + " COMMENT 'OLAP'\n"
+                + " PARTITION BY RANGE(`date`)\n"
+                + " (\n"
+                + " PARTITION `p201701` VALUES [(\"2017-01-01\"),  (\"2017-02-01\")),\n"
+                + " PARTITION `p201702` VALUES [(\"2017-02-01\"), (\"2017-03-01\")),\n"
+                + " PARTITION `p201703` VALUES [(\"2017-03-01\"), (\"2017-04-01\"))\n"
+                + " )\n"
+                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1') ;\n";
+        createTable(partitionTable);
+
+        String mv = "CREATE MATERIALIZED VIEW mtmv5\n"
+                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
+                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1')\n"
+                + " AS\n"
+                + " SELECT * FROM aa1;";
+
+        CreateMTMVInfo createMTMVInfo = getPartitionTableInfo(mv);
+        Assertions.assertEquals(PartitionTableInfo.EMPTY, createMTMVInfo.getPartitionTableInfo());
+    }
+
+    private void testRangePartitionConvertToPartitionTableInfo() throws Exception {
+        String fixedRangePartitionTable = "CREATE TABLE mm1 (\n"
+                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
+                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
+                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
+                + " ) ENGINE=OLAP\n"
+                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
+                + " COMMENT 'OLAP'\n"
+                + " PARTITION BY RANGE(`date`)\n"
+                + " (\n"
+                + " PARTITION `p201701` VALUES [(\"2017-01-01\"),  (\"2017-02-01\")),\n"
+                + " PARTITION `p201702` VALUES [(\"2017-02-01\"), (\"2017-03-01\")),\n"
+                + " PARTITION `p201703` VALUES [(\"2017-03-01\"), (\"2017-04-01\"))\n"
+                + " )\n"
+                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1') ;\n";
+
+        String mv = "CREATE MATERIALIZED VIEW mtmv1\n"
+                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
+                + " partition by(`date`)\n"
+                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1')\n"
+                + " AS\n"
+                + " SELECT * FROM mm1;";
+
+        check(fixedRangePartitionTable, mv);
+    }
+
+    private void testLessThanPartitionConvertToPartitionTableInfo() throws Exception {
+        String lessThanPartitionTable = "CREATE TABLE te2 (\n"
+                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
+                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
+                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
+                + " ) ENGINE=OLAP\n"
+                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
+                + " COMMENT 'OLAP'\n"
+                + " PARTITION BY RANGE(`date`)\n"
+                + "(\n"
+                + " PARTITION `p201701` VALUES LESS THAN (\"2017-02-01\"),\n"
+                + " PARTITION `p201702` VALUES LESS THAN (\"2017-03-01\"),\n"
+                + " PARTITION `p201703` VALUES LESS THAN (\"2017-04-01\"),\n"
+                + " PARTITION `p2018` VALUES [(\"2018-01-01\"), (\"2019-01-01\")),\n"
+                + " PARTITION `other` VALUES LESS THAN (MAXVALUE)\n"
+                + ")\n"
+                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1') ;";
+
+        String mv = "CREATE MATERIALIZED VIEW mtmv2\n"
+                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
+                + " partition by(`date`)\n"
+                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1')\n"
+                + " AS\n"
+                + " SELECT * FROM te2;";
+
+        check(lessThanPartitionTable, mv);
+    }
+
+    private void testInPartitionConvertToPartitionTableInfo() throws Exception {
+        String inPartitionTable = "CREATE TABLE cc1 (\n"
+                + "`user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
+                + "`date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
+                + "`num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
+                + ") ENGINE=OLAP\n"
+                + "DUPLICATE KEY(`user_id`, `date`, `num`)\n"
+                + "COMMENT 'OLAP'\n"
+                + "PARTITION BY LIST(`date`,`num`)\n"
+                + "(\n"
+                + " PARTITION p201701_1000 VALUES IN (('2017-01-01',1), ('2017-01-01',2)),\n"
+                + " PARTITION p201702_2000 VALUES IN (('2017-02-01',3), ('2017-02-01',4))\n"
+                + " )\n"
+                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1') ;";
+
+        String mv = "CREATE MATERIALIZED VIEW mtmv\n"
+                + "BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
+                + "partition by(`date`)\n"
+                + "DISTRIBUTED BY RANDOM BUCKETS 2\n"
+                + "PROPERTIES ('replication_num' = '1')\n"
+                + "AS\n"
+                + "SELECT * FROM cc1;";
+
+        check(inPartitionTable, mv);
+    }
+
+    private void check(String sql, String mv) throws Exception {
+        createTable(sql);
+
+        CreateMTMVInfo createMTMVInfo = getPartitionTableInfo(mv);
+        PartitionTableInfo partitionTableInfo = createMTMVInfo.getPartitionTableInfo();
+        PartitionDesc partitionDesc = createMTMVInfo.getPartitionDesc();
+
+        List<PartitionDefinition> partitionDefs = partitionTableInfo.getPartitionDefs();
+        List<SinglePartitionDesc> singlePartitionDescs = partitionDesc.getSinglePartitionDescs();
+
+        assertPartitionInfo(partitionDefs, singlePartitionDescs);
+    }
+
+    private void assertPartitionInfo(List<PartitionDefinition> partitionDefs, List<SinglePartitionDesc> singlePartitionDescs) {
+        Assertions.assertEquals(singlePartitionDescs.size(), partitionDefs.size());
+
+        for (int i = 0; i < singlePartitionDescs.size(); i++) {
+            PartitionDefinition partitionDefinition = partitionDefs.get(i);
+            SinglePartitionDesc singlePartitionDesc = singlePartitionDescs.get(i);
+
+            if (partitionDefinition instanceof InPartition) {
+                InPartition inPartition = (InPartition) partitionDefinition;
+
+                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
+                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "IN");
+                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getInValues().size(), inPartition.getValues().size());
+            } else if (partitionDefinition instanceof FixedRangePartition) {
+                FixedRangePartition fixedRangePartition = (FixedRangePartition) partitionDefinition;
+
+                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
+                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "FIXED");
+                Assertions.assertEquals(fixedRangePartition.getLowerBounds().size(), singlePartitionDesc.getPartitionKeyDesc().getLowerValues().size());
+                Assertions.assertEquals(fixedRangePartition.getUpperBounds().size(), singlePartitionDesc.getPartitionKeyDesc().getUpperValues().size());
+            } else if (partitionDefinition instanceof LessThanPartition) {
+                LessThanPartition lessThanPartition = (LessThanPartition) partitionDefinition;
+
+                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
+                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "LESS_THAN");
+                Assertions.assertEquals(lessThanPartition.getValues().size(), singlePartitionDesc.getPartitionKeyDesc().getUpperValues().size());
+            }
+        }
+    }
+
+    private CreateMTMVInfo getPartitionTableInfo(String sql) throws Exception {
+        NereidsParser nereidsParser = new NereidsParser();
+        LogicalPlan logicalPlan = nereidsParser.parseSingle(sql);
+        Assertions.assertTrue(logicalPlan instanceof CreateMTMVCommand);
+        CreateMTMVCommand command = (CreateMTMVCommand) logicalPlan;
+        command.getCreateMTMVInfo().analyze(connectContext);
+
+        return command.getCreateMTMVInfo();
+    }
+
+    @Test
+    public void testVariantFieldPatternDictCompressionValidation() {
+        String invalidSql = "create table test.tbl_variant_dict_invalid\n"
+                + "(k1 int, v variant<\n"
+                + "    MATCH_NAME 'metrics.score' : int\n"
+                + "> null,\n"
+                + "INDEX idx_v (v) USING INVERTED PROPERTIES(\n"
+                + "    \"field_pattern\" = \"metrics.score\",\n"
+                + "    \"dict_compression\" = \"true\"\n"
+                + "))\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties('replication_num' = '1', 'inverted_index_storage_format' = 'V3');";
+
+        AnalysisException ex = Assertions.assertThrows(AnalysisException.class, () -> createTable(invalidSql));
+        Assertions.assertTrue(ex.getMessage().contains("invalid INVERTED index: field pattern: metrics.score"));
+        Assertions.assertTrue(ex.getMessage().contains("dict_compression can only be set for StringType columns"));
+
+        String validSql = "create table test.tbl_variant_dict_valid\n"
+                + "(k1 int, v variant<\n"
+                + "    MATCH_NAME 'metrics.score' : string\n"
+                + "> null,\n"
+                + "INDEX idx_v (v) USING INVERTED PROPERTIES(\n"
+                + "    \"field_pattern\" = \"metrics.score\",\n"
+                + "    \"dict_compression\" = \"true\"\n"
+                + "))\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties('replication_num' = '1', 'inverted_index_storage_format' = 'V3');";
+
+        Assertions.assertDoesNotThrow(() -> createTable(validSql));
+    }
+
+    @Test
+    public void testMTMVRejectVarbinary() throws Exception {
+        String mv = "CREATE MATERIALIZED VIEW mv_vb\n"
+                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
+                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
+                + " PROPERTIES ('replication_num' = '1')\n"
+                + " AS SELECT X'AB' as vb;";
+
+        LogicalPlan plan = new NereidsParser().parseSingle(mv);
+        Assertions.assertTrue(plan instanceof CreateMTMVCommand);
+        CreateMTMVCommand cmd = (CreateMTMVCommand) plan;
+
+        org.apache.doris.nereids.exceptions.AnalysisException ex = Assertions.assertThrows(
+                org.apache.doris.nereids.exceptions.AnalysisException.class,
+                () -> cmd.getCreateMTMVInfo().analyze(connectContext));
+        System.out.println(ex.getMessage());
+        Assertions.assertTrue(ex.getMessage().contains("MTMV do not support varbinary type"));
+        Assertions.assertTrue(ex.getMessage().contains("vb"));
+    }
+
+    @Test
+    public void testVarBinaryModifyColumnRejected() throws Exception {
+        createTable("create table test.vb_alt (k1 int, v1 int)\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties('replication_num' = '1');");
+
+        org.apache.doris.nereids.trees.plans.logical.LogicalPlan plan =
+                new org.apache.doris.nereids.parser.NereidsParser()
+                        .parseSingle("alter table test.vb_alt modify column v1 VARBINARY");
+        Assertions.assertTrue(
+                plan instanceof org.apache.doris.nereids.trees.plans.commands.AlterTableCommand);
+        org.apache.doris.nereids.trees.plans.commands.AlterTableCommand cmd2 =
+                (org.apache.doris.nereids.trees.plans.commands.AlterTableCommand) plan;
+        Assertions.assertThrows(Throwable.class, () -> cmd2.run(connectContext, null));
     }
 }

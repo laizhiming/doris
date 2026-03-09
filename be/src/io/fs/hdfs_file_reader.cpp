@@ -28,13 +28,16 @@
 #include "bvar/reducer.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/logging.h"
-#include "common/sync_point.h"
+#include "common/metrics/doris_metrics.h"
+#include "cpp/sync_point.h"
 #include "io/fs/err_utils.h"
 #include "io/hdfs_util.h"
+#include "runtime/thread_context.h"
+#include "runtime/workload_management/io_throttle.h"
 #include "service/backend_options.h"
-#include "util/doris_metrics.h"
 
 namespace doris::io {
+#include "common/compile_check_begin.h"
 
 bvar::Adder<uint64_t> hdfs_bytes_read_total("hdfs_file_reader", "bytes_read");
 bvar::LatencyRecorder hdfs_bytes_per_read("hdfs_file_reader", "bytes_per_read"); // also QPS
@@ -47,7 +50,7 @@ namespace {
 Result<FileHandleCache::Accessor> get_file(const hdfsFS& fs, const Path& file, int64_t mtime,
                                            int64_t file_size) {
     static FileHandleCache cache(config::max_hdfs_file_handle_cache_num, 16,
-                                 config::max_hdfs_file_handle_cache_time_sec * 1000L);
+                                 config::max_hdfs_file_handle_cache_time_sec);
     bool cache_hit;
     FileHandleCache::Accessor accessor;
     RETURN_IF_ERROR_RESULT(cache.get_file_handle(fs, file.native(), mtime, file_size, false,
@@ -63,16 +66,17 @@ Result<FileReaderSPtr> HdfsFileReader::create(Path full_path, const hdfsFS& fs, 
     auto path = convert_path(full_path, fs_name);
     return get_file(fs, path, opts.mtime, opts.file_size).transform([&](auto&& accessor) {
         return std::make_shared<HdfsFileReader>(std::move(path), std::move(fs_name),
-                                                std::move(accessor), profile);
+                                                std::move(accessor), profile, opts.mtime);
     });
 }
 
 HdfsFileReader::HdfsFileReader(Path path, std::string fs_name, FileHandleCache::Accessor accessor,
-                               RuntimeProfile* profile)
+                               RuntimeProfile* profile, int64_t mtime)
         : _path(std::move(path)),
           _fs_name(std::move(fs_name)),
           _accessor(std::move(accessor)),
-          _profile(profile) {
+          _profile(profile),
+          _mtime(mtime) {
     _handle = _accessor.get();
 
     DorisMetrics::instance()->hdfs_file_open_reading->increment(1);
@@ -112,11 +116,26 @@ Status HdfsFileReader::close() {
     return Status::OK();
 }
 
-#ifdef USE_HADOOP_HDFS
 Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
-                                    const IOContext* /*io_ctx*/) {
+                                    const IOContext* io_ctx) {
+    auto st = do_read_at_impl(offset, result, bytes_read, io_ctx);
+    if (!st.ok()) {
+        _handle = nullptr;
+        _accessor.destroy();
+    }
+    return st;
+}
+
+#ifdef USE_HADOOP_HDFS
+Status HdfsFileReader::do_read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                                       const IOContext* /*io_ctx*/) {
     if (closed()) [[unlikely]] {
         return Status::InternalError("read closed file: {}", _path.native());
+    }
+
+    if (_handle == nullptr) [[unlikely]] {
+        return Status::InternalError("cached hdfs file handle has been destroyed: {}",
+                                     _path.native());
     }
 
     if (offset > _handle->file_size()) {
@@ -132,10 +151,15 @@ Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_r
         return Status::OK();
     }
 
+    LIMIT_REMOTE_SCAN_IO(bytes_read);
+
     size_t has_read = 0;
     while (has_read < bytes_req) {
+        int64_t max_to_read = bytes_req - has_read;
+        tSize to_read = static_cast<tSize>(
+                std::min(max_to_read, static_cast<int64_t>(std::numeric_limits<tSize>::max())));
         tSize loop_read = hdfsPread(_handle->fs(), _handle->file(), offset + has_read,
-                                    to + has_read, bytes_req - has_read);
+                                    to + has_read, to_read);
         {
             [[maybe_unused]] Status error_ret;
             TEST_INJECTION_POINT_RETURN_WITH_VALUE("HdfsFileReader:read_error", error_ret);
@@ -165,8 +189,8 @@ Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_r
 #else
 // The hedged read only support hdfsPread().
 // TODO: rethink here to see if there are some difference between hdfsPread() and hdfsRead()
-Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
-                                    const IOContext* /*io_ctx*/) {
+Status HdfsFileReader::do_read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                                       const IOContext* /*io_ctx*/) {
     if (closed()) [[unlikely]] {
         return Status::InternalError("read closed file: ", _path.native());
     }
@@ -196,10 +220,12 @@ Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_r
         return Status::OK();
     }
 
+    LIMIT_REMOTE_SCAN_IO(bytes_read);
+
     size_t has_read = 0;
     while (has_read < bytes_req) {
-        int64_t loop_read =
-                hdfsRead(_handle->fs(), _handle->file(), to + has_read, bytes_req - has_read);
+        int64_t loop_read = hdfsRead(_handle->fs(), _handle->file(), to + has_read,
+                                     static_cast<int32_t>(bytes_req - has_read));
         if (loop_read < 0) {
             // invoker maybe just skip Status.NotFound and continue
             // so we need distinguish between it and other kinds of errors
@@ -226,6 +252,10 @@ Status HdfsFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_r
 void HdfsFileReader::_collect_profile_before_close() {
     if (_profile != nullptr && is_hdfs(_fs_name)) {
 #ifdef USE_HADOOP_HDFS
+        if (_handle == nullptr) [[unlikely]] {
+            return;
+        }
+
         struct hdfsReadStatistics* hdfs_statistics = nullptr;
         auto r = hdfsFileGetReadStatistics(_handle->file(), &hdfs_statistics);
         if (r != 0) {
@@ -260,5 +290,6 @@ void HdfsFileReader::_collect_profile_before_close() {
 #endif
     }
 }
+#include "common/compile_check_end.h"
 
 } // namespace doris::io

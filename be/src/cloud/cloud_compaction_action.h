@@ -23,9 +23,9 @@
 
 #include "cloud/cloud_storage_engine.h"
 #include "common/status.h"
-#include "http/action/compaction_action.h"
-#include "http/http_handler_with_auth.h"
-#include "olap/tablet.h"
+#include "service/http/action/compaction_action.h"
+#include "service/http/http_handler_with_auth.h"
+#include "storage/tablet/tablet.h"
 
 namespace doris {
 class HttpRequest;
@@ -70,7 +70,7 @@ private:
 
 private:
     CloudStorageEngine& _engine;
-    CompactionActionType _type;
+    CompactionActionType _compaction_type;
 };
 
 } // end namespace doris

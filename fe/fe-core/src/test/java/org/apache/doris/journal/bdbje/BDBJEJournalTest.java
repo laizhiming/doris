@@ -18,6 +18,7 @@
 package org.apache.doris.journal.bdbje;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
@@ -155,14 +156,7 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
 
         journal.rollJournal();
         for (int i = 0; i < 10; i++) {
-            String data = "OperationType.OP_TIMESTAMP";
-            Writable writable = new Writable() {
-                @Override
-                public void write(DataOutput out) throws IOException {
-                    Text.writeString(out, data);
-                }
-            };
-            journal.write(OperationType.OP_TIMESTAMP, writable);
+            journal.write(OperationType.OP_TIMESTAMP, new Timestamp());
         }
 
         Assertions.assertEquals(10, journal.getMaxJournalId());
@@ -183,14 +177,7 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
             if (i % 10 == 0) {
                 journal.rollJournal();
             }
-            String data = "OperationType.OP_TIMESTAMP";
-            Writable writable = new Writable() {
-                @Override
-                public void write(DataOutput out) throws IOException {
-                    Text.writeString(out, data);
-                }
-            };
-            journal.write(OperationType.OP_TIMESTAMP, writable);
+            journal.write(OperationType.OP_TIMESTAMP, new Timestamp());
         }
 
         Assertions.assertEquals(50, journal.getMaxJournalId());
@@ -213,13 +200,13 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
             Assertions.assertEquals(OperationType.OP_TIMESTAMP, entity.getOpCode());
         }
 
-        Assertions.assertEquals(null, cursor.next());
+        Assertions.assertNull(cursor.next());
 
         journal.close();
-        Assertions.assertEquals(null, journal.getBDBEnvironment());
+        Assertions.assertNull(journal.getBDBEnvironment());
 
         journal.open();
-        Assertions.assertTrue(journal.getBDBEnvironment() != null);
+        Assertions.assertNotNull(journal.getBDBEnvironment());
         // BDBEnvrinment need several seconds election from unknown to master
         for (int i = 0; i < 10; i++) {
             if (journal.getBDBEnvironment().getReplicatedEnvironment().getState()
@@ -238,6 +225,92 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         Assertions.assertEquals(3, journal.getDatabaseNames().size());
         Assertions.assertEquals(21, journal.getDatabaseNames().get(0));
         journal.close();
+    }
+
+    @RepeatedTest(1)
+    public void testRecoveryJournalIdNoEffectWithoutMetadataRecovery() throws Exception {
+        int port = findValidPort();
+        Preconditions.checkArgument(((port > 0) && (port < 65535)));
+        String nodeName = Env.genFeNodeName("127.0.0.1", port, false);
+        long replayedJournalId = 0;
+        File tmpDir = createTmpDir();
+        new MockUp<Env>() {
+            HostInfo selfNode = new HostInfo("127.0.0.1", port);
+            @Mock
+            public String getBdbDir() {
+                return tmpDir.getAbsolutePath();
+            }
+
+            @Mock
+            public HostInfo getSelfNode() {
+                return this.selfNode;
+            }
+
+            @Mock
+            public HostInfo getHelperNode() {
+                return this.selfNode;
+            }
+
+            @Mock
+            public boolean isElectable() {
+                return true;
+            }
+
+            @Mock
+            public long getReplayedJournalId() {
+                return replayedJournalId;
+            }
+        };
+
+        String oldRecovery = System.getProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY);
+        String oldMetadataRecovery = System.getProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY);
+        BDBJEJournal journal = new BDBJEJournal(nodeName);
+        try {
+            System.clearProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY);
+            System.setProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY, "5");
+
+            journal.open();
+            for (int i = 0; i < 10; i++) {
+                if (journal.getBDBEnvironment().getReplicatedEnvironment().getState()
+                        .equals(ReplicatedEnvironment.State.MASTER)) {
+                    break;
+                }
+                Thread.sleep(1000);
+            }
+            Assertions.assertEquals(ReplicatedEnvironment.State.MASTER,
+                    journal.getBDBEnvironment().getReplicatedEnvironment().getState());
+            for (int i = 0; i < 10; i++) {
+                journal.write(OperationType.OP_TIMESTAMP, new Timestamp());
+            }
+            Assertions.assertEquals(10, journal.getMaxJournalId());
+            journal.close();
+
+            journal.open();
+            for (int i = 0; i < 10; i++) {
+                if (journal.getBDBEnvironment().getReplicatedEnvironment().getState()
+                        .equals(ReplicatedEnvironment.State.MASTER)) {
+                    break;
+                }
+                Thread.sleep(1000);
+            }
+            Assertions.assertEquals(ReplicatedEnvironment.State.MASTER,
+                    journal.getBDBEnvironment().getReplicatedEnvironment().getState());
+            Assertions.assertEquals(10, journal.getMaxJournalId());
+        } finally {
+            if (journal.getBDBEnvironment() != null) {
+                journal.close();
+            }
+            if (oldRecovery == null) {
+                System.clearProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY);
+            } else {
+                System.setProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY, oldRecovery);
+            }
+            if (oldMetadataRecovery == null) {
+                System.clearProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY);
+            } else {
+                System.setProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY, oldMetadataRecovery);
+            }
+        }
     }
 
     @RepeatedTest(1)
@@ -301,8 +374,8 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
                     Text.writeString(out, data);
                 }
             };
-            // CREATE_MTMV_JOB is deprecated, and safe to write any data.
-            batch.addJournal(OperationType.OP_CREATE_MTMV_JOB, writable);
+            // OP_START_ROLLUP is deprecated, and safe to write any data.
+            batch.addJournal(OperationType.OP_START_ROLLUP, writable);
         }
         long journalId = journal.write(batch);
         Assertions.assertEquals(1, journalId);
@@ -319,7 +392,7 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         Assertions.assertEquals(1, journal.getDatabaseNames().get(0));
 
         JournalEntity journalEntity = journal.read(1);
-        Assertions.assertEquals(OperationType.OP_CREATE_MTMV_JOB, journalEntity.getOpCode());
+        Assertions.assertEquals(OperationType.OP_START_ROLLUP, journalEntity.getOpCode());
 
         batch = new JournalBatch(10);
         for (int i = 0; i < 10; i++) {
@@ -330,7 +403,7 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
                     Text.writeString(out, data);
                 }
             };
-            batch.addJournal(OperationType.OP_CREATE_MTMV_JOB, writable);
+            batch.addJournal(OperationType.OP_START_ROLLUP, writable);
         }
         journalId = journal.write(batch);
         Assertions.assertEquals(11, journalId);

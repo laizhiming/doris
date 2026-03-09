@@ -26,9 +26,6 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
 
-import java.io.DataInput;
-import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -46,18 +43,21 @@ public class ListPartitionItem extends PartitionItem {
         this.partitionKeys = partitionKeys;
     }
 
-    public static ListPartitionItem read(DataInput input) throws IOException {
-        int counter = input.readInt();
-        List<PartitionKey> partitionKeys = new ArrayList<>();
-        for (int i = 0; i < counter; i++) {
-            PartitionKey partitionKey = PartitionKey.read(input);
-            partitionKeys.add(partitionKey);
-        }
-        return new ListPartitionItem(partitionKeys);
-    }
-
     public List<PartitionKey> getItems() {
         return partitionKeys;
+    }
+
+    public String getItemsString() {
+        // ATTN: DO NOT EDIT unless unless you explicitly guarantee compatibility
+        // between different versions.
+        //
+        // the ccr syncer depends on this string to identify partitions between two
+        // clusters (cluster versions may be different).
+        return getItems().toString();
+    }
+
+    public String getItemsSql() {
+        return toSql();
     }
 
     @Override
@@ -113,9 +113,10 @@ public class ListPartitionItem extends PartitionItem {
                                 partitionKey.toString(),
                                 pos));
             }
-            if (!isDefaultPartition() && MTMVUtil.getExprTimeSec(partitionKey.getKeys().get(pos), dateFormatOptional)
-                    >= nowTruncSubSec) {
-                // As long as one of the partitionKeys meets the requirements, this partition needs to be retained
+            if (!isDefaultPartition()
+                    && MTMVUtil.getExprTimeSec(partitionKey.getKeys().get(pos), dateFormatOptional) >= nowTruncSubSec) {
+                // As long as one of the partitionKeys meets the requirements, this partition
+                // needs to be retained
                 return true;
             }
         }
@@ -174,11 +175,11 @@ public class ListPartitionItem extends PartitionItem {
     }
 
     public String toSql() {
-        StringBuilder sb = new StringBuilder();
-        int size = partitionKeys.size();
-        if (size > 1) {
-            sb.append("(");
+        if (isDefaultPartition) {
+            return "";
         }
+        StringBuilder sb = new StringBuilder();
+        sb.append("(");
 
         int i = 0;
         for (PartitionKey partitionKey : partitionKeys) {
@@ -189,9 +190,7 @@ public class ListPartitionItem extends PartitionItem {
             i++;
         }
 
-        if (size > 1) {
-            sb.append(")");
-        }
+        sb.append(")");
 
         return sb.toString();
     }

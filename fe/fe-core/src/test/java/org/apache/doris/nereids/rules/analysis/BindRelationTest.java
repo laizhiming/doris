@@ -17,19 +17,20 @@
 
 package org.apache.doris.nereids.rules.analysis;
 
-import org.apache.doris.catalog.Column;
-import org.apache.doris.catalog.KeysType;
-import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.catalog.PartitionInfo;
-import org.apache.doris.catalog.RandomDistributionInfo;
-import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.pattern.GeneratedPlanPatterns;
 import org.apache.doris.nereids.rules.RulePromise;
-import org.apache.doris.nereids.rules.analysis.BindRelation.CustomTableResolver;
+import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.ExprId;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSchemaScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
+import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanVisitor;
 import org.apache.doris.nereids.util.PlanChecker;
 import org.apache.doris.nereids.util.PlanRewriter;
 import org.apache.doris.utframe.TestWithFeService;
@@ -38,8 +39,10 @@ import com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 class BindRelationTest extends TestWithFeService implements GeneratedPlanPatterns {
     private static final String DB1 = "db1";
@@ -54,6 +57,12 @@ class BindRelationTest extends TestWithFeService implements GeneratedPlanPattern
                 + ")ENGINE=OLAP\n"
                 + "DISTRIBUTED BY HASH(`a`) BUCKETS 3\n"
                 + "PROPERTIES (\"replication_num\"= \"1\");");
+        createTable("CREATE TABLE db1.tagg ( \n"
+                + " \ta INT,\n"
+                + " \tb INT SUM\n"
+                + ")ENGINE=OLAP AGGREGATE KEY(a)\n "
+                + "DISTRIBUTED BY random BUCKETS 3\n"
+                + "PROPERTIES (\"replication_num\"= \"1\");");
         connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
     }
 
@@ -63,7 +72,7 @@ class BindRelationTest extends TestWithFeService implements GeneratedPlanPattern
         Plan plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(), ImmutableList.of("t")),
                 connectContext, new BindRelation());
 
-        Assertions.assertTrue(plan instanceof LogicalOlapScan);
+        Assertions.assertInstanceOf(LogicalOlapScan.class, plan);
         Assertions.assertEquals(
                 ImmutableList.of("internal", DEFAULT_CLUSTER_PREFIX + DB1, "t"),
                 ((LogicalOlapScan) plan).qualified());
@@ -75,54 +84,88 @@ class BindRelationTest extends TestWithFeService implements GeneratedPlanPattern
         Plan plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(), ImmutableList.of("db1", "t")),
                 connectContext, new BindRelation());
 
-        Assertions.assertTrue(plan instanceof LogicalOlapScan);
+        Assertions.assertInstanceOf(LogicalOlapScan.class, plan);
         Assertions.assertEquals(
                 ImmutableList.of("internal", DEFAULT_CLUSTER_PREFIX + DB1, "t"),
                 ((LogicalOlapScan) plan).qualified());
     }
 
     @Test
-    public void bindExternalRelation() {
+    void bindSchemaTable() {
+        boolean originValue = connectContext.getSessionVariable().isFetchAllFeForSystemTable();
+        try {
+            connectContext.getSessionVariable().setFetchAllFeForSystemTable(true);
+            // test table which should fetch all fe
+            Plan plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(),
+                            ImmutableList.of("information_schema", "sql_block_rule_status")),
+                    connectContext, new BindRelation());
+            Assertions.assertInstanceOf(LogicalAggregate.class, plan);
+            Assertions.assertInstanceOf(LogicalSubQueryAlias.class, plan.child(0));
+            Assertions.assertInstanceOf(LogicalSchemaScan.class, plan.child(0).child(0));
+            // test table which should not fetch all fe
+            plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(),
+                            ImmutableList.of("information_schema", "tables")),
+                    connectContext, new BindRelation());
+            Assertions.assertInstanceOf(LogicalSubQueryAlias.class, plan);
+            Assertions.assertInstanceOf(LogicalSchemaScan.class, plan.child(0));
+            // test table which should fetch all fe but close session variable
+            connectContext.getSessionVariable().setFetchAllFeForSystemTable(false);
+            plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(),
+                            ImmutableList.of("information_schema", "sql_block_rule_status")),
+                    connectContext, new BindRelation());
+            Assertions.assertInstanceOf(LogicalSubQueryAlias.class, plan);
+            Assertions.assertInstanceOf(LogicalSchemaScan.class, plan.child(0));
+        } finally {
+            connectContext.getSessionVariable().setFetchAllFeForSystemTable(originValue);
+        }
+    }
+
+    @Test
+    void bindRandomAggTable() {
         connectContext.setDatabase(DEFAULT_CLUSTER_PREFIX + DB1);
-        String tableName = "external_table";
+        connectContext.getState().setIsQuery(true);
+        Plan plan = PlanRewriter.bottomUpRewrite(new UnboundRelation(StatementScopeIdGenerator.newRelationId(), ImmutableList.of("tagg")),
+                connectContext, new BindRelation());
 
-        List<Column> externalTableColumns = ImmutableList.of(
-                new Column("id", Type.INT),
-                new Column("name", Type.VARCHAR)
-        );
+        Assertions.assertInstanceOf(LogicalAggregate.class, plan);
+        Assertions.assertEquals(
+                ImmutableList.of("internal", DEFAULT_CLUSTER_PREFIX + DB1, "tagg"),
+                plan.getOutput().get(0).getQualifier());
+        Assertions.assertEquals(
+                ImmutableList.of("internal", DEFAULT_CLUSTER_PREFIX + DB1, "tagg"),
+                plan.getOutput().get(1).getQualifier());
+    }
 
-        OlapTable externalOlapTable = new OlapTable(1, tableName, externalTableColumns, KeysType.DUP_KEYS,
-                new PartitionInfo(), new RandomDistributionInfo(10)) {
-            @Override
-            public List<Column> getBaseSchema(boolean full) {
-                return externalTableColumns;
-            }
-
-            @Override
-            public boolean hasDeleteSign() {
-                return false;
-            }
-        };
-
-        CustomTableResolver customTableResolver = qualifiedTable -> {
-            if (qualifiedTable.get(2).equals(tableName)) {
-                return externalOlapTable;
-            } else {
-                return null;
-            }
-        };
-
+    @Test
+    void testBindRandomAggTableExprIdSame() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
+        connectContext.getState().setIsQuery(true);
         PlanChecker.from(connectContext)
-                .parse("select * from " + tableName + " as et join db1.t on et.id = t.a")
-                .customAnalyzer(Optional.of(customTableResolver)) // analyze internal relation
-                .matches(
-                        logicalJoin(
-                                logicalSubQueryAlias(
-                                    logicalOlapScan().when(r -> r.getTable() == externalOlapTable)
-                                ),
-                                logicalOlapScan().when(r -> r.getTable().getName().equals("t"))
-                        )
-                );
+                .checkPlannerResult("select * from db1.tagg",
+                        planner -> {
+                            List<Alias> collectedAlias = new ArrayList<>();
+                            planner.getCascadesContext().getRewritePlan().accept(
+                                    new DefaultPlanVisitor<Void, List<Alias>>() {
+                                        @Override
+                                        public Void visitLogicalAggregate(LogicalAggregate<? extends Plan> aggregate,
+                                                List<Alias> context) {
+                                            for (Expression expression : aggregate.getExpressions()) {
+                                                collectedAlias.addAll(
+                                                        expression.collectToList(Alias.class::isInstance));
+                                            }
+                                            return super.visitLogicalAggregate(aggregate, context);
+                                        }
+                                    }, collectedAlias);
+                            for (Alias alias : collectedAlias) {
+                                for (Expression child : alias.children()) {
+                                    Set<ExprId> childExpressionSet =
+                                            child.collectToSet(NamedExpression.class::isInstance).stream()
+                                                    .map(expr -> ((NamedExpression) expr).getExprId())
+                                                    .collect(Collectors.toSet());
+                                    Assertions.assertFalse(childExpressionSet.contains(alias.getExprId()));
+                                }
+                            }
+                        });
     }
 
     @Override

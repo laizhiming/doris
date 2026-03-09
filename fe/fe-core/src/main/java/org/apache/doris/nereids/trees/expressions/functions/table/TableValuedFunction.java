@@ -27,12 +27,10 @@ import org.apache.doris.nereids.trees.expressions.Properties;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.functions.BoundFunction;
 import org.apache.doris.nereids.trees.expressions.functions.CustomSignature;
-import org.apache.doris.nereids.trees.expressions.functions.Nondeterministic;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.statistics.ColumnStatistic;
 import org.apache.doris.statistics.Statistics;
 import org.apache.doris.tablefunction.TableValuedFunctionIf;
@@ -48,7 +46,7 @@ import java.util.stream.Collectors;
 
 /** TableValuedFunction */
 public abstract class TableValuedFunction extends BoundFunction
-        implements UnaryExpression, CustomSignature, Nondeterministic {
+        implements UnaryExpression, CustomSignature {
 
     protected final Supplier<TableValuedFunctionIf> catalogFunctionCache = Suppliers.memoize(this::toCatalogFunction);
     protected final Supplier<FunctionGenTable> tableCache = Suppliers.memoize(() -> {
@@ -119,9 +117,7 @@ public abstract class TableValuedFunction extends BoundFunction
     }
 
     public PhysicalProperties getPhysicalProperties() {
-        if (SessionVariable.canUseNereidsDistributePlanner()) {
-            return PhysicalProperties.ANY;
-        }
+        // always need shuffle when exists union all
         return PhysicalProperties.STORAGE_ANY;
     }
 
@@ -131,7 +127,7 @@ public abstract class TableValuedFunction extends BoundFunction
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         String args = getTVFProperties()
                 .getMap()
                 .entrySet()
@@ -144,5 +140,10 @@ public abstract class TableValuedFunction extends BoundFunction
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public boolean isDeterministic() {
+        return false;
     }
 }

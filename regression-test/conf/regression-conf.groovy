@@ -24,8 +24,8 @@ defaultDb = "regression_test"
 // init cmd like: select @@session.tx_read_only
 // at each time we connect.
 // add allowLoadLocalInfile so that the jdbc can execute mysql load data from client.
-jdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true"
-targetJdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true"
+jdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true&zeroDateTimeBehavior=round"
+targetJdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true&zeroDateTimeBehavior=round"
 jdbcUser = "root"
 jdbcPassword = ""
 
@@ -38,6 +38,12 @@ feSyncerPassword = ""
 feHttpAddress = "127.0.0.1:8030"
 feHttpUser = "root"
 feHttpPassword = ""
+
+// ccr, need BE enable_feature_binlog=true and FE enable_feature_binlog = true
+ccrDownstreamUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true"
+ccrDownstreamUser = "root"
+ccrDownstreamPassword = ""
+ccrDownstreamFeThriftAddress = "127.0.0.1:9030"
 
 // set DORIS_HOME by system properties
 // e.g. java -DDORIS_HOME=./
@@ -104,8 +110,16 @@ brokerName = "broker_name"
 
 // broker load test config
 enableBrokerLoad=true
-ak=""
-sk=""
+
+// for s3 releated cases, "aliyun" or "aliyun-internal" or "tencent" or "huawei" or "azure" or "gcp"
+// if s3Source is set,  s3Endpoint s3BucketName s3Region s3Provider will be filled with default value if not set
+s3Source="aliyun"
+// s3Endpoint = ""
+// s3BucketName = ""
+// s3Region = ""
+// s3Provider = ""
+ak="***********"
+sk="***********"
 
 // jdbc connector test config
 // To enable jdbc test, you need first start mysql/pg container.
@@ -119,6 +133,7 @@ clickhouse_22_port=8123
 doris_port=9030
 mariadb_10_port=3326
 db2_11_port=50000
+oceanbase_port=2881
 
 // hive catalog test config
 // To enable hive/paimon test, you need first start hive container.
@@ -161,6 +176,17 @@ extHdfsPort = 4007
 extHiveServerPort= 7001
 extHiveHmsUser = "****"
 extHiveHmsPassword= "***********"
+dfsNameservices=""
+dfsNameservicesPort=8020
+dfsHaNamenodesHdfsCluster=""
+dfsNamenodeRpcAddress1=""
+dfsNamenodeRpcAddress2=""
+dfsNamenodeRpcAddress3=""
+hadoopSecurityAuthentication = ""
+hadoopKerberosKeytabPath = ""
+hadoopKerberosPrincipal = ""
+hadoopSecurityAutoToLocal = ""
+
 
 //paimon catalog test config for bigdata
 enableExternalPaimonTest = false
@@ -179,12 +205,18 @@ extPgPort = 5432
 extPgUser = "****"
 extPgPassword = "***********"
 
-// elasticsearch external test config for bigdata
-enableExternalEsTest = false
-extEsHost = "***********"
-extEsPort = 9200
-extEsUser = "*******"
-extEsPassword = "***********"
+// minio external test config
+enableExternalMinioTest = false
+extMinioHost = "***.**.**.**"
+extMinioPort = 9000
+extMinioDomain = "myminio.com"
+extMinioAk = "minioadmin"
+extMinioSk = "minioadmin"
+extMinioRegion = "us-east-1"
+extMinioBucket = "test-bucket"
+
+enableExternalHudiTest = false
+hudiEmrCatalog = "***********"
 
 enableObjStorageTest=false
 enableMaxComputeTest=false
@@ -193,20 +225,30 @@ dlfUid="***********"
 aliYunSk="***********"
 hwYunAk="***********"
 hwYunSk="***********"
-
-s3Endpoint = "cos.ap-hongkong.myqcloud.com"
-s3BucketName = "doris-build-hk-1308700295"
-s3Region = "ap-hongkong"
+txYunAk="***********"
+txYunSk="***********"
 
 //arrow flight sql test config
 extArrowFlightSqlHost = "127.0.0.1"
-extArrowFlightSqlPort = 9090
+extArrowFlightSqlPort = 8081
 extArrowFlightSqlUser = "root"
 extArrowFlightSqlPassword= ""
+extArrowFlightHttpPort= 8030
 
 // iceberg rest catalog config
 iceberg_rest_uri_port=18181
 iceberg_minio_port=19001
+iceberg_rest_uri_port_s3=19181
+iceberg_rest_uri_port_oss=19182
+iceberg_rest_uri_port_cos=19183
+iceberg_rest_uri_port_obs=19184
+iceberg_rest_uri_port_gcs=19185
+iceberg_rest_uri_port_hdfs=19186
+iceberg_rest_hdfs_port=20020
+
+// polaris rest catalog config
+polaris_rest_uri_port=20181
+polaris_minio_port=20001
 
 // If the failure suite num exceeds this config
 // all following suite will be skipped to fast quit the run.
@@ -224,3 +266,70 @@ enableTrinoConnectorTest = false
 enableKerberosTest=false
 kerberosHmsPort=9883
 kerberosHdfsPort=8820
+enableRefactorParamsHdfsTest=true
+
+
+// LakeSoul catalog test config
+enableLakesoulTest = false
+lakesoulPGUser="*******"
+lakesoulPGPwd="*******"
+lakesoulPGUrl="*******"
+lakesoulMinioAK="*******"
+lakesoulMinioSK="*******"
+lakesoulMinioEndpoint="*******"
+
+// cloud
+metaServiceToken = "greedisgood9999"
+instanceId = "default_instance_id"
+multiClusterInstance = "default_instance_id"
+
+storageProvider = "oss"
+cbsS3Ak = "*******"
+cbsS3Sk = "*******"
+cbsS3Endpoint = "oss-cn-beijing.aliyuncs.com"
+cbsS3Bucket = "test-bucket"
+cbsS3Prefix = "test-cluster-prefix"
+
+// External Env
+enableExternalIcebergTest = false
+// The properties string of iceberg catalog
+icebergS3TablesCatalog = ""
+
+enableExternalHudiTest = false
+// The properties string of hudi catalog
+hudiEmrCatalog = ""
+icebergS3TablesCatalog=""
+icebergS3TablesCatalogGlueRest=""
+
+// The path of the cert configuration file for the testing framework 
+// is consistent with the path of the cert file for the cluster
+enableTLS=false
+tlsVerifyMode="strict"
+keyStorePath="/your/keystore.p12"
+keyStorePassword="yourPwd"
+keyStoreType="PKCS12"
+trustStorePath="/your/truststore.p12"
+trustStorePassword="yourPwd"
+trustStoreType="PKCS12"
+trustCert="/your/certificate.crt"
+trustCACert="/your/ca.crt"
+trustCAKey="/your/certificate.key"
+
+
+enableTestTvfAnonymous="true"
+anymousS3Uri="https://datasets-documentation.s3.eu-west-3.amazonaws.com/aapl_stock.csv"
+anymousS3Region="eu-west-3"
+anymousS3ExpectDataCount="8365"
+awsInstanceProfileRegion="us-east-1"
+
+// hudi p0 external regression test config
+// To enable hudi test, you need first start hudi container.
+// See `docker/thirdparties/run-thirdparties-docker.sh -c hudi`
+enableHudiTest=true
+// hudi catalog config
+hudiHmsPort=19083
+hudiMinioPort=19100
+hudiMinioAccessKey="minio"
+hudiMinioSecretKey="minio123"
+
+icebergDlfRestCatalog="'type' = 'iceberg', 'warehouse' = 'new_dlf_iceberg_catalog', 'iceberg.catalog.type' = 'rest', 'iceberg.rest.uri' = 'http://cn-beijing-vpc.dlf.aliyuncs.com/iceberg', 'iceberg.rest.sigv4-enabled' = 'true', 'iceberg.rest.signing-name' = 'DlfNext', 'iceberg.rest.access-key-id' = 'ak', 'iceberg.rest.secret-access-key' = 'sk', 'iceberg.rest.signing-region' = 'cn-beijing', 'iceberg.rest.vended-credentials-enabled' = 'true', 'io-impl' = 'org.apache.iceberg.rest.DlfFileIO', 'fs.oss.support' = 'true'"

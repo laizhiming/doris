@@ -19,27 +19,31 @@ package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNotNullable;
-import org.apache.doris.nereids.trees.expressions.shape.LeafExpression;
+import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DateType;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.EnumUtils;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
  * Interval for timestamp calculation.
  */
-public class Interval extends Expression implements LeafExpression, AlwaysNotNullable {
-    private final Expression value;
+public class Interval extends Expression implements UnaryExpression, AlwaysNotNullable {
     private final TimeUnit timeUnit;
 
     public Interval(Expression value, String desc) {
-        super(ImmutableList.of());
-        this.value = value;
-        this.timeUnit = TimeUnit.valueOf(desc.toUpperCase());
+        this(value, TimeUnit.valueOf(desc.toUpperCase()));
+    }
+
+    public Interval(Expression value, TimeUnit timeUnit) {
+        super(ImmutableList.of(value));
+        this.timeUnit = timeUnit;
     }
 
     @Override
@@ -48,7 +52,7 @@ public class Interval extends Expression implements LeafExpression, AlwaysNotNul
     }
 
     public Expression value() {
-        return value;
+        return child();
     }
 
     public TimeUnit timeUnit() {
@@ -56,8 +60,28 @@ public class Interval extends Expression implements LeafExpression, AlwaysNotNul
     }
 
     @Override
+    public Expression withChildren(List<Expression> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new Interval(children.get(0), timeUnit);
+    }
+
+    @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitInterval(this, context);
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("INTERVAL ");
+        sb.append(value().toDigest());
+        sb.append(" ").append(timeUnit);
+        return sb.toString();
+    }
+
+    @Override
+    protected boolean extraEquals(Expression that) {
+        return that instanceof Interval && this.timeUnit().equals(((Interval) that).timeUnit());
     }
 
     /**
@@ -65,13 +89,24 @@ public class Interval extends Expression implements LeafExpression, AlwaysNotNul
      */
     public enum TimeUnit {
         YEAR("YEAR", false, 800),
+        YEAR_MONTH("YEAR_MONTH", false, 800),
         MONTH("MONTH", false, 700),
-        QUARTER("QUARTER", false, 600),
+        QUARTER("QUARTER", false, 600), //TODO: need really support quarter
         WEEK("WEEK", false, 500),
         DAY("DAY", false, 400),
+        DAY_HOUR("DAY_HOUR", false, 400),
+        DAY_MINUTE("DAY_MINUTE", false, 400),
+        DAY_MICROSECOND("DAY_MICROSECOND", false, 400),
+        DAY_SECOND("DAY_SECOND", false, 400),
         HOUR("HOUR", true, 300),
+        HOUR_MINUTE("HOUR_MINUTE", false, 300),
+        HOUR_SECOND("HOUR_SECOND", false, 300),
+        HOUR_MICROSECOND("HOUR_MICROSECOND", false, 300),
         MINUTE("MINUTE", true, 200),
-        SECOND("SECOND", true, 100);
+        MINUTE_SECOND("MINUTE_SECOND", false, 200),
+        MINUTE_MICROSECOND("MINUTE_MICROSECOND", false, 200),
+        SECOND("SECOND", true, 100),
+        SECOND_MICROSECOND("SECOND_MICROSECOND", true, 100);
 
         private final String description;
         private final boolean isDateTimeUnit;

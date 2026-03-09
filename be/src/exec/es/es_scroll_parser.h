@@ -23,8 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "core/data_type/data_type.h"
 #include "rapidjson/document.h"
-#include "vec/data_types/data_type.h"
 
 namespace doris {
 
@@ -47,6 +47,8 @@ public:
     int get_size() const;
 
 private:
+    Status parse_column(const rapidjson::Value& col, PrimitiveType sub_type, bool pure_doc_value,
+                        vectorized::Array& array, const cctz::time_zone& time_zone);
     std::string _scroll_id;
     int _size;
     rapidjson::SizeType _line_index;

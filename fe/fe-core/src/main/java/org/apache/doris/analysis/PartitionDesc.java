@@ -17,27 +17,27 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionType;
-import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.util.PropertyAnalyzer;
-import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.nereids.analyzer.UnboundFunction;
+import org.apache.doris.nereids.analyzer.UnboundSlot;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.trees.plans.commands.info.PartitionDefinition;
+import org.apache.doris.nereids.trees.plans.commands.info.PartitionTableInfo;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import org.apache.commons.lang3.NotImplementedException;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.stream.Collectors;
 
 public class PartitionDesc {
     protected List<String> partitionColNames;
@@ -129,9 +129,9 @@ public class PartitionDesc {
                                     + expr.toSql());
                 }
             } else if (expr instanceof SlotRef) {
-                if (isAutoPartition && !colNames.isEmpty() && !isListPartition) {
+                if (isAutoPartition && !isListPartition) {
                     throw new AnalysisException(
-                            "auto create partition only support one slotRef in expr of RANGE partition. "
+                            "auto create partition only support date_trunc function of RANGE partition. "
                                     + expr.toSql());
                 }
                 colNames.add(((SlotRef) expr).getColumnName());
@@ -155,116 +155,6 @@ public class PartitionDesc {
         return colNames;
     }
 
-    public void analyze(List<ColumnDef> columnDefs, Map<String, String> otherProperties) throws AnalysisException {
-        if (partitionColNames == null || partitionColNames.isEmpty()) {
-            throw new AnalysisException("No partition columns.");
-        }
-
-        int createTablePartitionMaxNum = ConnectContext.get().getSessionVariable().getCreateTablePartitionMaxNum();
-        if (singlePartitionDescs.size() > createTablePartitionMaxNum) {
-            throw new AnalysisException(String.format(
-                    "The number of partitions to be created is [%s], exceeding the maximum value of [%s]. "
-                            + "Creating too many partitions can be time-consuming. If necessary, "
-                            + "You can set the session variable 'create_table_partition_max_num' to a larger value.",
-                    singlePartitionDescs.size(), createTablePartitionMaxNum));
-        }
-
-        // `analyzeUniqueKeyMergeOnWrite` would modify `properties`, which will be used later,
-        // so we just clone a properties map here.
-        boolean enableUniqueKeyMergeOnWrite = false;
-        if (otherProperties != null) {
-            enableUniqueKeyMergeOnWrite =
-                PropertyAnalyzer.analyzeUniqueKeyMergeOnWrite(Maps.newHashMap(otherProperties));
-        }
-        Set<String> partColNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-        for (String partitionCol : partitionColNames) {
-            if (!partColNames.add(partitionCol)) {
-                throw new AnalysisException("Duplicated partition column " + partitionCol);
-            }
-
-            boolean found = false;
-            for (ColumnDef columnDef : columnDefs) {
-                if (columnDef.getName().equals(partitionCol)) {
-                    if (!columnDef.isKey()) {
-                        if (columnDef.getAggregateType() != AggregateType.NONE) {
-                            throw new AnalysisException("The partition column could not be aggregated column");
-                        }
-                        if (enableUniqueKeyMergeOnWrite) {
-                            throw new AnalysisException("Merge-on-Write table's partition column must be KEY column");
-                        }
-                    }
-                    if (columnDef.getType().isFloatingPointType()) {
-                        throw new AnalysisException("Floating point type column can not be partition column");
-                    }
-                    if (columnDef.getType().isScalarType(PrimitiveType.STRING)) {
-                        throw new AnalysisException("String Type should not be used in partition column["
-                                + columnDef.getName() + "].");
-                    }
-                    if (columnDef.getType().isComplexType()) {
-                        throw new AnalysisException("Complex type column can't be partition column: "
-                                + columnDef.getType().toString());
-                    }
-                    if (!ConnectContext.get().getSessionVariable().isAllowPartitionColumnNullable()
-                            && columnDef.isAllowNull()) {
-                        throw new AnalysisException(
-                                "The partition column must be NOT NULL with allow_partition_column_nullable OFF");
-                    }
-                    if (this instanceof RangePartitionDesc && isAutoCreatePartitions) {
-                        if (columnDef.isAllowNull()) {
-                            throw new AnalysisException("AUTO RANGE PARTITION doesn't support NULL column");
-                        }
-                        if (partitionExprs != null) {
-                            for (Expr expr : partitionExprs) {
-                                if (!(expr instanceof FunctionCallExpr) || !RANGE_PARTITION_FUNCTIONS
-                                        .contains(((FunctionCallExpr) expr).getFnName().getFunction())) {
-                                    throw new AnalysisException(
-                                            "auto create partition only support slotRef and "
-                                                    + "date_trunc/date_floor/date_ceil function in range partitions. "
-                                                    + expr.toSql());
-                                }
-                            }
-                            if (partitionExprs.get(0) instanceof FunctionCallExpr) {
-                                if (!columnDef.getType().isDateType()) {
-                                    throw new AnalysisException(
-                                            "Auto range partition needs Date/DateV2/"
-                                                    + "Datetime/DatetimeV2 column as partition column but got"
-                                                    + partitionExprs.get(0).toSql());
-                                }
-                            }
-                        }
-                    }
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                throw new AnalysisException("Partition column[" + partitionCol + "] does not exist in column list.");
-            }
-        }
-
-        Set<String> nameSet = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-        for (SinglePartitionDesc desc : singlePartitionDescs) {
-            if (!nameSet.add(desc.getPartitionName())) {
-                throw new AnalysisException("Duplicated partition name: " + desc.getPartitionName());
-            }
-            // in create table stmt, we use given properties
-            // copy one. because ProperAnalyzer will remove entry after analyze
-            Map<String, String> givenProperties = null;
-            if (otherProperties != null) {
-                givenProperties = Maps.newHashMap(otherProperties);
-            }
-            // check partitionType
-            checkPartitionKeyValueType(desc.getPartitionKeyDesc());
-            // analyze singlePartitionDesc
-            desc.analyze(columnDefs.size(), givenProperties);
-        }
-    }
-
-    public void checkPartitionKeyValueType(PartitionKeyDesc partitionKeyDesc) throws AnalysisException {
-
-    }
-
     public PartitionType getType() {
         return type;
     }
@@ -286,7 +176,66 @@ public class PartitionDesc {
         throw new NotImplementedException("toPartitionInfo not implemented");
     }
 
-    public boolean inIdentifierPartitions(String colName) {
-        return partitionColNames != null && partitionColNames.contains(colName);
+    /**
+     *  Convert to PartitionTableInfo
+     */
+    public PartitionTableInfo convertToPartitionTableInfo() {
+        List<PartitionDefinition> partitionDefinitions = null;
+        List<Expression> partitionFields = null;
+
+        if (!type.name().equalsIgnoreCase(PartitionType.UNPARTITIONED.name())) {
+            // only auto partition support partition expr
+            if (!isAutoCreatePartitions) {
+                if (partitionExprs.stream().anyMatch(expr -> expr instanceof FunctionCallExpr)) {
+                    throw new org.apache.doris.nereids.exceptions.AnalysisException("Non-auto partition "
+                        + "table not support partition expr!");
+                }
+            }
+
+            try {
+                partitionDefinitions = singlePartitionDescs.stream()
+                    .map(SinglePartitionDesc::translateToPartitionDefinition)
+                    .collect(Collectors.toList());
+
+                partitionFields = partitionExprs.stream()
+                    .map(expr -> {
+                        if (expr instanceof SlotRef) {
+                            SlotRef slot = (SlotRef) expr;
+                            return new UnboundSlot(slot.getColumnName());
+                        } else if (expr instanceof FunctionCallExpr) {
+                            FunctionCallExpr function = (FunctionCallExpr) expr;
+                            List<Expression> expressions = function.getFnParams().exprs().stream()
+                                    .map(exp -> {
+                                        if (exp instanceof SlotRef) {
+                                            SlotRef slot = (SlotRef) exp;
+                                            return new UnboundSlot(slot.getColumnName());
+                                        } else if (exp instanceof StringLiteral) {
+                                            return Literal.of((((StringLiteral) exp).getStringValue()));
+                                        } else {
+                                            throw new org.apache.doris.nereids.exceptions.AnalysisException(
+                                                "unsupported argument " + exp.toString());
+                                        }
+                                    })
+                                    .collect(Collectors.toList());
+
+                            return new UnboundFunction(
+                                function.getFnName().getFunction(),
+                                expressions);
+                        } else {
+                            throw new org.apache.doris.nereids.exceptions.AnalysisException(
+                                "unsupported auto partition expr " + expr.toString());
+                        }
+                    })
+                    .collect(Collectors.toList());
+            } catch (Exception e) {
+                throw new org.apache.doris.nereids.exceptions.AnalysisException(e.getMessage(), e.getCause());
+            }
+        }
+
+        return new PartitionTableInfo(
+            isAutoCreatePartitions,
+            type.name(),
+            partitionDefinitions.isEmpty() ? null : partitionDefinitions,
+            partitionFields);
     }
 }

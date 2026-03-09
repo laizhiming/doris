@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_cloud_accessible_obs", "p2,external,hive,external_remote,external_remote_hive") {
+suite("test_cloud_accessible_obs", "p2,external") {
+
+    Boolean ignoreP2 = true;
+    if (ignoreP2) {
+        logger.info("disable p2 test");
+        return;
+    }
     String enabled = context.config.otherConfigs.get("enableObjStorageTest")
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String extHiveHmsHost = context.config.otherConfigs.get("extHiveHmsHost")

@@ -27,16 +27,21 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.util.TimeUtils;
-import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.datasource.CatalogMgr;
+import org.apache.doris.job.common.JobType;
+import org.apache.doris.job.common.TaskStatus;
+import org.apache.doris.job.task.AbstractTask;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.executable.DateTimeExtractAndTransform;
+import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeV2Literal;
 import org.apache.doris.nereids.trees.expressions.literal.DateV2Literal;
-import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.DecimalV3Literal;
 import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 import org.apache.doris.qe.ConnectContext;
 
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.List;
 import java.util.Optional;
@@ -52,11 +57,18 @@ public class MTMVUtil {
      * @throws AnalysisException
      */
     public static TableIf getTable(BaseTableInfo baseTableInfo) throws AnalysisException {
-        TableIf table = Env.getCurrentEnv().getCatalogMgr()
-                .getCatalogOrAnalysisException(baseTableInfo.getCtlId())
-                .getDbOrAnalysisException(baseTableInfo.getDbId())
-                .getTableOrAnalysisException(baseTableInfo.getTableId());
-        return table;
+        // for compatible old version, not have name
+        if (StringUtils.isEmpty(baseTableInfo.getCtlName())) {
+            return Env.getCurrentEnv().getCatalogMgr()
+                    .getCatalogOrAnalysisException(baseTableInfo.getCtlId())
+                    .getDbOrAnalysisException(baseTableInfo.getDbId())
+                    .getTableOrAnalysisException(baseTableInfo.getTableId());
+        } else {
+            return Env.getCurrentEnv().getCatalogMgr()
+                    .getCatalogOrAnalysisException(baseTableInfo.getCtlName())
+                    .getDbOrAnalysisException(baseTableInfo.getDbName())
+                    .getTableOrAnalysisException(baseTableInfo.getTableName());
+        }
     }
 
     public static MTMVRelatedTableIf getRelatedTable(BaseTableInfo baseTableInfo) {
@@ -73,9 +85,27 @@ public class MTMVUtil {
         return (MTMVRelatedTableIf) relatedTable;
     }
 
+    public static MTMV getMTMV(BaseTableInfo baseTableInfo) throws AnalysisException {
+        TableIf table = getTable(baseTableInfo);
+        if (!(table instanceof MTMV)) {
+            throw new AnalysisException(String.format("table is not MTMV, table: %s", baseTableInfo));
+        }
+        return (MTMV) table;
+    }
+
     public static MTMV getMTMV(long dbId, long mtmvId) throws DdlException, MetaNotFoundException {
         Database db = Env.getCurrentInternalCatalog().getDbOrDdlException(dbId);
         return (MTMV) db.getTableOrMetaException(mtmvId, TableType.MATERIALIZED_VIEW);
+    }
+
+    public static TableIf getTable(List<String> names) throws AnalysisException {
+        if (names == null || names.size() != 3) {
+            throw new AnalysisException("size of names need 3, but names is:" + names);
+        }
+        return Env.getCurrentEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(names.get(0))
+                .getDbOrAnalysisException(names.get(1))
+                .getTableOrAnalysisException(names.get(2));
     }
 
     /**
@@ -85,9 +115,9 @@ public class MTMVUtil {
      * @return
      */
     public static boolean mtmvContainsExternalTable(MTMV mtmv) {
-        Set<BaseTableInfo> baseTables = mtmv.getRelation().getBaseTables();
+        Set<BaseTableInfo> baseTables = mtmv.getRelation().getBaseTablesOneLevelAndFromView();
         for (BaseTableInfo baseTableInfo : baseTables) {
-            if (baseTableInfo.getCtlId() != InternalCatalog.INTERNAL_CATALOG_ID) {
+            if (!baseTableInfo.isInternalTable()) {
                 return true;
             }
         }
@@ -120,10 +150,10 @@ public class MTMVUtil {
         Expression strToDate = DateTimeExtractAndTransform
                 .strToDate(new VarcharLiteral(expr.getStringValue()), new VarcharLiteral(dateFormat));
         if (strToDate instanceof DateTimeV2Literal) {
-            return ((IntegerLiteral) DateTimeExtractAndTransform
-                    .unixTimestamp((DateTimeV2Literal) strToDate)).getValue();
+            return ((DecimalV3Literal) DateTimeExtractAndTransform
+                    .unixTimestamp((DateTimeV2Literal) strToDate)).getValue().longValue();
         } else if (strToDate instanceof DateV2Literal) {
-            return ((IntegerLiteral) DateTimeExtractAndTransform
+            return ((BigIntLiteral) DateTimeExtractAndTransform
                     .unixTimestamp((DateV2Literal) strToDate)).getValue();
         } else {
             throw new AnalysisException(
@@ -150,5 +180,40 @@ public class MTMVUtil {
                 throw new AnalysisException("Not allowed to perform current operation on async materialized view");
             }
         }
+    }
+
+    public static void compatibleMTMV(CatalogMgr catalogMgr) {
+        List<Database> dbs = catalogMgr.getInternalCatalog().getDbs();
+        for (Database database : dbs) {
+            List<Table> tables = database.getTables();
+            for (Table table : tables) {
+                if (table instanceof MTMV) {
+                    ((MTMV) table).compatible(catalogMgr);
+                }
+            }
+        }
+    }
+
+    /**
+     * get MTMV task num by status
+     *
+     * @param status status of task
+     * @return if status is null, return 0
+     */
+    public static Integer getTaskNum(TaskStatus status) {
+        if (status == null) {
+            return 0;
+        }
+        int res = 0;
+        List<org.apache.doris.job.base.AbstractJob> jobList = Env.getCurrentEnv().getJobManager().queryJobs(JobType.MV);
+        for (org.apache.doris.job.base.AbstractJob job : jobList) {
+            List<AbstractTask> tasks = job.getRunningTasks();
+            for (AbstractTask task : tasks) {
+                if (task.getStatus().equals(status)) {
+                    res++;
+                }
+            }
+        }
+        return res;
     }
 }

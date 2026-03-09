@@ -20,82 +20,27 @@
 
 package org.apache.doris.planner;
 
-import org.apache.doris.analysis.Analyzer;
-import org.apache.doris.analysis.Expr;
-import org.apache.doris.common.UserException;
-import org.apache.doris.statistics.StatisticalType;
-import org.apache.doris.statistics.StatsRecursiveDerive;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
 import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Node that applies conjuncts and a limit clause. Has exactly one child.
  */
 public class SelectNode extends PlanNode {
-    private static final Logger LOG = LogManager.getLogger(SelectNode.class);
-
     /**
      * Used by nereids only.
      */
     public SelectNode(PlanNodeId id, PlanNode child) {
-        super(id, new ArrayList<>(child.getOutputTupleIds()), "SELECT", StatisticalType.SELECT_NODE);
+        super(id, new ArrayList<>(child.getOutputTupleIds()), "SELECT");
         addChild(child);
-        this.nullableTupleIds = child.nullableTupleIds;
-    }
-
-    protected SelectNode(PlanNodeId id, PlanNode child, List<Expr> conjuncts) {
-        super(id, new ArrayList<>(child.getOutputTupleIds()), "SELECT", StatisticalType.SELECT_NODE);
-        addChild(child);
-        this.tblRefIds = child.tblRefIds;
-        this.nullableTupleIds = child.nullableTupleIds;
-        this.conjuncts.addAll(conjuncts);
     }
 
     @Override
     protected void toThrift(TPlanNode msg) {
         msg.node_type = TPlanNodeType.SELECT_NODE;
-    }
-
-    @Override
-    public void init(Analyzer analyzer) throws UserException {
-        super.init(analyzer);
-        analyzer.markConjunctsAssigned(conjuncts);
-        computeStats(analyzer);
-    }
-
-    @Override
-    public void computeStats(Analyzer analyzer) throws UserException {
-        super.computeStats(analyzer);
-        if (!analyzer.safeIsEnableJoinReorderBasedCost()) {
-            return;
-        }
-        StatsRecursiveDerive.getStatsRecursiveDerive().statsRecursiveDerive(this);
-        cardinality = (long) statsDeriveResult.getRowCount();
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("stats Select: cardinality={}", this.cardinality);
-        }
-    }
-
-    @Override
-    protected void computeOldCardinality() {
-        long cardinality = getChild(0).cardinality;
-        double selectivity = computeOldSelectivity();
-        if (cardinality < 0 || selectivity < 0) {
-            this.cardinality = -1;
-        } else {
-            this.cardinality = Math.round(cardinality * selectivity);
-        }
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("stats Select: cardinality={}", this.cardinality);
-        }
     }
 
     @Override
@@ -108,5 +53,11 @@ public class SelectNode extends PlanNode {
             output.append(prefix).append("predicates: ").append(getExplainString(conjuncts)).append("\n");
         }
         return output.toString();
+    }
+
+    // Determined by its child.
+    @Override
+    public boolean isSerialOperator() {
+        return children.get(0).isSerialOperator();
     }
 }

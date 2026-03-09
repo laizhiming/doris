@@ -18,7 +18,6 @@
 #pragma once
 
 #include <mutex>
-#include <thread>
 
 #include "util/blocking_priority_queue.hpp"
 #include "util/blocking_queue.hpp"
@@ -126,16 +125,17 @@ public:
     }
 
     std::string get_info() const {
-        return fmt::format(
-                "PriorityThreadPool(name={}, queue_size={}/{}, active_thread={}/{}, "
-                "total_get_wait_time={}, total_put_wait_time={})",
-                _name, get_queue_size(), _work_queue.get_capacity(), _active_threads,
-                _threads.size(), _work_queue.total_get_wait_time(),
-                _work_queue.total_put_wait_time());
+        return (Priority ? "PriorityThreadPool" : "FifoThreadPool") +
+               fmt::format(
+                       "(name={}, queue_size={}/{}, active_thread={}/{}, "
+                       "total_get_wait_time={}, total_put_wait_time={}, is_shutdown={})",
+                       _name, get_queue_size(), _work_queue.get_capacity(), _active_threads,
+                       _threads.size(), _work_queue.total_get_wait_time(),
+                       _work_queue.total_put_wait_time(), is_shutdown());
     }
 
 protected:
-    virtual bool is_shutdown() { return _shutdown; }
+    virtual bool is_shutdown() const { return _shutdown; }
 
     // Collection of worker threads that process work from the queue.
     ThreadGroup _threads;
@@ -151,6 +151,7 @@ private:
     // until the pool is shutdown.
     void work_thread(int thread_id) {
         Thread::set_self_name(_name);
+        LOG(INFO) << "WorkThreadPool started: " << get_info();
         while (!is_shutdown()) {
             Task task;
             if (_work_queue.blocking_get(&task)) {
@@ -162,6 +163,7 @@ private:
                 _empty_cv.notify_all();
             }
         }
+        LOG(INFO) << "WorkThreadPool shutdown: " << get_info();
     }
 
     WorkQueue _work_queue;

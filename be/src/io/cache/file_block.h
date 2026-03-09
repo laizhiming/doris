@@ -37,11 +37,14 @@ namespace io {
 
 struct FileBlocksHolder;
 class BlockFileCache;
+struct FileBlockCell;
 
 class FileBlock {
     friend struct FileBlocksHolder;
     friend class BlockFileCache;
     friend class CachedRemoteFileReader;
+    friend struct FileBlockCell;
+    friend class FileBlockTestAccessor;
 
 public:
     enum class State {
@@ -66,6 +69,7 @@ public:
     ~FileBlock() = default;
 
     State state() const;
+    State state_unsafe() const;
 
     static std::string state_to_string(FileBlock::State state);
 
@@ -111,22 +115,35 @@ public:
 
     FileCacheType cache_type() const { return _key.meta.type; }
 
+    int64_t tablet_id() const { return _key.meta.tablet_id; }
+
+    void set_tablet_id(int64_t id) { _key.meta.tablet_id = id; }
+
     static uint64_t get_caller_id();
 
     std::string get_info_for_log() const;
 
-    [[nodiscard]] Status change_cache_type_by_mgr(FileCacheType new_type);
+    [[nodiscard]] Status change_cache_type(FileCacheType new_type);
 
-    [[nodiscard]] Status change_cache_type_self(FileCacheType new_type);
-
-    [[nodiscard]] Status update_expiration_time(uint64_t expiration_time);
+    [[nodiscard]] Status change_cache_type_lock(FileCacheType new_type,
+                                                std::lock_guard<std::mutex>&);
 
     uint64_t expiration_time() const { return _key.meta.expiration_time; }
+
+    std::string get_cache_file() const;
 
     State state_unlock(std::lock_guard<std::mutex>&) const;
 
     FileBlock& operator=(const FileBlock&) = delete;
     FileBlock(const FileBlock&) = delete;
+
+    // block is being using by other thread when deleting, so tag it is_deleting and delete later on¬
+    void set_deleting() { _is_deleting = true; }
+    bool is_deleting() const { return _is_deleting; };
+
+public:
+    std::atomic<bool> _owned_by_cached_reader {
+            false}; // pocessed by CachedRemoteFileReader::_cache_file_readers
 
 private:
     std::string get_info_for_log_impl(std::lock_guard<std::mutex>& block_lock) const;
@@ -153,6 +170,9 @@ private:
     std::condition_variable _cv;
     FileCacheKey _key;
     size_t _downloaded_size {0};
+    bool _is_deleting {false};
+
+    FileBlockCell* cell;
 };
 
 extern std::ostream& operator<<(std::ostream& os, const FileBlock::State& value);

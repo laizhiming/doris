@@ -29,12 +29,14 @@ import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.cloud.datasource.CloudInternalCatalog;
 import org.apache.doris.cloud.proto.Cloud;
+import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.proto.OlapFile;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.OriginStatement;
+import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskQueue;
 import org.apache.doris.thrift.TTabletType;
@@ -71,7 +73,6 @@ public class CloudRollupJobV2 extends RollupJobV2 {
                 field.set(ret, field.get(job));
             }
         }
-        ret.initAnalyzer();
         return ret;
     }
 
@@ -84,13 +85,18 @@ public class CloudRollupJobV2 extends RollupJobV2 {
                        Column whereColumn,
                        int baseSchemaHash, int rollupSchemaHash, KeysType rollupKeysType,
                        short rollupShortKeyColumnCount,
-                       OriginStatement origStmt) throws AnalysisException {
+                       OriginStatement origStmt, Map<String, String> sessionVariable) throws AnalysisException {
         super(rawSql, jobId, dbId, tableId, tableName, timeoutMs, baseIndexId,
                 rollupIndexId, baseIndexName, rollupIndexName, rollupSchema, whereColumn,
-                baseSchemaHash, rollupSchemaHash, rollupKeysType, rollupShortKeyColumnCount, origStmt);
+                baseSchemaHash, rollupSchemaHash, rollupKeysType, rollupShortKeyColumnCount, origStmt, sessionVariable);
         ConnectContext context = ConnectContext.get();
         if (context != null) {
-            String clusterName = context.getCloudCluster();
+            String clusterName = "";
+            try {
+                clusterName = context.getCloudCluster();
+            } catch (ComputeGroupException e) {
+                LOG.warn("failed to get compute group name", e);
+            }
             LOG.debug("rollup job add cloud cluster, context not null, cluster: {}", clusterName);
             if (!Strings.isNullOrEmpty(clusterName)) {
                 setCloudClusterName(clusterName);
@@ -105,7 +111,7 @@ public class CloudRollupJobV2 extends RollupJobV2 {
         rollupIndexList.add(rollupIndexId);
         try {
             ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
-                .commitMaterializedIndex(dbId, tableId, rollupIndexList, false);
+                    .commitMaterializedIndex(dbId, tableId, rollupIndexList, null, false);
         } catch (Exception e) {
             LOG.warn("commitMaterializedIndex Exception:{}", e);
             throw new AlterCancelException(e.getMessage());
@@ -123,7 +129,21 @@ public class CloudRollupJobV2 extends RollupJobV2 {
         while (true) {
             try {
                 ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
-                    .dropMaterializedIndex(tableId, rollupIndexList, false);
+                    .dropMaterializedIndex(dbId, tableId, rollupIndexList, false);
+                for (Map.Entry<Long, Map<Long, Long>> partitionEntry : partitionIdToBaseRollupTabletIdMap.entrySet()) {
+                    Long partitionId = partitionEntry.getKey();
+                    Map<Long, Long> rollupTabletIdToBaseTabletId = partitionEntry.getValue();
+                    for (Map.Entry<Long, Long> tabletEntry : rollupTabletIdToBaseTabletId.entrySet()) {
+                        Long rollupTabletId = tabletEntry.getKey();
+                        Long baseTabletId = tabletEntry.getValue();
+                        ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
+                                .removeSchemaChangeJob(jobId, dbId, tableId, baseIndexId, rollupIndexId,
+                                    partitionId, baseTabletId, rollupTabletId);
+                    }
+                    LOG.info("Cancel RollupJob. Remove SchemaChangeJob in ms."
+                            + "dbId:{}, tableId:{}, rollupIndexId: {} partitionId:{}. tabletSize:{}",
+                            dbId, tableId, rollupIndexId, partitionId, rollupTabletIdToBaseTabletId.size());
+                }
                 break;
             } catch (Exception e) {
                 LOG.warn("tryTimes:{}, onCancel exception:", tryTimes, e);
@@ -188,7 +208,7 @@ public class CloudRollupJobV2 extends RollupJobV2 {
             TTabletType tabletType = tbl.getPartitionInfo().getTabletType(partitionId);
             MaterializedIndex rollupIndex = entry.getValue();
             Cloud.CreateTabletsRequest.Builder requestBuilder =
-                    Cloud.CreateTabletsRequest.newBuilder();
+                    Cloud.CreateTabletsRequest.newBuilder().setRequestIp(FrontendOptions.getLocalHostAddressCached());
             List<String> rowStoreColumns =
                                         tbl.getTableProperty().getCopiedRowStoreColumns();
             for (Tablet rollupTablet : rollupIndex.getTablets()) {
@@ -196,22 +216,29 @@ public class CloudRollupJobV2 extends RollupJobV2 {
                         ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
                             .createTabletMetaBuilder(tableId, rollupIndexId,
                             partitionId, rollupTablet, tabletType, rollupSchemaHash,
-                            rollupKeysType, rollupShortKeyColumnCount, tbl.getCopiedBfColumns(),
-                            tbl.getBfFpp(), null, rollupSchema,
-                            tbl.getDataSortInfo(), tbl.getCompressionType(), tbl.getStoragePolicy(),
-                            tbl.isInMemory(), true,
-                            tbl.getName(), tbl.getTTLSeconds(),
-                            tbl.getEnableUniqueKeyMergeOnWrite(), tbl.storeRowColumn(),
-                            tbl.getBaseSchemaVersion(), tbl.getCompactionPolicy(),
-                            tbl.getTimeSeriesCompactionGoalSizeMbytes(),
-                            tbl.getTimeSeriesCompactionFileCountThreshold(),
-                            tbl.getTimeSeriesCompactionTimeThresholdSeconds(),
-                            tbl.getTimeSeriesCompactionEmptyRowsetsThreshold(),
-                            tbl.getTimeSeriesCompactionLevelThreshold(),
-                            tbl.disableAutoCompaction(),
-                            tbl.getRowStoreColumnsUniqueIds(rowStoreColumns));
+                                    rollupKeysType, rollupShortKeyColumnCount, tbl.getCopiedBfColumns(),
+                                    tbl.getBfFpp(), null, rollupSchema,
+                                    tbl.getDataSortInfo(), tbl.getCompressionType(), tbl.getStorageFormat(),
+                                    tbl.getStoragePolicy(), tbl.isInMemory(), true,
+                                    tbl.getName(), tbl.getTTLSeconds(),
+                                    tbl.getEnableUniqueKeyMergeOnWrite(), tbl.storeRowColumn(),
+                                    tbl.getBaseSchemaVersion(), tbl.getCompactionPolicy(),
+                                    tbl.getTimeSeriesCompactionGoalSizeMbytes(),
+                                    tbl.getTimeSeriesCompactionFileCountThreshold(),
+                                    tbl.getTimeSeriesCompactionTimeThresholdSeconds(),
+                                    tbl.getTimeSeriesCompactionEmptyRowsetsThreshold(),
+                                    tbl.getTimeSeriesCompactionLevelThreshold(),
+                                    tbl.disableAutoCompaction(),
+                                    tbl.getRowStoreColumnsUniqueIds(rowStoreColumns),
+                                    null,
+                                    tbl.rowStorePageSize(),
+                                    tbl.variantEnableFlattenNested(), null,
+                                    tbl.storagePageSize(), tbl.getTDEAlgorithmPB(),
+                                    tbl.storageDictPageSize(), true,
+                                    tbl.getColumnSeqMapping());
                 requestBuilder.addTabletMetas(builder);
             } // end for rollupTablets
+            requestBuilder.setDbId(dbId);
             ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
                     .sendCreateTabletsRpc(requestBuilder);
         }

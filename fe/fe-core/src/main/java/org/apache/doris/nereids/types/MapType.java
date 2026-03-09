@@ -18,8 +18,8 @@
 package org.apache.doris.nereids.types;
 
 import org.apache.doris.catalog.Type;
-import org.apache.doris.nereids.analyzer.ComplexDataType;
 import org.apache.doris.nereids.annotation.Developing;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import java.util.Objects;
 
@@ -27,7 +27,7 @@ import java.util.Objects;
  * Struct type in Nereids.
  */
 @Developing
-public class MapType extends DataType implements ComplexDataType {
+public class MapType extends DataType implements ComplexDataType, NestedColumnPrunable {
 
     public static final MapType SYSTEM_DEFAULT = new MapType();
 

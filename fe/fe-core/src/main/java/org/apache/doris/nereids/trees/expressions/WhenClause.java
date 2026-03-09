@@ -56,7 +56,7 @@ public class WhenClause extends Expression implements BinaryExpression, ExpectsI
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return " WHEN " + left().toSql() + " THEN " + right().toSql();
     }
 
@@ -90,12 +90,19 @@ public class WhenClause extends Expression implements BinaryExpression, ExpectsI
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(left(), right());
     }
 
     @Override
     public String toString() {
         return " WHEN " + left().toString() + " THEN " + right().toString();
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(" WHEN ").append(left().toDigest()).append(" THEN ").append(right().toDigest());
+        return sb.toString();
     }
 }

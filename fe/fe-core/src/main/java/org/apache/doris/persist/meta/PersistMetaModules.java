@@ -17,6 +17,8 @@
 
 package org.apache.doris.persist.meta;
 
+import org.apache.doris.common.Config;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -36,15 +38,22 @@ public class PersistMetaModules {
 
     public static final ImmutableList<String> MODULE_NAMES = ImmutableList.of(
             "masterInfo", "frontends", "backends", "datasource", "db", "alterJob", "recycleBin",
-            "globalVariable", "cluster", "broker", "resources", "exportJob", "syncJob", "backupHandler",
+            "globalVariable", "cluster", "broker", "resources", "exportJob", "backupHandler",
             "paloAuth", "transactionState", "colocateTableIndex", "routineLoadJobs", "loadJobV2", "smallFiles",
-            "plugins", "deleteHandler", "sqlBlockRule", "policy", "globalFunction", "workloadGroups",
+            "plugins", "deleteHandler", "sqlBlockRule", "policy",
+            "globalFunction", "workloadGroups",
             "binlogs", "resourceGroups", "AnalysisMgrV2", "AsyncJobManager", "workloadSchedPolicy",
-            "insertOverwrite", "plsql");
+            "insertOverwrite", "plsql", "dictionaryManager", "indexPolicy", "KeyManagerStore"
+            // TODO: Re-enable "authenticationIntegrations" after persistence requirements are confirmed.
+            // , "authenticationIntegrations"
+    );
+
+    // The modules in `CloudEnv`.
+    public static final ImmutableList<String> CLOUD_MODULE_NAMES = ImmutableList.of("cloudWarmUpJob");
 
     // Modules in this list is deprecated and will not be saved in meta file. (also should not be in MODULE_NAMES)
     public static final ImmutableList<String> DEPRECATED_MODULE_NAMES = ImmutableList.of(
-            "loadJob", "cooldownJob", "AnalysisMgr", "mtmvJobManager", "JobTaskManager", "cloudWarmUpJob");
+            "loadJob", "cooldownJob", "AnalysisMgr", "mtmvJobManager", "JobTaskManager", "syncJob");
 
     static {
         MODULES_MAP = Maps.newHashMap();
@@ -54,6 +63,13 @@ public class PersistMetaModules {
                 MetaPersistMethod persistMethod = MetaPersistMethod.create(name);
                 MODULES_MAP.put(name, persistMethod);
                 MODULES_IN_ORDER.add(persistMethod);
+            }
+            if (Config.isCloudMode()) {
+                for (String name : CLOUD_MODULE_NAMES) {
+                    MetaPersistMethod persistMethod = MetaPersistMethod.create(name);
+                    MODULES_MAP.put(name, persistMethod);
+                    MODULES_IN_ORDER.add(persistMethod);
+                }
             }
         } catch (NoSuchMethodException e) {
             throw new RuntimeException(e);

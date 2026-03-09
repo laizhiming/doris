@@ -18,26 +18,22 @@
 package org.apache.doris.nereids.trees.plans.commands.info;
 
 import org.apache.doris.analysis.AllPartitionDesc;
-import org.apache.doris.analysis.CreateMTMVStmt;
-import org.apache.doris.analysis.KeysDesc;
 import org.apache.doris.analysis.ListPartitionDesc;
 import org.apache.doris.analysis.PartitionDesc;
 import org.apache.doris.analysis.RangePartitionDesc;
-import org.apache.doris.analysis.TableName;
-import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.PartitionType;
-import org.apache.doris.catalog.TableIf;
-import org.apache.doris.catalog.Type;
-import org.apache.doris.catalog.View;
 import org.apache.doris.common.ErrorCode;
-import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeNameFormat;
+import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
-import org.apache.doris.mtmv.EnvInfo;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.info.TableNameInfo;
+import org.apache.doris.mtmv.MTMVAnalyzeQueryInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo.MTMVPartitionType;
 import org.apache.doris.mtmv.MTMVPartitionUtil;
@@ -48,30 +44,21 @@ import org.apache.doris.mtmv.MTMVRelatedTableIf;
 import org.apache.doris.mtmv.MTMVRelation;
 import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.mysql.privilege.PrivPredicate;
-import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.analyzer.UnboundResultSink;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.properties.PhysicalProperties;
-import org.apache.doris.nereids.rules.exploration.mv.MaterializedViewUtils;
-import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
-import org.apache.doris.nereids.trees.plans.algebra.OneRowRelation;
-import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
+import org.apache.doris.nereids.trees.plans.commands.info.BaseViewInfo.AnalyzerForCreateView;
+import org.apache.doris.nereids.trees.plans.commands.info.BaseViewInfo.PlanSlotFinder;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
-import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
-import org.apache.doris.nereids.types.AggStateType;
-import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -79,88 +66,87 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /**
  * MTMV info in creating MTMV.
  */
-public class CreateMTMVInfo {
+public class CreateMTMVInfo extends CreateTableInfo {
     public static final Logger LOG = LogManager.getLogger(CreateMTMVInfo.class);
-    public static final String MTMV_PLANER_DISABLE_RULES = "OLAP_SCAN_PARTITION_PRUNE,PRUNE_EMPTY_PARTITION";
-    private final boolean ifNotExists;
-    private final TableNameInfo mvName;
-    private List<String> keys;
-    private final String comment;
-    private final DistributionDescriptor distribution;
-    private Map<String, String> properties;
-    private Map<String, String> mvProperties = Maps.newHashMap();
+    public static final String MTMV_PLANER_DISABLE_RULES = "OLAP_SCAN_PARTITION_PRUNE,PRUNE_EMPTY_PARTITION,"
+            + "ELIMINATE_GROUP_BY_KEY_BY_UNIFORM";
+    private LogicalPlan logicalQuery;
+    private List<SimpleColumnDefinition> simpleColumnDefinitions;
+    private MTMVPartitionDefinition mvPartitionDefinition;
 
-    private final LogicalPlan logicalQuery;
-    private final String querySql;
+    private String querySql;
+    private Map<String, String> mvProperties = Maps.newHashMap();
     private final MTMVRefreshInfo refreshInfo;
-    private final List<ColumnDefinition> columns = Lists.newArrayList();
-    private final List<SimpleColumnDefinition> simpleColumnDefinitions;
-    private final EnvInfo envInfo;
-    private final MTMVPartitionDefinition mvPartitionDefinition;
-    private PartitionDesc partitionDesc;
     private MTMVRelation relation;
     private MTMVPartitionInfo mvPartitionInfo;
+    private final Map<String, String> sessionVariables;
 
     /**
      * constructor for create MTMV
      */
-    public CreateMTMVInfo(boolean ifNotExists, TableNameInfo mvName,
-            List<String> keys, String comment,
-            DistributionDescriptor distribution, Map<String, String> properties,
-            LogicalPlan logicalQuery, String querySql,
+    public CreateMTMVInfo(
+            boolean ifNotExists,
+            TableNameInfo mvName,
+            List<String> keys,
+            String comment,
+            DistributionDescriptor distribution,
+            Map<String, String> properties,
+            LogicalPlan logicalQuery,
+            String querySql,
             MTMVRefreshInfo refreshInfo,
             List<SimpleColumnDefinition> simpleColumnDefinitions,
-            MTMVPartitionDefinition mvPartitionDefinition) {
-        this.ifNotExists = Objects.requireNonNull(ifNotExists, "require ifNotExists object");
-        this.mvName = Objects.requireNonNull(mvName, "require mvName object");
-        this.keys = Utils.copyRequiredList(keys);
-        this.comment = comment;
-        this.distribution = Objects.requireNonNull(distribution, "require distribution object");
-        this.properties = Objects.requireNonNull(properties, "require properties object");
+            MTMVPartitionDefinition mvPartitionDefinition,
+            Map<String, String> sessionVariables) {
+        super(
+                ifNotExists,
+                mvName,
+                Utils.copyRequiredList(keys),
+                comment,
+                distribution,
+                properties);
         this.logicalQuery = Objects.requireNonNull(logicalQuery, "require logicalQuery object");
         this.querySql = Objects.requireNonNull(querySql, "require querySql object");
         this.refreshInfo = Objects.requireNonNull(refreshInfo, "require refreshInfo object");
         this.simpleColumnDefinitions = Objects
                 .requireNonNull(simpleColumnDefinitions, "require simpleColumnDefinitions object");
-        this.envInfo = new EnvInfo(ConnectContext.get().getCurrentCatalog().getId(),
-                ConnectContext.get().getCurrentDbId());
         this.mvPartitionDefinition = Objects
                 .requireNonNull(mvPartitionDefinition, "require mtmvPartitionInfo object");
+        this.sessionVariables = sessionVariables;
     }
 
     /**
      * analyze create table info
      */
-    public void analyze(ConnectContext ctx) {
+    public void analyze(ConnectContext ctx) throws Exception {
         // analyze table name
-        mvName.analyze(ctx);
+        tableNameInfo.analyze(ctx);
+        if (!InternalCatalog.INTERNAL_CATALOG_NAME.equals(tableNameInfo.getCtl())) {
+            throw new AnalysisException("Only support creating asynchronous materialized views in internal catalog");
+        }
+        if (ctx.getSessionVariable().isInDebugMode()) {
+            throw new AnalysisException("Create materialized view fail, because is in debug mode");
+        }
         try {
-            FeNameFormat.checkTableName(mvName.getTbl());
+            FeNameFormat.checkTableName(tableNameInfo.getTbl());
         } catch (org.apache.doris.common.AnalysisException e) {
             throw new AnalysisException(e.getMessage(), e);
         }
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ctx, mvName.getCtl(), mvName.getDb(),
-                mvName.getTbl(), PrivPredicate.CREATE)) {
+        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ctx, tableNameInfo.getCtl(), tableNameInfo.getDb(),
+                tableNameInfo.getTbl(), PrivPredicate.CREATE)) {
             String message = ErrorCode.ERR_TABLEACCESS_DENIED_ERROR.formatErrorMsg("CREATE",
                     ctx.getQualifiedUser(), ctx.getRemoteIP(),
-                    mvName.getDb() + ": " + mvName.getTbl());
+                    tableNameInfo.getDb() + ": " + tableNameInfo.getTbl());
             throw new AnalysisException(message);
         }
         analyzeProperties();
-        analyzeQuery(ctx, this.mvProperties);
-        // analyze column
-        final boolean finalEnableMergeOnWrite = false;
-        Set<String> keysSet = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-        keysSet.addAll(keys);
-        columns.forEach(c -> c.validate(true, keysSet, finalEnableMergeOnWrite, KeysType.DUP_KEYS));
-
+        analyzeQuery(ctx);
+        this.partitionDesc = generatePartitionDesc(ctx);
         if (distribution == null) {
             throw new AnalysisException("Create async materialized view should contain distribution desc");
         }
@@ -179,10 +165,38 @@ public class CreateMTMVInfo {
         refreshInfo.validate();
 
         analyzeProperties();
+        rewriteQuerySql(ctx);
+
+        // set CreateTableInfo information
+        setTableInformation(ctx);
+    }
+
+    private void rewriteQuerySql(ConnectContext ctx) {
+        analyzeAndFillRewriteSqlMap(querySql, ctx);
+        querySql = BaseViewInfo.rewriteSql(ctx.getStatementContext().getIndexInSqlToString(), querySql);
+    }
+
+    private void analyzeAndFillRewriteSqlMap(String sql, ConnectContext ctx) {
+        StatementContext stmtCtx = ctx.getStatementContext();
+        LogicalPlan parsedViewPlan = new NereidsParser().parseForCreateView(sql);
+        if (parsedViewPlan instanceof UnboundResultSink) {
+            parsedViewPlan = (LogicalPlan) ((UnboundResultSink<?>) parsedViewPlan).child();
+        }
+        CascadesContext viewContextForStar = CascadesContext.initContext(
+                stmtCtx, parsedViewPlan, PhysicalProperties.ANY);
+        AnalyzerForCreateView analyzerForStar = new AnalyzerForCreateView(viewContextForStar);
+        analyzerForStar.analyze();
+        Plan analyzedPlan = viewContextForStar.getRewritePlan();
+        // Traverse all slots in the plan, and add the slot's location information
+        // and the fully qualified replacement string to the indexInSqlToString of the StatementContext.
+        analyzedPlan.accept(PlanSlotFinder.INSTANCE, ctx.getStatementContext());
     }
 
     private void analyzeProperties() {
-        properties = PropertyAnalyzer.getInstance().rewriteOlapProperties(mvName.getCtl(), mvName.getDb(), properties);
+        properties = PropertyAnalyzer.getInstance().rewriteOlapProperties(
+            tableNameInfo.getCtl(),
+            tableNameInfo.getDb(),
+            properties);
         if (DynamicPartitionUtil.checkDynamicPartitionPropertiesExist(properties)) {
             throw new AnalysisException("Not support dynamic partition properties on async materialized view");
         }
@@ -198,100 +212,36 @@ public class CreateMTMVInfo {
     /**
      * analyzeQuery
      */
-    public void analyzeQuery(ConnectContext ctx, Map<String, String> mvProperties) {
-        // create table as select
-        StatementContext statementContext = ctx.getStatementContext();
-        NereidsPlanner planner = new NereidsPlanner(statementContext);
-        // this is for expression column name infer when not use alias
-        LogicalSink<Plan> logicalSink = new UnboundResultSink<>(logicalQuery);
-        Plan plan = planner.plan(logicalSink, PhysicalProperties.ANY, ExplainLevel.ALL_PLAN);
-        if (plan.anyMatch(node -> node instanceof OneRowRelation)) {
-            throw new AnalysisException("at least contain one table");
-        }
-        // can not contain VIEW or MTMV
-        analyzeBaseTables(planner.getAnalyzedPlan());
-        // can not contain Random function
-        analyzeExpressions(planner.getAnalyzedPlan(), mvProperties);
-        // can not contain partition or tablets
-        boolean containTableQueryOperator = MaterializedViewUtils.containTableQueryOperator(planner.getAnalyzedPlan());
-        if (containTableQueryOperator) {
-            throw new AnalysisException("can not contain invalid expression");
-        }
-        getRelation(planner);
-        getColumns(plan);
-        analyzeKeys();
-        this.mvPartitionInfo = mvPartitionDefinition
-                .analyzeAndTransferToMTMVPartitionInfo(planner, ctx, logicalQuery);
-        this.partitionDesc = generatePartitionDesc(ctx);
+    public void analyzeQuery(ConnectContext ctx) throws UserException {
+        MTMVAnalyzeQueryInfo mtmvAnalyzeQueryInfo = MTMVPlanUtil.analyzeQuery(ctx, this.mvProperties, this.querySql,
+                this.mvPartitionDefinition, this.distribution, this.simpleColumnDefinitions, this.properties, this.keys,
+                this.logicalQuery);
+        this.mvPartitionInfo = mtmvAnalyzeQueryInfo.getMvPartitionInfo();
+        this.columns = mtmvAnalyzeQueryInfo.getColumnDefinitions();
+        this.relation = mtmvAnalyzeQueryInfo.getRelation();
     }
 
-    private void analyzeKeys() {
-        boolean enableDuplicateWithoutKeysByDefault = false;
-        try {
-            if (properties != null) {
-                enableDuplicateWithoutKeysByDefault =
-                        PropertyAnalyzer.analyzeEnableDuplicateWithoutKeysByDefault(properties);
-            }
-        } catch (Exception e) {
-            throw new AnalysisException(e.getMessage(), e.getCause());
-        }
-        if (keys.isEmpty() && !enableDuplicateWithoutKeysByDefault) {
-            keys = Lists.newArrayList();
-            int keyLength = 0;
-            for (ColumnDefinition column : columns) {
-                DataType type = column.getType();
-                Type catalogType = column.getType().toCatalogDataType();
-                keyLength += catalogType.getIndexSize();
-                if (keys.size() >= FeConstants.shortkey_max_column_count
-                        || keyLength > FeConstants.shortkey_maxsize_bytes) {
-                    if (keys.isEmpty() && type.isStringLikeType()) {
-                        keys.add(column.getName());
-                    }
-                    break;
-                }
-                if (type.isFloatLikeType() || type.isStringType() || type.isJsonType()
-                        || catalogType.isComplexType() || type.isBitmapType() || type.isHllType()
-                        || type.isQuantileStateType() || type.isJsonType() || type.isStructType()
-                        || column.getAggType() != null) {
-                    break;
-                }
-                keys.add(column.getName());
-                if (type.isVarcharType()) {
-                    break;
-                }
+    private List<Column> getPartitionColumn(String partitionColumnName) {
+        for (ColumnDefinition columnDefinition : columns) {
+            if (columnDefinition.getName().equalsIgnoreCase(partitionColumnName)) {
+                // current only support one partition col
+                return Lists.newArrayList(columnDefinition.translateToCatalogStyle());
             }
         }
-    }
-
-    private void getRelation(NereidsPlanner planner) {
-        // Should not make table without data to empty relation when analyze the related table,
-        // so add disable rules
-        ConnectContext ctx = planner.getCascadesContext().getConnectContext();
-        SessionVariable sessionVariable = ctx.getSessionVariable();
-        Set<String> tempDisableRules = sessionVariable.getDisableNereidsRuleNames();
-        sessionVariable.setDisableNereidsRules(CreateMTMVInfo.MTMV_PLANER_DISABLE_RULES);
-        if (ctx.getStatementContext() != null) {
-            ctx.getStatementContext().invalidCache(SessionVariable.DISABLE_NEREIDS_RULES);
-        }
-        Plan plan;
-        try {
-            plan = planner.plan(logicalQuery, PhysicalProperties.ANY, ExplainLevel.NONE);
-        } finally {
-            sessionVariable.setDisableNereidsRules(String.join(",", tempDisableRules));
-            ctx.getStatementContext().invalidCache(SessionVariable.DISABLE_NEREIDS_RULES);
-        }
-        this.relation = MTMVPlanUtil.generateMTMVRelation(plan);
+        throw new AnalysisException("can not find partition column");
     }
 
     private PartitionDesc generatePartitionDesc(ConnectContext ctx) {
         if (mvPartitionInfo.getPartitionType() == MTMVPartitionType.SELF_MANAGE) {
             return null;
         }
-        MTMVRelatedTableIf relatedTable = MTMVUtil.getRelatedTable(mvPartitionInfo.getRelatedTableInfo());
+        // all pct table partition type is same
+        MTMVRelatedTableIf relatedTable = MTMVUtil.getRelatedTable(mvPartitionInfo.getPctInfos().get(0).getTableInfo());
         List<AllPartitionDesc> allPartitionDescs = null;
         try {
             allPartitionDescs = MTMVPartitionUtil
-                    .getPartitionDescsByRelatedTable(properties, mvPartitionInfo, mvProperties);
+                    .getPartitionDescsByRelatedTable(properties, mvPartitionInfo, mvProperties,
+                            getPartitionColumn(mvPartitionInfo.getPartitionCol()));
         } catch (org.apache.doris.common.AnalysisException e) {
             throw new AnalysisException(e.getMessage(), e);
         }
@@ -303,7 +253,7 @@ public class CreateMTMVInfo {
                     allPartitionDescs.size(), ctx.getSessionVariable().getCreateTablePartitionMaxNum()));
         }
         try {
-            PartitionType type = relatedTable.getPartitionType();
+            PartitionType type = relatedTable.getPartitionType(Optional.empty());
             if (type == PartitionType.RANGE) {
                 return new RangePartitionDesc(Lists.newArrayList(mvPartitionInfo.getPartitionCol()),
                         allPartitionDescs);
@@ -318,98 +268,75 @@ public class CreateMTMVInfo {
         }
     }
 
-    private void analyzeBaseTables(Plan plan) {
-        List<Object> subQuerys = plan.collectToList(node -> node instanceof LogicalSubQueryAlias);
-        for (Object subquery : subQuerys) {
-            List<String> qualifier = ((LogicalSubQueryAlias) subquery).getQualifier();
-            if (!CollectionUtils.isEmpty(qualifier) && qualifier.size() == 3) {
-                try {
-                    TableIf table = Env.getCurrentEnv().getCatalogMgr()
-                            .getCatalogOrAnalysisException(qualifier.get(0))
-                            .getDbOrAnalysisException(qualifier.get(1)).getTableOrAnalysisException(qualifier.get(2));
-                    if (table instanceof View) {
-                        throw new AnalysisException("can not contain VIEW");
-                    }
-                } catch (org.apache.doris.common.AnalysisException e) {
-                    LOG.warn(e.getMessage(), e);
-                }
-            }
-        }
-    }
-
-    private void analyzeExpressions(Plan plan, Map<String, String> mvProperties) {
-        boolean enableNondeterministicFunction = Boolean.parseBoolean(
-                mvProperties.get(PropertyAnalyzer.PROPERTIES_ENABLE_NONDETERMINISTIC_FUNCTION));
-        if (enableNondeterministicFunction) {
-            return;
-        }
-        List<Expression> functionCollectResult = MaterializedViewUtils.extractNondeterministicFunction(plan);
-        if (!CollectionUtils.isEmpty(functionCollectResult)) {
-            throw new AnalysisException(String.format(
-                    "can not contain invalid expression, the expression is %s",
-                    functionCollectResult.stream().map(Expression::toString).collect(Collectors.joining(","))));
-        }
-    }
-
-    private void getColumns(Plan plan) {
-        List<Slot> slots = plan.getOutput();
-        if (slots.isEmpty()) {
-            throw new AnalysisException("table should contain at least one column");
-        }
-        if (!CollectionUtils.isEmpty(simpleColumnDefinitions) && simpleColumnDefinitions.size() != slots.size()) {
-            throw new AnalysisException("simpleColumnDefinitions size is not equal to the query's");
-        }
-        Set<String> colNames = Sets.newHashSet();
-        for (int i = 0; i < slots.size(); i++) {
-            String colName = CollectionUtils.isEmpty(simpleColumnDefinitions) ? slots.get(i).getName()
-                    : simpleColumnDefinitions.get(i).getName();
-            try {
-                FeNameFormat.checkColumnName(colName);
-            } catch (org.apache.doris.common.AnalysisException e) {
-                throw new AnalysisException(e.getMessage(), e);
-            }
-            if (colNames.contains(colName)) {
-                throw new AnalysisException("repeat cols:" + colName);
-            } else {
-                colNames.add(colName);
-            }
-            // If datatype is AggStateType, AggregateType should be generic, or column definition check will fail
-            columns.add(new ColumnDefinition(
-                    colName,
-                    slots.get(i).getDataType(),
-                    false,
-                    slots.get(i).getDataType() instanceof AggStateType ? AggregateType.GENERIC : null,
-                    slots.get(i).nullable(),
-                    Optional.empty(),
-                    CollectionUtils.isEmpty(simpleColumnDefinitions) ? null
-                            : simpleColumnDefinitions.get(i).getComment()));
-        }
-        // add a hidden column as row store
-        if (properties != null) {
-            try {
-                boolean storeRowColumn =
-                        PropertyAnalyzer.analyzeStoreRowColumn(Maps.newHashMap(properties));
-                if (storeRowColumn) {
-                    columns.add(ColumnDefinition.newRowStoreColumnDefinition(null));
-                }
-            } catch (Exception e) {
-                throw new AnalysisException(e.getMessage(), e.getCause());
-            }
-        }
-    }
-
     /**
-     * translate to catalog CreateMultiTableMaterializedViewStmt
+     * set CreateTableInfo Information
      */
-    public CreateMTMVStmt translateToLegacyStmt() {
-        TableName tableName = mvName.transferToTableName();
-        KeysDesc keysDesc = new KeysDesc(KeysType.DUP_KEYS, keys);
-        List<Column> catalogColumns = columns.stream()
-                .map(ColumnDefinition::translateToCatalogStyle)
+    private void setTableInformation(ConnectContext ctx) {
+        List<String> ctasColumns = simpleColumnDefinitions.stream()
+                .map(SimpleColumnDefinition::getName)
                 .collect(Collectors.toList());
-        return new CreateMTMVStmt(ifNotExists, tableName, catalogColumns, refreshInfo, keysDesc,
-                distribution.translateToCatalogStyle(), properties, mvProperties, querySql, comment, envInfo,
-                partitionDesc, mvPartitionInfo, relation);
+
+        this.setCatalog(tableNameInfo.getCtl());
+        this.setDbName(tableNameInfo.getDb());
+        this.setTableName(tableNameInfo.getTbl());
+        this.setCtasColumns(ctasColumns.isEmpty() ? null : ctasColumns);
+        this.setEngineName(CreateTableInfo.ENGINE_OLAP);
+        this.setKeysType(KeysType.DUP_KEYS);
+        this.setPartitionTableInfo(partitionDesc == null
+                ? PartitionTableInfo.EMPTY : partitionDesc.convertToPartitionTableInfo());
+        this.setRollups(Lists.newArrayList());
+        this.setSortOrderFields(Lists.newArrayList());
+        this.setIndexes(Lists.newArrayList());
+
+        this.analyzeEngine();
+
+        validatePartitionInfo(ctx);
     }
 
+    private void validatePartitionInfo(ConnectContext ctx) {
+        Map<String, ColumnDefinition> columnMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        columns.forEach(c -> {
+            if (columnMap.put(c.getName(), c) != null) {
+                try {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_DUP_FIELDNAME,
+                            c.getName());
+                } catch (Exception e) {
+                    throw new AnalysisException(e.getMessage(), e.getCause());
+                }
+            }
+        });
+
+        getPartitionTableInfo().validatePartitionInfo(
+                getEngineName(),
+                columns,
+                columnMap,
+                properties,
+                ctx,
+                isEnableMergeOnWrite(),
+                isExternal());
+    }
+
+    public String getQuerySql() {
+        return querySql;
+    }
+
+    public Map<String, String> getMvProperties() {
+        return mvProperties;
+    }
+
+    public MTMVRefreshInfo getRefreshInfo() {
+        return refreshInfo;
+    }
+
+    public MTMVRelation getRelation() {
+        return relation;
+    }
+
+    public MTMVPartitionInfo getMvPartitionInfo() {
+        return mvPartitionInfo;
+    }
+
+    public Map<String, String> getSessionVariables() {
+        return sessionVariables;
+    }
 }

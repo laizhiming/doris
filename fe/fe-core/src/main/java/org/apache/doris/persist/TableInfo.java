@@ -17,8 +17,6 @@
 
 package org.apache.doris.persist;
 
-import org.apache.doris.catalog.Env;
-import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -42,10 +40,16 @@ public class TableInfo implements Writable {
 
     @SerializedName("nT")
     private String newTableName;
+    @SerializedName("oT")
+    private String oldTableName;
     @SerializedName("nR")
     private String newRollupName;
+    @SerializedName("oR")
+    private String oldRollupName;
     @SerializedName("nP")
     private String newPartitionName;
+    @SerializedName("oP")
+    private String oldPartitionName;
 
     public TableInfo() {
         // for persist
@@ -63,17 +67,38 @@ public class TableInfo implements Writable {
         this.newPartitionName = newPartitionName;
     }
 
+    private TableInfo(long dbId, long tableId, long indexId, long partitionId,
+                      String newTableName, String oldTableName, String newRollupName, String oldRollupName,
+                      String newPartitionName, String oldPartitionName) {
+        this.dbId = dbId;
+        this.tableId = tableId;
+        this.indexId = indexId;
+        this.partitionId = partitionId;
+
+        this.newTableName = newTableName;
+        this.oldTableName = oldTableName;
+        this.newRollupName = newRollupName;
+        this.oldRollupName = oldRollupName;
+        this.newPartitionName = newPartitionName;
+        this.oldPartitionName = oldPartitionName;
+    }
+
     public static TableInfo createForTableRename(long dbId, long tableId, String newTableName) {
         return new TableInfo(dbId, tableId, -1L, -1L, newTableName, "", "");
     }
 
-    public static TableInfo createForRollupRename(long dbId, long tableId, long indexId, String newRollupName) {
-        return new TableInfo(dbId, tableId, indexId, -1L, "", newRollupName, "");
+    public static TableInfo createForTableRename(long dbId, long tableId, String oldTableName, String newTableName) {
+        return new TableInfo(dbId, tableId, -1L, -1L, newTableName, oldTableName, "", "", "", "");
+    }
+
+    public static TableInfo createForRollupRename(long dbId, long tableId, long indexId, String oldRollupName,
+                                                  String newRollupName) {
+        return new TableInfo(dbId, tableId, indexId, -1L, "", "", newRollupName, oldRollupName, "", "");
     }
 
     public static TableInfo createForPartitionRename(long dbId, long tableId, long partitionId,
-                                                     String newPartitionName) {
-        return new TableInfo(dbId, tableId, -1L, partitionId, "", "", newPartitionName);
+                                                     String oldPartitionName, String newPartitionName) {
+        return new TableInfo(dbId, tableId, -1L, partitionId, "", "", "", "", newPartitionName, oldPartitionName);
     }
 
     public static TableInfo createForModifyDistribution(long dbId, long tableId) {
@@ -114,24 +139,10 @@ public class TableInfo implements Writable {
     }
 
     public static TableInfo read(DataInput in) throws IOException {
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_134) {
-            TableInfo tableInfo = new TableInfo();
-            tableInfo.readFields(in);
-            return tableInfo;
-        } else {
-            return GsonUtils.GSON.fromJson(Text.readString(in), TableInfo.class);
-        }
+        return GsonUtils.GSON.fromJson(Text.readString(in), TableInfo.class);
     }
 
-    @Deprecated
-    public void readFields(DataInput in) throws IOException {
-        dbId = in.readLong();
-        tableId = in.readLong();
-        indexId = in.readLong();
-        partitionId = in.readLong();
-
-        newTableName = Text.readString(in);
-        newRollupName = Text.readString(in);
-        newPartitionName = Text.readString(in);
+    public String toJson() {
+        return GsonUtils.GSON.toJson(this);
     }
 }

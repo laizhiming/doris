@@ -16,11 +16,13 @@
 // under the License.
 
 #pragma once
-#include "runtime/stream_load/stream_load_executor.h"
+#include "load/stream_load/stream_load_executor.h"
 
 namespace doris {
 
 class CloudStreamLoadExecutor final : public StreamLoadExecutor {
+    ENABLE_FACTORY_CREATOR(CloudStreamLoadExecutor);
+
 public:
     CloudStreamLoadExecutor(ExecEnv* exec_env);
 

@@ -18,14 +18,18 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.ExplainOptions;
+import org.apache.doris.analysis.StmtType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
 import org.apache.doris.nereids.rules.exploration.mv.InitMaterializationContextHook;
 import org.apache.doris.nereids.trees.plans.Explainable;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertOverwriteTableCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 
@@ -77,22 +81,38 @@ public class ExplainCommand extends Command implements NoForward {
         if (!(logicalPlan instanceof Explainable)) {
             throw new AnalysisException(logicalPlan.getClass().getSimpleName() + " cannot be explained");
         }
-        explainPlan = ((LogicalPlan) ((Explainable) logicalPlan).getExplainPlan(ctx));
+        Explainable explainable = (Explainable) logicalPlan;
+        if (explainable instanceof InsertIntoTableCommand
+                || explainable instanceof InsertOverwriteTableCommand
+                || explainable instanceof UpdateCommand) {
+            ctx.getStatementContext().setIsInsert(true);
+        }
+        if (explainable instanceof DeleteFromCommand) {
+            ctx.getStatementContext().setSkipPrunePredicate(true);
+        }
+        explainPlan = ((LogicalPlan) explainable.getExplainPlan(ctx));
+        NereidsPlanner planner = explainable.getExplainPlanner(explainPlan, ctx.getStatementContext()).orElseGet(() ->
+            new NereidsPlanner(ctx.getStatementContext())
+        );
+
         LogicalPlanAdapter logicalPlanAdapter = new LogicalPlanAdapter(explainPlan, ctx.getStatementContext());
         ExplainOptions explainOptions = new ExplainOptions(level, showPlanProcess);
         logicalPlanAdapter.setIsExplain(explainOptions);
         executor.setParsedStmt(logicalPlanAdapter);
-        NereidsPlanner planner = new NereidsPlanner(ctx.getStatementContext());
         if (ctx.getSessionVariable().isEnableMaterializedViewRewrite()) {
-            planner.addHook(InitMaterializationContextHook.INSTANCE);
+            ctx.getStatementContext().addPlannerHook(InitMaterializationContextHook.INSTANCE);
         }
         planner.plan(logicalPlanAdapter, ctx.getSessionVariable().toThrift());
         executor.setPlanner(planner);
-        executor.checkBlockRules();
+        // Skip SQL block rules check for EXPLAIN statements since they only show
+        // the execution plan without actually executing the query
         if (showPlanProcess) {
             executor.handleExplainPlanProcessStmt(planner.getCascadesContext().getPlanProcesses());
         } else {
             executor.handleExplainStmt(planner.getExplainString(explainOptions), true);
+        }
+        for (ScanNode scanNode : planner.getScanNodes()) {
+            scanNode.stop();
         }
     }
 
@@ -111,5 +131,18 @@ public class ExplainCommand extends Command implements NoForward {
 
     public boolean showPlanProcess() {
         return showPlanProcess;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.EXPLAIN;
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("EXPLAIN ");
+        sb.append(logicalPlan.toDigest());
+        return sb.toString();
     }
 }

@@ -42,6 +42,7 @@ public class FrontendOptions {
     private static List<CIDR> priorityCidrs = Lists.newArrayList();
     private static InetAddress localAddr = InetAddress.getLoopbackAddress();
     private static boolean useFqdn = false;
+    private static String cachedAddr;
 
     public static void init() throws UnknownHostException {
         localAddr = null;
@@ -56,6 +57,7 @@ public class FrontendOptions {
         } else {
             initAddrUseIp(hosts);
         }
+        cachedAddr = getLocalHostAddress();
     }
 
     // 1. If priority_networks is configured . Obtain the IP that complies with the rules,
@@ -169,6 +171,10 @@ public class FrontendOptions {
                 localAddr.getCanonicalHostName(), localAddr.getHostAddress());
     }
 
+    public static String getLocalHostAddressCached() {
+        return Strings.nullToEmpty(cachedAddr);
+    }
+
     public static String getLocalHostAddress() {
         if (useFqdn) {
             // localAddr.getHostName() is same as run `hostname`
@@ -183,7 +189,20 @@ public class FrontendOptions {
             // so we call localAddr.getCanonicalHostName() at here
             return localAddr.getCanonicalHostName();
         }
-        return InetAddresses.toAddrString(localAddr);
+        return getIpByLocalAddr(localAddr);
+    }
+
+    /**
+     * get ip from addr
+     * @param addr InetAddress
+     * @return ip
+     */
+    public static String getIpByLocalAddr(InetAddress addr) {
+        String addrString = InetAddresses.toAddrString(addr);
+        if (addrString.contains("%")) {
+            addrString = addrString.split("%")[0];
+        }
+        return addrString;
     }
 
     private static void analyzePriorityCidrs() {

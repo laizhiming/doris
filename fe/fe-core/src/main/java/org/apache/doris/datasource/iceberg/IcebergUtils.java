@@ -31,48 +31,114 @@ import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.NullLiteral;
 import org.apache.doris.analysis.PartitionDesc;
+import org.apache.doris.analysis.PartitionValue;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
-import org.apache.doris.analysis.Subquery;
+import org.apache.doris.analysis.TableScanParams;
+import org.apache.doris.analysis.TableSnapshot;
 import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MapType;
+import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionKey;
+import org.apache.doris.catalog.RangePartitionItem;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.StructField;
 import org.apache.doris.catalog.StructType;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.info.SimpleTableInfo;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.CacheException;
 import org.apache.doris.datasource.ExternalCatalog;
-import org.apache.doris.datasource.hive.HiveMetaStoreClientHelper;
+import org.apache.doris.datasource.ExternalSchemaCache;
+import org.apache.doris.datasource.ExternalTable;
+import org.apache.doris.datasource.SchemaCacheValue;
+import org.apache.doris.datasource.iceberg.cache.IcebergManifestCache;
+import org.apache.doris.datasource.iceberg.source.IcebergTableQueryInfo;
+import org.apache.doris.datasource.metacache.CacheSpec;
+import org.apache.doris.datasource.mvcc.MvccSnapshot;
+import org.apache.doris.datasource.mvcc.MvccUtil;
+import org.apache.doris.datasource.property.metastore.HMSBaseProperties;
 import org.apache.doris.nereids.exceptions.NotSupportedException;
+import org.apache.doris.nereids.trees.expressions.literal.Result;
+import org.apache.doris.nereids.types.VarBinaryType;
+import org.apache.doris.nereids.util.DateUtils;
 import org.apache.doris.thrift.TExprOpcode;
 
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Range;
+import com.google.common.collect.Sets;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.MetadataTableType;
+import org.apache.iceberg.MetadataTableUtils;
+import org.apache.iceberg.PartitionData;
+import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.PartitionsTable;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotRef;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.expressions.And;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.expressions.Literal;
+import org.apache.iceberg.expressions.ManifestEvaluator;
 import org.apache.iceberg.expressions.Not;
 import org.apache.iceberg.expressions.Or;
+import org.apache.iceberg.expressions.Projections;
 import org.apache.iceberg.expressions.Unbound;
+import org.apache.iceberg.hive.HiveCatalog;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Type.TypeID;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.types.Types.NestedField;
+import org.apache.iceberg.types.Types.TimestampType;
 import org.apache.iceberg.util.LocationUtil;
+import org.apache.iceberg.util.SnapshotUtil;
+import org.apache.iceberg.util.StructProjection;
+import org.apache.iceberg.view.View;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.time.DateTimeException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.Month;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoField;
+import java.time.temporal.TemporalAccessor;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -102,6 +168,18 @@ public class IcebergUtils {
 
     // nickname in spark
     public static final String SPARK_SQL_COMPRESSION_CODEC = "spark.sql.iceberg.compression-codec";
+
+    public static final long UNKNOWN_SNAPSHOT_ID = -1;  // means an empty table
+    public static final long NEWEST_SCHEMA_ID = -1;
+
+    public static final String YEAR = "year";
+    public static final String MONTH = "month";
+    public static final String DAY = "day";
+    public static final String HOUR = "hour";
+    public static final String IDENTITY = "identity";
+    public static final int PARTITION_DATA_ID_START = 1000; // org.apache.iceberg.PartitionSpec
+
+    private static final Pattern SNAPSHOT_ID = Pattern.compile("\\d+");
 
     public static Expression convertToIcebergExpr(Expr expr, Schema schema) {
         if (expr == null) {
@@ -215,9 +293,6 @@ public class IcebergUtils {
         } else if (expr instanceof InPredicate) {
             // InPredicate, only support a in (1,2,3)
             InPredicate inExpr = (InPredicate) expr;
-            if (inExpr.contains(Subquery.class)) {
-                return null;
-            }
             SlotRef slotRef = convertDorisExprToSlotRef(inExpr.getChild(0));
             if (slotRef == null) {
                 return null;
@@ -482,7 +557,8 @@ public class IcebergUtils {
         return builder.build();
     }
 
-    private static Type icebergPrimitiveTypeToDorisType(org.apache.iceberg.types.Type.PrimitiveType primitive) {
+    private static Type icebergPrimitiveTypeToDorisType(org.apache.iceberg.types.Type.PrimitiveType primitive,
+            boolean enableMappingVarbinary, boolean enableMappingTimestampTz) {
         switch (primitive.typeId()) {
             case BOOLEAN:
                 return Type.BOOLEAN;
@@ -495,18 +571,25 @@ public class IcebergUtils {
             case DOUBLE:
                 return Type.DOUBLE;
             case STRING:
-            case BINARY:
-            case UUID:
                 return Type.STRING;
+            case UUID:
+                return enableMappingVarbinary ? ScalarType.createVarbinaryType(16) : Type.STRING;
+            case BINARY:
+                return enableMappingVarbinary ? ScalarType.createVarbinaryType(VarBinaryType.MAX_VARBINARY_LENGTH)
+                        : Type.STRING;
             case FIXED:
                 Types.FixedType fixed = (Types.FixedType) primitive;
-                return ScalarType.createCharType(fixed.length());
+                return enableMappingVarbinary ? ScalarType.createVarbinaryType(fixed.length())
+                        : ScalarType.createCharType(fixed.length());
             case DECIMAL:
                 Types.DecimalType decimal = (Types.DecimalType) primitive;
                 return ScalarType.createDecimalV3Type(decimal.precision(), decimal.scale());
             case DATE:
                 return ScalarType.createDateV2Type();
             case TIMESTAMP:
+                if (enableMappingTimestampTz && ((TimestampType) primitive).shouldAdjustToUTC()) {
+                    return ScalarType.createTimeStampTzType(ICEBERG_DATETIME_SCALE_MS);
+                }
                 return ScalarType.createDatetimeV2Type(ICEBERG_DATETIME_SCALE_MS);
             case TIME:
                 return Type.UNSUPPORTED;
@@ -515,75 +598,395 @@ public class IcebergUtils {
         }
     }
 
-    public static Type icebergTypeToDorisType(org.apache.iceberg.types.Type type) {
+    public static Type icebergTypeToDorisType(org.apache.iceberg.types.Type type, boolean enableMappingVarbinary,
+            boolean enableMappingTimestampTz) {
         if (type.isPrimitiveType()) {
-            return icebergPrimitiveTypeToDorisType((org.apache.iceberg.types.Type.PrimitiveType) type);
+            return icebergPrimitiveTypeToDorisType((org.apache.iceberg.types.Type.PrimitiveType) type,
+                    enableMappingVarbinary, enableMappingTimestampTz);
         }
         switch (type.typeId()) {
             case LIST:
                 Types.ListType list = (Types.ListType) type;
-                return ArrayType.create(icebergTypeToDorisType(list.elementType()), true);
+                return ArrayType.create(
+                        icebergTypeToDorisType(list.elementType(), enableMappingVarbinary, enableMappingTimestampTz),
+                        true);
             case MAP:
                 Types.MapType map = (Types.MapType) type;
                 return new MapType(
-                        icebergTypeToDorisType(map.keyType()),
-                        icebergTypeToDorisType(map.valueType())
-                );
+                        icebergTypeToDorisType(map.keyType(), enableMappingVarbinary, enableMappingTimestampTz),
+                        icebergTypeToDorisType(map.valueType(), enableMappingVarbinary, enableMappingTimestampTz));
             case STRUCT:
                 Types.StructType struct = (Types.StructType) type;
                 ArrayList<StructField> nestedTypes = struct.fields().stream().map(
-                        x -> new StructField(x.name(), icebergTypeToDorisType(x.type()))
-                ).collect(Collectors.toCollection(ArrayList::new));
+                        x -> new StructField(x.name(),
+                                icebergTypeToDorisType(x.type(), enableMappingVarbinary, enableMappingTimestampTz)))
+                        .collect(Collectors.toCollection(ArrayList::new));
                 return new StructType(nestedTypes);
             default:
                 throw new IllegalArgumentException("Cannot transform unknown type: " + type);
         }
     }
 
+    /**
+     * Get partition info map for identity partitions only, considering partition
+     * evolution.
+     * For non-identity partitions (e.g., day, bucket, truncate), returns null to
+     * skip
+     * dynamic partition pruning.
+     *
+     * @param partitionData The partition data from the file
+     * @param partitionSpec The partition spec corresponding to the file's specId
+     *                      (required)
+     * @param timeZone      The time zone for timestamp serialization
+     * @return Map of partition field name to partition value string, or null if
+     *         there are non-identity partitions
+     */
+    public static Map<String, String> getPartitionInfoMap(PartitionData partitionData, PartitionSpec partitionSpec,
+            String timeZone) {
+        Map<String, String> partitionInfoMap = new HashMap<>();
+        List<NestedField> fields = partitionData.getPartitionType().asNestedType().fields();
 
-    public static org.apache.iceberg.Table getIcebergTable(ExternalCatalog catalog, String dbName, String tblName) {
-        return getIcebergTableInternal(catalog, dbName, tblName, false);
+        // Check if all partition fields are identity transform
+        // If any field is not identity, return null to skip dynamic partition pruning
+        List<PartitionField> partitionFields = partitionSpec.fields();
+        Preconditions.checkArgument(fields.size() == partitionFields.size(),
+                "PartitionData fields size does not match PartitionSpec fields size");
+
+        for (int i = 0; i < fields.size(); i++) {
+            NestedField field = fields.get(i);
+            PartitionField partitionField = partitionFields.get(i);
+
+            // Only process identity transform partitions
+            // For other transforms (day, bucket, truncate, etc.), skip dynamic partition
+            // pruning
+            if (!partitionField.transform().isIdentity()) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Skip dynamic partition pruning for non-identity partition field: {} with transform: {}",
+                            field.name(), partitionField.transform().toString());
+                }
+                return null;
+            }
+
+            Object value = partitionData.get(i);
+            try {
+                String partitionString = serializePartitionValue(field.type(), value, timeZone);
+                partitionInfoMap.put(field.name(), partitionString);
+            } catch (UnsupportedOperationException e) {
+                LOG.warn("Failed to serialize Iceberg table partition value for field {}: {}", field.name(),
+                        e.getMessage());
+                return null;
+            }
+        }
+        return partitionInfoMap;
     }
 
-    public static org.apache.iceberg.Table getAndCloneTable(ExternalCatalog catalog, SimpleTableInfo tableInfo) {
-        return getIcebergTableInternal(catalog, tableInfo.getDbName(), tableInfo.getTbName(), true);
+    private static String serializePartitionValue(org.apache.iceberg.types.Type type, Object value, String timeZone) {
+        switch (type.typeId()) {
+            case BOOLEAN:
+            case INTEGER:
+            case LONG:
+            case STRING:
+            case UUID:
+            case DECIMAL:
+                if (value == null) {
+                    return null;
+                }
+                return value.toString();
+            // case binary, fixed should not supported, because if return string with utf8,
+            // the data maybe be corrupted
+            case DATE:
+                if (value == null) {
+                    return null;
+                }
+                // Iceberg date is stored as days since epoch (1970-01-01)
+                LocalDate date = LocalDate.ofEpochDay((Integer) value);
+                return date.format(DateTimeFormatter.ISO_LOCAL_DATE);
+            case TIME:
+                if (value == null) {
+                    return null;
+                }
+                // Iceberg time is stored as microseconds since midnight
+                long micros = (Long) value;
+                LocalTime time = LocalTime.ofNanoOfDay(micros * 1000);
+                return time.format(DateTimeFormatter.ISO_LOCAL_TIME);
+            case TIMESTAMP:
+                if (value == null) {
+                    return null;
+                }
+                // Iceberg timestamp is stored as microseconds since epoch
+                // (1970-01-01T00:00:00)
+                long timestampMicros = (Long) value;
+                TimestampType timestampType = (TimestampType) type;
+                LocalDateTime timestamp = LocalDateTime.ofEpochSecond(
+                        timestampMicros / 1_000_000, (int) (timestampMicros % 1_000_000) * 1000,
+                        ZoneOffset.UTC);
+                // type is timestamptz if timestampType.shouldAdjustToUTC() is true
+                if (timestampType.shouldAdjustToUTC()) {
+                    timestamp = timestamp.atZone(ZoneId.of("UTC")).withZoneSameInstant(ZoneId.of(timeZone))
+                            .toLocalDateTime();
+                }
+                return timestamp.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+            default:
+                throw new UnsupportedOperationException("Unsupported type for serializePartitionValue: " + type);
+        }
     }
 
-    public static org.apache.iceberg.Table getRemoteTable(ExternalCatalog catalog, SimpleTableInfo tableInfo) {
-        return Env.getCurrentEnv()
-                .getExtMetaCacheMgr()
-                .getIcebergMetadataCache()
-                .getRemoteTable(catalog, tableInfo.getDbName(), tableInfo.getTbName());
+    public static Table getIcebergTable(ExternalTable dorisTable) {
+        return icebergMetadataCache(dorisTable.getCatalog()).getIcebergTable(dorisTable);
     }
 
-    private static org.apache.iceberg.Table getIcebergTableInternal(ExternalCatalog catalog, String dbName,
-            String tblName,
-            boolean isClone) {
-        IcebergMetadataCache metadataCache = Env.getCurrentEnv()
-                .getExtMetaCacheMgr()
-                .getIcebergMetadataCache();
-        return isClone ? metadataCache.getAndCloneTable(catalog, dbName, tblName)
-                : metadataCache.getIcebergTable(catalog, dbName, tblName);
+    // Centralize cache access to keep call sites consistent and easy to understand.
+    private static IcebergMetadataCache icebergMetadataCache(ExternalCatalog catalog) {
+        return Env.getCurrentEnv().getExtMetaCacheMgr().getIcebergMetadataCache(catalog);
+    }
+
+    private static ExternalSchemaCache schemaCache(ExternalCatalog catalog) {
+        return Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(catalog);
+    }
+
+    public static org.apache.iceberg.types.Type dorisTypeToIcebergType(Type type) {
+        DorisTypeToIcebergType visitor = type.isStructType() ? new DorisTypeToIcebergType((StructType) type)
+                : new DorisTypeToIcebergType();
+        return DorisTypeToIcebergType.visit(type, visitor);
+    }
+
+    public static Literal<?> parseIcebergLiteral(String value, org.apache.iceberg.types.Type type) {
+        if (value == null) {
+            return null;
+        }
+        switch (type.typeId()) {
+            case BOOLEAN:
+                try {
+                    return Literal.of(Boolean.parseBoolean(value));
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalArgumentException("Invalid Boolean string: " + value, e);
+                }
+            case INTEGER:
+            case DATE:
+                try {
+                    return Literal.of(Integer.parseInt(value));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid Int string: " + value, e);
+                }
+            case LONG:
+            case TIME:
+            case TIMESTAMP:
+            case TIMESTAMP_NANO:
+                try {
+                    return Literal.of(Long.parseLong(value));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid Long string: " + value, e);
+                }
+            case FLOAT:
+                try {
+                    return Literal.of(Float.parseFloat(value));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid Float string: " + value, e);
+                }
+            case DOUBLE:
+                try {
+                    return Literal.of(Double.parseDouble(value));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid Double string: " + value, e);
+                }
+            case STRING:
+                return Literal.of(value);
+            case UUID:
+                try {
+                    return Literal.of(UUID.fromString(value));
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalArgumentException("Invalid UUID string: " + value, e);
+                }
+            case FIXED:
+            case BINARY:
+            case GEOMETRY:
+            case GEOGRAPHY:
+                return Literal.of(ByteBuffer.wrap(value.getBytes()));
+            case DECIMAL:
+                try {
+                    return Literal.of(new BigDecimal(value));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid Decimal string: " + value, e);
+                }
+            default:
+                throw new IllegalArgumentException("Cannot parse unknown type: " + type);
+        }
+    }
+
+    /**
+     * Convert human-readable partition value string to appropriate Java type for
+     * Iceberg expression.
+     * This is used for static partition overwrite where user specifies partition
+     * values like PARTITION (dt='2025-01-01', region='bj').
+     *
+     * @param valueStr    Partition value as human-readable string (e.g.,
+     *                    "2025-01-01" for date)
+     * @param icebergType Iceberg type of the partition field
+     * @return Converted value object suitable for Iceberg Expression, or null if
+     *         value is null
+     */
+    public static Object parsePartitionValueFromString(String valueStr, org.apache.iceberg.types.Type icebergType) {
+        if (valueStr == null) {
+            return null;
+        }
+
+        try {
+            switch (icebergType.typeId()) {
+                case STRING:
+                    return valueStr;
+                case INTEGER:
+                    return Integer.parseInt(valueStr);
+                case LONG:
+                    return Long.parseLong(valueStr);
+                case FLOAT:
+                    return Float.parseFloat(valueStr);
+                case DOUBLE:
+                    return Double.parseDouble(valueStr);
+                case BOOLEAN:
+                    return Boolean.parseBoolean(valueStr);
+                case DATE:
+                    // Parse date string (format: yyyy-MM-dd) to epoch day
+                    return (int) LocalDate.parse(valueStr, DateTimeFormatter.ISO_LOCAL_DATE).toEpochDay();
+                case TIMESTAMP:
+                    return parseTimestampToMicros(valueStr, (TimestampType) icebergType);
+                case DECIMAL:
+                    return new BigDecimal(valueStr);
+                default:
+                    throw new IllegalArgumentException("Unsupported partition value type: " + icebergType);
+            }
+        } catch (Exception e) {
+            throw new IllegalArgumentException(String.format("Failed to convert partition value '%s' to type %s",
+                    valueStr, icebergType), e);
+        }
+    }
+
+    /**
+     * Parse timestamp string to microseconds using Doris's built-in datetime
+     * parser.
+     *
+     * @param valueStr      Timestamp string in various formats
+     * @param timestampType Iceberg timestamp type (with or without timezone)
+     * @return Microseconds since epoch
+     * @throws IllegalArgumentException if the timestamp string cannot be parsed
+     */
+    private static long parseTimestampToMicros(String valueStr, TimestampType timestampType) {
+        // Use Doris's built-in DateLiteral.parseDateTime() which supports multiple formats
+        Result<TemporalAccessor, org.apache.doris.nereids.exceptions.AnalysisException> parseResult =
+                org.apache.doris.nereids.trees.expressions.literal.DateLiteral.parseDateTime(valueStr);
+
+        if (parseResult.isError()) {
+            throw new IllegalArgumentException(
+                    String.format("Failed to parse timestamp string '%s'", valueStr));
+        }
+
+        TemporalAccessor temporal = parseResult.get();
+
+        // Build LocalDateTime from TemporalAccessor using DateUtils helper methods
+        LocalDateTime ldt = LocalDateTime.of(
+                DateUtils.getOrDefault(temporal, ChronoField.YEAR),
+                DateUtils.getOrDefault(temporal, ChronoField.MONTH_OF_YEAR),
+                DateUtils.getOrDefault(temporal, ChronoField.DAY_OF_MONTH),
+                DateUtils.getHourOrDefault(temporal),
+                DateUtils.getOrDefault(temporal, ChronoField.MINUTE_OF_HOUR),
+                DateUtils.getOrDefault(temporal, ChronoField.SECOND_OF_MINUTE),
+                DateUtils.getOrDefault(temporal, ChronoField.NANO_OF_SECOND));
+
+        // Convert to microseconds
+        ZoneId zone = timestampType.shouldAdjustToUTC()
+                ? DateUtils.getTimeZone()
+                : ZoneId.of("UTC");
+
+        long epochSecond = ldt.atZone(zone).toInstant().getEpochSecond();
+        long microSecond = DateUtils.getOrDefault(temporal, ChronoField.NANO_OF_SECOND) / 1_000L;
+
+        return epochSecond * 1_000_000L + microSecond;
+    }
+
+    private static void updateIcebergColumnUniqueId(Column column, Types.NestedField icebergField) {
+        column.setUniqueId(icebergField.fieldId());
+        List<NestedField> icebergFields = Lists.newArrayList();
+        switch (icebergField.type().typeId()) {
+            case LIST:
+                icebergFields = ((Types.ListType) icebergField.type()).fields();
+                break;
+            case MAP:
+                icebergFields =  ((Types.MapType) icebergField.type()).fields();
+                break;
+            case STRUCT:
+                icebergFields = ((Types.StructType) icebergField.type()).fields();
+                break;
+            default:
+                return;
+        }
+
+        if (column.getChildren() != null) {
+            List<Column> childColumns = column.getChildren();
+            for (int idx = 0; idx < childColumns.size(); idx++) {
+                updateIcebergColumnUniqueId(childColumns.get(idx), icebergFields.get(idx));
+            }
+        }
     }
 
     /**
      * Get iceberg schema from catalog and convert them to doris schema
      */
-    public static List<Column> getSchema(ExternalCatalog catalog, String dbName, String name) {
-        return HiveMetaStoreClientHelper.ugiDoAs(catalog.getConfiguration(), () -> {
-            org.apache.iceberg.Table icebergTable = getIcebergTable(catalog, dbName, name);
-            Schema schema = icebergTable.schema();
-            List<Types.NestedField> columns = schema.columns();
-            List<Column> tmpSchema = Lists.newArrayListWithCapacity(columns.size());
-            for (Types.NestedField field : columns) {
-                tmpSchema.add(new Column(field.name().toLowerCase(Locale.ROOT),
-                        IcebergUtils.icebergTypeToDorisType(field.type()), true, null, true, field.doc(), true,
-                        schema.caseInsensitiveFindField(field.name()).fieldId()));
-            }
-            return tmpSchema;
-        });
+    private static List<Column> getSchema(ExternalTable dorisTable, long schemaId, boolean isView,
+            Table icebergTable) {
+        try {
+            return dorisTable.getCatalog().getExecutionAuthenticator().execute(() -> {
+                Schema schema;
+                if (isView) {
+                    View icebergView = getIcebergView(dorisTable);
+                    if (schemaId == NEWEST_SCHEMA_ID) {
+                        schema = icebergView.schema();
+                    } else {
+                        schema = icebergView.schemas().get((int) schemaId);
+                    }
+                } else {
+                    Table table = icebergTable != null ? icebergTable : getIcebergTable(dorisTable);
+                    if (schemaId == NEWEST_SCHEMA_ID || table.currentSnapshot() == null) {
+                        schema = table.schema();
+                    } else {
+                        schema = table.schemas().get((int) schemaId);
+                    }
+                }
+                String type = isView ? "view" : "table";
+                Preconditions.checkNotNull(schema,
+                        "Schema for " + type + " " + dorisTable.getCatalog().getName()
+                                + "." + dorisTable.getDbName() + "." + dorisTable.getName() + " is null");
+                return parseSchema(schema, dorisTable.getCatalog().getEnableMappingVarbinary(),
+                        dorisTable.getCatalog().getEnableMappingTimestampTz());
+            });
+        } catch (Exception e) {
+            throw new RuntimeException(ExceptionUtils.getRootCauseMessage(e), e);
+        }
+
     }
 
+    /**
+     * Parse iceberg schema to doris schema
+     */
+    public static List<Column> parseSchema(Schema schema, boolean enableMappingVarbinary,
+            boolean enableMappingTimestampTz) {
+        List<Types.NestedField> columns = schema.columns();
+        List<Column> resSchema = Lists.newArrayListWithCapacity(columns.size());
+        for (Types.NestedField field : columns) {
+            Column column = new Column(field.name().toLowerCase(Locale.ROOT),
+                    IcebergUtils.icebergTypeToDorisType(field.type(), enableMappingVarbinary, enableMappingTimestampTz),
+                    true, null,
+                    true, field.doc(), true, -1);
+            updateIcebergColumnUniqueId(column, field);
+            if (field.type().isPrimitiveType() && field.type().typeId() == TypeID.TIMESTAMP) {
+                Types.TimestampType timestampType = (Types.TimestampType) field.type();
+                if (timestampType.shouldAdjustToUTC()) {
+                    column.setWithTZExtraInfo();
+                }
+            }
+            resSchema.add(column);
+        }
+        return resSchema;
+    }
 
     /**
      * Estimate iceberg table row count.
@@ -591,23 +994,23 @@ public class IcebergUtils {
      *
      * @return estimated row count
      */
-    public static long getIcebergRowCount(ExternalCatalog catalog, String dbName, String tbName) {
-        try {
-            Table icebergTable = Env.getCurrentEnv()
-                    .getExtMetaCacheMgr()
-                    .getIcebergMetadataCache()
-                    .getIcebergTable(catalog, dbName, tbName);
-            Snapshot snapshot = icebergTable.currentSnapshot();
-            if (snapshot == null) {
-                // empty table
-                return 0;
-            }
-            Map<String, String> summary = snapshot.summary();
-            return Long.parseLong(summary.get(TOTAL_RECORDS)) - Long.parseLong(summary.get(TOTAL_POSITION_DELETES));
-        } catch (Exception e) {
-            LOG.warn("Fail to collect row count for db {} table {}", dbName, tbName, e);
+    public static long getIcebergRowCount(ExternalTable tbl) {
+        // the table may be null when the iceberg metadata cache is not loaded.But I don't think it's a problem,
+        // because the NPE would be caught in the caller and return the default value -1.
+        // Meanwhile, it will trigger iceberg metadata cache to load the table, so we can get it next time.
+        Table icebergTable = getIcebergTable(tbl);
+        Snapshot snapshot = icebergTable.currentSnapshot();
+        if (snapshot == null) {
+            LOG.info("Iceberg table {}.{}.{} is empty, return -1.",
+                    tbl.getCatalog().getName(), tbl.getDbName(), tbl.getName());
+            // empty table
+            return TableIf.UNKNOWN_ROW_COUNT;
         }
-        return -1;
+        Map<String, String> summary = snapshot.summary();
+        long rows = Long.parseLong(summary.get(TOTAL_RECORDS)) - Long.parseLong(summary.get(TOTAL_POSITION_DELETES));
+        LOG.info("Iceberg table {}.{}.{} row count in summary is {}",
+                tbl.getCatalog().getName(), tbl.getDbName(), tbl.getName(), rows);
+        return rows;
     }
 
 
@@ -667,4 +1070,533 @@ public class IcebergUtils {
         }
         return dataLocation;
     }
+
+    public static HiveCatalog createIcebergHiveCatalog(ExternalCatalog externalCatalog, String name) {
+        HiveCatalog hiveCatalog = new HiveCatalog();
+        hiveCatalog.setConf(externalCatalog.getConfiguration());
+
+        Map<String, String> catalogProperties = externalCatalog.getProperties();
+        if (!catalogProperties.containsKey(HiveCatalog.LIST_ALL_TABLES)) {
+            // This configuration will display all tables (including non-Iceberg type tables),
+            // which can save the time of obtaining table objects.
+            // Later, type checks will be performed when loading the table.
+            catalogProperties.put(HiveCatalog.LIST_ALL_TABLES, "true");
+        }
+        String metastoreUris = catalogProperties.getOrDefault(HMSBaseProperties.HIVE_METASTORE_URIS, "");
+        catalogProperties.put(CatalogProperties.URI, metastoreUris);
+        hiveCatalog.initialize(name, catalogProperties);
+        return hiveCatalog;
+    }
+
+    // Retrieve the manifest files that match the query based on partitions in filter
+    public static CloseableIterable<ManifestFile> getMatchingManifest(
+                List<ManifestFile> dataManifests,
+                Map<Integer, PartitionSpec> specsById,
+                Expression dataFilter) {
+        LoadingCache<Integer, ManifestEvaluator> evalCache = Caffeine.newBuilder()
+                .build(
+                        specId -> {
+                            PartitionSpec spec = specsById.get(specId);
+                            return ManifestEvaluator.forPartitionFilter(
+                                    Expressions.and(
+                                            Expressions.alwaysTrue(),
+                                            Projections.inclusive(spec, true).project(dataFilter)),
+                                    spec,
+                                    true);
+                        });
+
+        CloseableIterable<ManifestFile> matchingManifests = CloseableIterable.filter(
+                CloseableIterable.withNoopClose(dataManifests),
+                manifest -> evalCache.get(manifest.partitionSpecId()).eval(manifest));
+
+        matchingManifests =
+                CloseableIterable.filter(
+                        matchingManifests,
+                        manifest -> manifest.hasAddedFiles() || manifest.hasExistingFiles());
+
+        return matchingManifests;
+    }
+
+    // get snapshot id from query like 'for version/time as of' or '@branch/@tag'
+    public static IcebergTableQueryInfo getQuerySpecSnapshot(
+            Table table,
+            Optional<TableSnapshot> queryTableSnapshot,
+            Optional<TableScanParams> scanParams) throws UserException {
+
+        Preconditions.checkArgument(
+                queryTableSnapshot.isPresent() || isIcebergBranchOrTag(scanParams),
+                "should spec version or time or branch or tag");
+
+        // not support `select * from tb@branch/tag(b) for version/time as of ...`
+        Preconditions.checkArgument(
+                !(queryTableSnapshot.isPresent() && isIcebergBranchOrTag(scanParams)),
+                "could not spec a version/time with tag/branch");
+
+        // solve @branch/@tag
+        if (scanParams.isPresent()) {
+            String refName;
+            TableScanParams params = scanParams.get();
+            if (!params.getMapParams().isEmpty()) {
+                refName = params.getMapParams().get("name");
+            } else {
+                refName = params.getListParams().get(0);
+            }
+            SnapshotRef snapshotRef = table.refs().get(refName);
+            if (params.isBranch()) {
+                if (snapshotRef == null || !snapshotRef.isBranch()) {
+                    throw new UserException("Table " + table.name() + " does not have branch named " + refName);
+                }
+            } else {
+                if (snapshotRef == null || !snapshotRef.isTag()) {
+                    throw new UserException("Table " + table.name() + " does not have tag named " + refName);
+                }
+            }
+            return new IcebergTableQueryInfo(
+                snapshotRef.snapshotId(),
+                refName,
+                SnapshotUtil.schemaFor(table, refName).schemaId());
+        }
+
+        // solve version/time as of
+        String value = queryTableSnapshot.get().getValue();
+        TableSnapshot.VersionType type = queryTableSnapshot.get().getType();
+        if (type == TableSnapshot.VersionType.VERSION) {
+            if (SNAPSHOT_ID.matcher(value).matches()) {
+                long snapshotId = Long.parseLong(value);
+                Snapshot snapshot = table.snapshot(snapshotId);
+                if (snapshot == null) {
+                    throw new UserException("Table " + table.name() + " does not have snapshotId " + value);
+                }
+                return new IcebergTableQueryInfo(
+                    snapshotId,
+                    null,
+                    snapshot.schemaId()
+                );
+            }
+
+            if (!table.refs().containsKey(value)) {
+                throw new UserException("Table " + table.name() + " does not have tag or branch named " + value);
+            }
+            return new IcebergTableQueryInfo(
+                table.refs().get(value).snapshotId(),
+                value,
+                SnapshotUtil.schemaFor(table, value).schemaId()
+            );
+        } else {
+            long timestamp = TimeUtils.timeStringToLong(value, TimeUtils.getTimeZone());
+            if (timestamp < 0) {
+                throw new DateTimeException("can't parse time: " + value);
+            }
+            long snapshotId = SnapshotUtil.snapshotIdAsOfTime(table, timestamp);
+            return new IcebergTableQueryInfo(
+                snapshotId,
+                null,
+                table.snapshot(snapshotId).schemaId()
+                );
+        }
+    }
+
+    public static boolean isIcebergBranchOrTag(Optional<TableScanParams> scanParams) {
+        if (scanParams == null || !scanParams.isPresent()) {
+            return false;
+        }
+        TableScanParams params = scanParams.get();
+        if (params.isBranch() || params.isTag()) {
+            if (!params.getMapParams().isEmpty()) {
+                Preconditions.checkArgument(
+                        params.getMapParams().containsKey("name"),
+                        "must contain key 'name' in params"
+                );
+            } else {
+                Preconditions.checkArgument(
+                        params.getListParams().size() == 1
+                                && params.getListParams().get(0) != null,
+                        "must contain a branch/tag name in params"
+                );
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // read schema from external schema cache
+    public static IcebergSchemaCacheValue getSchemaCacheValue(ExternalTable dorisTable, long schemaId) {
+        Optional<SchemaCacheValue> schemaCacheValue = schemaCache(dorisTable.getCatalog()).getSchemaValue(
+                new IcebergSchemaCacheKey(dorisTable.getOrBuildNameMapping(), schemaId));
+        if (!schemaCacheValue.isPresent()) {
+            throw new CacheException("failed to getSchema for: %s.%s.%s.%s",
+                    null, dorisTable.getCatalog().getName(), dorisTable.getDbName(), dorisTable.getName(), schemaId);
+        }
+        return (IcebergSchemaCacheValue) schemaCacheValue.get();
+    }
+
+    public static IcebergSnapshot getLatestIcebergSnapshot(Table table) {
+        Snapshot snapshot = table.currentSnapshot();
+        long snapshotId = snapshot == null ? IcebergUtils.UNKNOWN_SNAPSHOT_ID : snapshot.snapshotId();
+        // Use the latest table schema even if the current snapshot doesn't advance its schemaId,
+        // e.g. schema-only changes without a new snapshot.
+        long schemaId = table.schema().schemaId();
+        return new IcebergSnapshot(snapshotId, schemaId);
+    }
+
+    public static IcebergPartitionInfo loadPartitionInfo(ExternalTable dorisTable, Table table, long snapshotId)
+            throws AnalysisException {
+        // snapshotId == UNKNOWN_SNAPSHOT_ID means this is an empty table, haven't contained any snapshot yet.
+        if (snapshotId == IcebergUtils.UNKNOWN_SNAPSHOT_ID) {
+            return IcebergPartitionInfo.empty();
+        }
+        return loadPartitionInfo(dorisTable, table, snapshotId, table.snapshot(snapshotId).schemaId());
+    }
+
+    public static IcebergPartitionInfo loadPartitionInfo(ExternalTable dorisTable, Table table, long snapshotId,
+            long schemaId) throws AnalysisException {
+        if (snapshotId == IcebergUtils.UNKNOWN_SNAPSHOT_ID) {
+            return IcebergPartitionInfo.empty();
+        }
+        List<IcebergPartition> icebergPartitions;
+        try {
+            icebergPartitions = dorisTable.getCatalog().getExecutionAuthenticator()
+                    .execute(() -> loadIcebergPartition(table, snapshotId));
+        } catch (Exception e) {
+            String errorMsg = String.format("Failed to get iceberg partition info, table: %s.%s.%s, snapshotId: %s",
+                    dorisTable.getCatalog().getName(), dorisTable.getDbName(), dorisTable.getName(), snapshotId);
+            LOG.warn(errorMsg, e);
+            throw new AnalysisException(errorMsg, e);
+        }
+        Map<String, IcebergPartition> nameToPartition = Maps.newHashMap();
+        Map<String, PartitionItem> nameToPartitionItem = Maps.newHashMap();
+
+        List<Column> partitionColumns = IcebergUtils.getSchemaCacheValue(dorisTable, schemaId).getPartitionColumns();
+        for (IcebergPartition partition : icebergPartitions) {
+            nameToPartition.put(partition.getPartitionName(), partition);
+            String transform = table.specs().get(partition.getSpecId()).fields().get(0).transform().toString();
+            Range<PartitionKey> partitionRange = getPartitionRange(
+                    partition.getPartitionValues().get(0), transform, partitionColumns);
+            PartitionItem item = new RangePartitionItem(partitionRange);
+            nameToPartitionItem.put(partition.getPartitionName(), item);
+        }
+        Map<String, Set<String>> partitionNameMap = mergeOverlapPartitions(nameToPartitionItem);
+        return new IcebergPartitionInfo(nameToPartitionItem, nameToPartition, partitionNameMap);
+    }
+
+    private static List<IcebergPartition> loadIcebergPartition(Table table, long snapshotId) {
+        PartitionsTable partitionsTable = (PartitionsTable) MetadataTableUtils
+                .createMetadataTableInstance(table, MetadataTableType.PARTITIONS);
+        List<IcebergPartition> partitions = Lists.newArrayList();
+        try (CloseableIterable<FileScanTask> tasks = partitionsTable.newScan().useSnapshot(snapshotId).planFiles()) {
+            for (FileScanTask task : tasks) {
+                CloseableIterable<StructLike> rows = task.asDataTask().rows();
+                for (StructLike row : rows) {
+                    partitions.add(generateIcebergPartition(table, row));
+                }
+            }
+        } catch (IOException e) {
+            LOG.warn("Failed to get Iceberg table {} partition info.", table.name(), e);
+        }
+        return partitions;
+    }
+
+    private static IcebergPartition generateIcebergPartition(Table table, StructLike row) {
+        // row format :
+        // 0. partitionData,
+        // 1. spec_id,
+        // 2. record_count,
+        // 3. file_count,
+        // 4. total_data_file_size_in_bytes,
+        // 5. position_delete_record_count,
+        // 6. position_delete_file_count,
+        // 7. equality_delete_record_count,
+        // 8. equality_delete_file_count,
+        // 9. last_updated_at,
+        // 10. last_updated_snapshot_id
+        Preconditions.checkState(!table.spec().fields().isEmpty(), table.name() + " is not a partition table.");
+        int specId = row.get(1, Integer.class);
+        PartitionSpec partitionSpec = table.specs().get(specId);
+        StructProjection partitionData = row.get(0, StructProjection.class);
+        StringBuilder sb = new StringBuilder();
+        List<String> partitionValues = Lists.newArrayList();
+        List<String> transforms = Lists.newArrayList();
+        for (int i = 0; i < partitionSpec.fields().size(); ++i) {
+            PartitionField partitionField = partitionSpec.fields().get(i);
+            Class<?> fieldClass = partitionSpec.javaClasses()[i];
+            int fieldId = partitionField.fieldId();
+            // Iceberg partition field id starts at PARTITION_DATA_ID_START,
+            // So we can get the field index in partitionData using fieldId - PARTITION_DATA_ID_START
+            int index = fieldId - PARTITION_DATA_ID_START;
+            Object o = partitionData.get(index, fieldClass);
+            String fieldValue = o == null ? null : o.toString();
+            String fieldName = partitionField.name();
+            sb.append(fieldName);
+            sb.append("=");
+            sb.append(fieldValue);
+            sb.append("/");
+            partitionValues.add(fieldValue);
+            transforms.add(partitionField.transform().toString());
+        }
+        if (sb.length() > 0) {
+            sb.delete(sb.length() - 1, sb.length());
+        }
+        String partitionName = sb.toString();
+        long recordCount = row.get(2, Long.class);
+        long fileCount = row.get(3, Integer.class);
+        long fileSizeInBytes = row.get(4, Long.class);
+        // last_updated_at and last_updated_snapshot_id are optional, so we need to
+        // handle the null case.
+        long lastUpdateTime;
+        long lastUpdateSnapShotId;
+        try {
+            lastUpdateTime = row.get(9, Long.class);
+        } catch (NullPointerException e) {
+            lastUpdateTime = 0;
+        }
+        try {
+            lastUpdateSnapShotId = row.get(10, Long.class);
+        } catch (NullPointerException e) {
+            lastUpdateSnapShotId = UNKNOWN_SNAPSHOT_ID;
+        }
+        return new IcebergPartition(partitionName, specId, recordCount, fileSizeInBytes, fileCount,
+            lastUpdateTime, lastUpdateSnapShotId, partitionValues, transforms);
+    }
+
+    @VisibleForTesting
+    public static Range<PartitionKey> getPartitionRange(String value, String transform, List<Column> partitionColumns)
+            throws AnalysisException {
+        // For NULL value, create a minimum partition for it.
+        if (value == null) {
+            PartitionKey nullLowKey = PartitionKey.createPartitionKey(
+                    Lists.newArrayList(new PartitionValue("0000-01-01")), partitionColumns);
+            PartitionKey nullUpKey = nullLowKey.successor();
+            return Range.closedOpen(nullLowKey, nullUpKey);
+        }
+        LocalDateTime epoch = Instant.EPOCH.atZone(ZoneId.of("UTC")).toLocalDateTime();
+        LocalDateTime target;
+        LocalDateTime lower;
+        LocalDateTime upper;
+        long longValue = Long.parseLong(value);
+        switch (transform) {
+            case HOUR:
+                target = epoch.plusHours(longValue);
+                lower = LocalDateTime.of(target.getYear(), target.getMonth(), target.getDayOfMonth(),
+                    target.getHour(), 0, 0);
+                upper = lower.plusHours(1);
+                break;
+            case DAY:
+                target = epoch.plusDays(longValue);
+                lower = LocalDateTime.of(target.getYear(), target.getMonth(), target.getDayOfMonth(), 0, 0, 0);
+                upper = lower.plusDays(1);
+                break;
+            case MONTH:
+                target = epoch.plusMonths(longValue);
+                lower = LocalDateTime.of(target.getYear(), target.getMonth(), 1, 0, 0, 0);
+                upper = lower.plusMonths(1);
+                break;
+            case YEAR:
+                target = epoch.plusYears(longValue);
+                lower = LocalDateTime.of(target.getYear(), Month.JANUARY, 1, 0, 0, 0);
+                upper = lower.plusYears(1);
+                break;
+            default:
+                throw new RuntimeException("Unsupported transform " + transform);
+        }
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        Column c = partitionColumns.get(0);
+        Preconditions.checkState(c.getDataType().isDateLikeType(), "Only support date type partition column");
+        if (c.getType().isDate() || c.getType().isDateV2()) {
+            formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        }
+        PartitionValue lowerValue = new PartitionValue(lower.format(formatter));
+        PartitionValue upperValue = new PartitionValue(upper.format(formatter));
+        PartitionKey lowKey = PartitionKey.createPartitionKey(Lists.newArrayList(lowerValue), partitionColumns);
+        PartitionKey upperKey =  PartitionKey.createPartitionKey(Lists.newArrayList(upperValue), partitionColumns);
+        return Range.closedOpen(lowKey, upperKey);
+    }
+
+    /**
+     * Merge overlapped iceberg partitions into one Doris partition.
+     */
+    @VisibleForTesting
+    public static Map<String, Set<String>> mergeOverlapPartitions(Map<String, PartitionItem> originPartitions) {
+        List<Map.Entry<String, PartitionItem>> entries = sortPartitionMap(originPartitions);
+        Map<String, Set<String>> map = Maps.newHashMap();
+        for (int i = 0; i < entries.size() - 1; i++) {
+            Range<PartitionKey> firstValue = entries.get(i).getValue().getItems();
+            String firstKey = entries.get(i).getKey();
+            Range<PartitionKey> secondValue = entries.get(i + 1).getValue().getItems();
+            String secondKey = entries.get(i + 1).getKey();
+            // If the first entry enclose the second one, remove the second entry and keep a record in the return map.
+            // So we can track the iceberg partitions those contained by one Doris partition.
+            while (i < entries.size() && firstValue.encloses(secondValue)) {
+                originPartitions.remove(secondKey);
+                map.putIfAbsent(firstKey, Sets.newHashSet(firstKey));
+                String finalSecondKey = secondKey;
+                map.computeIfPresent(firstKey, (key, value) -> {
+                    value.add(finalSecondKey);
+                    return value;
+                });
+                i++;
+                if (i >= entries.size() - 1) {
+                    break;
+                }
+                secondValue = entries.get(i + 1).getValue().getItems();
+                secondKey = entries.get(i + 1).getKey();
+            }
+        }
+        return map;
+    }
+
+    /**
+     * Sort the given map entries by PartitionItem Range(LOW, HIGH)
+     * When comparing two ranges, the one with smaller LOW value is smaller than the other one.
+     * If two ranges have same values of LOW, the one with larger HIGH value is smaller.
+     *
+     * For now, we only support year, month, day and hour,
+     * so it is impossible to have two partially intersect partitions.
+     * One range is either enclosed by another or has no intersection at all with another.
+     *
+     *
+     * For example, we have these 4 ranges:
+     * [10, 20), [30, 40), [0, 30), [10, 15)
+     *
+     * After sort, they become:
+     * [0, 30), [10, 20), [10, 15), [30, 40)
+     */
+    @VisibleForTesting
+    public static List<Map.Entry<String, PartitionItem>> sortPartitionMap(Map<String, PartitionItem> originPartitions) {
+        List<Map.Entry<String, PartitionItem>> entries = new ArrayList<>(originPartitions.entrySet());
+        entries.sort(new RangeComparator());
+        return entries;
+    }
+
+    public static class RangeComparator implements Comparator<Map.Entry<String, PartitionItem>> {
+        @Override
+        public int compare(Map.Entry<String, PartitionItem> p1, Map.Entry<String, PartitionItem> p2) {
+            PartitionItem value1 = p1.getValue();
+            PartitionItem value2 = p2.getValue();
+            if (value1 instanceof RangePartitionItem && value2 instanceof RangePartitionItem) {
+                Range<PartitionKey> items1 = value1.getItems();
+                Range<PartitionKey> items2 = value2.getItems();
+                if (!items1.hasLowerBound()) {
+                    return -1;
+                }
+                if (!items2.hasLowerBound()) {
+                    return 1;
+                }
+                PartitionKey upper1 = items1.upperEndpoint();
+                PartitionKey lower1 = items1.lowerEndpoint();
+                PartitionKey upper2 = items2.upperEndpoint();
+                PartitionKey lower2 = items2.lowerEndpoint();
+                int compareLow = lower1.compareTo(lower2);
+                return compareLow == 0 ? upper2.compareTo(upper1) : compareLow;
+            }
+            return 0;
+        }
+    }
+
+    public static IcebergSchemaCacheValue getSchemaCacheValue(ExternalTable dorisTable, IcebergSnapshotCacheValue sv) {
+        return getSchemaCacheValue(dorisTable, sv.getSnapshot().getSchemaId());
+    }
+
+    public static IcebergSnapshotCacheValue getLatestSnapshotCacheValue(ExternalTable dorisTable) {
+        return icebergMetadataCache(dorisTable.getCatalog()).getSnapshotCache(dorisTable);
+    }
+
+    public static IcebergSnapshotCacheValue getSnapshotCacheValue(Optional<MvccSnapshot> snapshot,
+            ExternalTable dorisTable) {
+        if (snapshot.isPresent() && snapshot.get() instanceof IcebergMvccSnapshot) {
+            return ((IcebergMvccSnapshot) snapshot.get()).getSnapshotCacheValue();
+        }
+        return getLatestSnapshotCacheValue(dorisTable);
+    }
+
+    public static IcebergSnapshotCacheValue getSnapshotCacheValue(
+            Optional<TableSnapshot> tableSnapshot,
+            ExternalTable dorisTable,
+            Optional<TableScanParams> scanParams) {
+        if (tableSnapshot.isPresent() || IcebergUtils.isIcebergBranchOrTag(scanParams)) {
+            // If a snapshot is specified, use the specified snapshot and the corresponding schema (not latest).
+            Table icebergTable = getIcebergTable(dorisTable);
+            IcebergTableQueryInfo info;
+            try {
+                info = getQuerySpecSnapshot(icebergTable, tableSnapshot, scanParams);
+            } catch (UserException e) {
+                throw new RuntimeException(e);
+            }
+            return new IcebergSnapshotCacheValue(
+                    IcebergPartitionInfo.empty(),
+                    new IcebergSnapshot(info.getSnapshotId(), info.getSchemaId()));
+        }
+        return getLatestSnapshotCacheValue(dorisTable);
+    }
+
+    public static List<Column> getIcebergSchema(ExternalTable dorisTable) {
+        Optional<MvccSnapshot> snapshotFromContext = MvccUtil.getSnapshotFromContext(dorisTable);
+        IcebergSnapshotCacheValue cacheValue = IcebergUtils.getSnapshotCacheValue(snapshotFromContext, dorisTable);
+        return IcebergUtils.getSchemaCacheValue(dorisTable, cacheValue).getSchema();
+    }
+
+    public static List<Column> getIcebergPartitionColumns(Optional<MvccSnapshot> snapshot, ExternalTable dorisTable) {
+        IcebergSnapshotCacheValue snapshotValue = getSnapshotCacheValue(snapshot, dorisTable);
+        return getSchemaCacheValue(dorisTable, snapshotValue).getPartitionColumns();
+    }
+
+    public static Map<String, PartitionItem> getIcebergPartitionItems(Optional<MvccSnapshot> snapshot,
+            ExternalTable dorisTable) {
+        return getSnapshotCacheValue(snapshot, dorisTable).getPartitionInfo().getNameToPartitionItem();
+    }
+
+    public static View getIcebergView(ExternalTable dorisTable) {
+        return icebergMetadataCache(dorisTable.getCatalog()).getIcebergView(dorisTable);
+    }
+
+    public static Optional<SchemaCacheValue> loadSchemaCacheValue(
+            ExternalTable dorisTable, long schemaId, boolean isView) {
+        return isView
+                ? loadViewSchemaCacheValue(dorisTable, schemaId)
+                : loadTableSchemaCacheValue(dorisTable, schemaId);
+    }
+
+    private static Optional<SchemaCacheValue> loadViewSchemaCacheValue(ExternalTable dorisTable, long schemaId) {
+        List<Column> schema = IcebergUtils.getSchema(dorisTable, schemaId, true, null);
+        return Optional.of(new IcebergSchemaCacheValue(schema, Lists.newArrayList()));
+    }
+
+    private static Optional<SchemaCacheValue> loadTableSchemaCacheValue(ExternalTable dorisTable, long schemaId) {
+        Table icebergTable = IcebergUtils.getIcebergTable(dorisTable);
+        List<Column> schema = IcebergUtils.getSchema(dorisTable, schemaId, false, icebergTable);
+        // get table partition column info
+        List<Column> tmpColumns = Lists.newArrayList();
+        PartitionSpec spec = icebergTable.spec();
+        for (PartitionField field : spec.fields()) {
+            Types.NestedField col = icebergTable.schema().findField(field.sourceId());
+            for (Column c : schema) {
+                if (c.getName().equalsIgnoreCase(col.name())) {
+                    tmpColumns.add(c);
+                    break;
+                }
+            }
+        }
+        return Optional.of(new IcebergSchemaCacheValue(schema, tmpColumns));
+    }
+
+    public static String showCreateView(IcebergExternalTable icebergExternalTable) {
+        return String.format("CREATE VIEW `%s` AS ", icebergExternalTable.getName())
+                +
+                icebergExternalTable.getViewText();
+    }
+
+    public static IcebergManifestCache getManifestCache(ExternalCatalog catalog) {
+        return icebergMetadataCache(catalog).getManifestCache();
+    }
+
+    public static boolean isManifestCacheEnabled(ExternalCatalog catalog) {
+        CacheSpec spec = CacheSpec.fromProperties(catalog.getProperties(),
+                IcebergExternalCatalog.ICEBERG_MANIFEST_CACHE_ENABLE,
+                IcebergExternalCatalog.DEFAULT_ICEBERG_MANIFEST_CACHE_ENABLE,
+                IcebergExternalCatalog.ICEBERG_MANIFEST_CACHE_TTL_SECOND,
+                IcebergExternalCatalog.DEFAULT_ICEBERG_MANIFEST_CACHE_TTL_SECOND,
+                IcebergExternalCatalog.ICEBERG_MANIFEST_CACHE_CAPACITY,
+                IcebergExternalCatalog.DEFAULT_ICEBERG_MANIFEST_CACHE_CAPACITY);
+        return CacheSpec.isCacheEnabled(spec.isEnable(), spec.getTtlSecond(), spec.getCapacity());
+    }
+
 }

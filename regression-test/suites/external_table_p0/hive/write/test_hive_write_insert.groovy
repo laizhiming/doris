@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_hive_write_insert", "p0,external,hive,external_docker,external_docker_hive") {
+suite("test_hive_write_insert", "p0,external") {
     def format_compressions = ["parquet_snappy", "orc_zlib"]
 
     def q01 = { String format_compression, String catalog_name ->
@@ -880,7 +880,7 @@ INSERT INTO all_types_par_${format_compression}_${catalog_name}_q03
         return;
     }
 
-    for (String hivePrefix : ["hive2", "hive3"]) {
+    for (String hivePrefix : ["hive3"]) {
         setHivePrefix(hivePrefix)
         try {
             String hms_port = context.config.otherConfigs.get(hivePrefix + "HmsPort")

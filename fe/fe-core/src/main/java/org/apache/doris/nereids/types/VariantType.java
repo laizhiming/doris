@@ -18,26 +18,121 @@
 package org.apache.doris.nereids.types;
 
 import org.apache.doris.catalog.Type;
-import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.types.coercion.PrimitiveType;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Variant type in Nereids.
  * Why Variant is not complex type? Since it's nested structure is not pre-defined, then using
  * primitive type will be easy to handle meta info in FE.
+ * Also, could predefine some fields of nested columns.
+ * Example: VARIANT <`a.b`:INT, `a.c`:DATETIMEV2>
+ *
  */
-@Developing
 public class VariantType extends PrimitiveType {
 
-    public static final VariantType INSTANCE = new VariantType();
+    public static final VariantType INSTANCE = new VariantType(0);
 
     public static final int WIDTH = 24;
 
+    private final int variantMaxSubcolumnsCount;
+
+    private final boolean enableTypedPathsToSparse;
+
+    private final int variantMaxSparseColumnStatisticsSize;
+
+    private final List<VariantField> predefinedFields;
+    private final int variantSparseHashShardCount;
+
+    private final boolean enableVariantDocMode;
+    private final long variantDocMaterializationMinRows;
+    private final int variantDocShardCount;
+    private final boolean enableNestedGroup;
+
+    /**
+     * Creates a Variant type without predefined fields and only configures the max subcolumn limit.
+     *
+     * @param variantMaxSubcolumnsCount max number of subcolumns allowed (0 means unlimited)
+     */
+    public VariantType(int variantMaxSubcolumnsCount) {
+        this.variantMaxSubcolumnsCount = variantMaxSubcolumnsCount;
+        this.predefinedFields = Lists.newArrayList();
+        this.enableTypedPathsToSparse = false;
+        this.variantMaxSparseColumnStatisticsSize = 10000;
+        this.variantSparseHashShardCount = 0;
+        this.enableVariantDocMode = false;
+        this.variantDocMaterializationMinRows = 0L;
+        this.variantDocShardCount = 64;
+        this.enableNestedGroup = false;
+    }
+
+    /**
+     *   Contains predefined fields like struct
+     */
+    public VariantType(List<VariantField> fields) {
+        this.predefinedFields = ImmutableList.copyOf(Objects.requireNonNull(fields, "fields should not be null"));
+        this.variantMaxSubcolumnsCount = 0;
+        this.enableTypedPathsToSparse = false;
+        this.variantMaxSparseColumnStatisticsSize = 10000;
+        this.variantSparseHashShardCount = 0;
+        this.enableVariantDocMode = false;
+        this.variantDocMaterializationMinRows = 0L;
+        this.variantDocShardCount = 64;
+        this.enableNestedGroup = false;
+    }
+
+    /**
+     * Creates a Variant type with predefined fields and advanced optional properties.
+     *
+     * @param fields predefined variant path fields
+     * @param variantMaxSubcolumnsCount max number of subcolumns allowed
+     * @param enableTypedPathsToSparse whether typed paths should be materialized as sparse columns
+     * @param variantMaxSparseColumnStatisticsSize upper bound of sparse path statistics entries
+     * @param variantSparseHashShardCount hash buckets count when writing sparse shards
+     * @param enableVariantDocMode whether to enable variant doc snapshot writing mode
+     * @param variantDocMaterializationMinRows minimum rows to generate doc snapshot columns
+     */
+    public VariantType(List<VariantField> fields, int variantMaxSubcolumnsCount,
+            boolean enableTypedPathsToSparse, int variantMaxSparseColumnStatisticsSize,
+            int variantSparseHashShardCount, boolean enableVariantDocMode,
+            long variantDocMaterializationMinRows, int variantDocShardCount,
+            boolean enableNestedGroup) {
+        this.predefinedFields = ImmutableList.copyOf(Objects.requireNonNull(fields, "fields should not be null"));
+        this.variantMaxSubcolumnsCount = variantMaxSubcolumnsCount;
+        this.enableTypedPathsToSparse = enableTypedPathsToSparse;
+        this.variantMaxSparseColumnStatisticsSize = variantMaxSparseColumnStatisticsSize;
+        this.variantSparseHashShardCount = variantSparseHashShardCount;
+        this.enableVariantDocMode = enableVariantDocMode;
+        this.variantDocMaterializationMinRows = variantDocMaterializationMinRows;
+        this.variantDocShardCount = variantDocShardCount;
+        this.enableNestedGroup = enableNestedGroup;
+    }
+
+    @Override
+    public DataType conversion() {
+        return new VariantType(predefinedFields.stream().map(VariantField::conversion)
+                                .collect(Collectors.toList()), variantMaxSubcolumnsCount, enableTypedPathsToSparse,
+                                    variantMaxSparseColumnStatisticsSize, variantSparseHashShardCount,
+                                    enableVariantDocMode, variantDocMaterializationMinRows,
+                                    variantDocShardCount, enableNestedGroup);
+    }
+
     @Override
     public Type toCatalogDataType() {
-        return Type.VARIANT;
+        org.apache.doris.catalog.VariantType type = new org.apache.doris.catalog.VariantType(predefinedFields.stream()
+                .map(VariantField::toCatalogDataType)
+                .collect(Collectors.toCollection(ArrayList::new)), variantMaxSubcolumnsCount, enableTypedPathsToSparse,
+                     variantMaxSparseColumnStatisticsSize, variantSparseHashShardCount, enableVariantDocMode,
+                     variantDocMaterializationMinRows, variantDocShardCount, enableNestedGroup);
+        return type;
     }
 
     @Override
@@ -46,8 +141,52 @@ public class VariantType extends PrimitiveType {
     }
 
     @Override
-    public String simpleString() {
-        return "variant";
+    public boolean isAssignableFrom(DataType targetDataType) {
+        // Any VariantType is assignable to any other VariantType,
+        // regardless of property differences (maxSubcolumns, etc.)
+        if (targetDataType instanceof VariantType) {
+            return true;
+        }
+        return super.isAssignableFrom(targetDataType);
+    }
+
+    @Override
+    public String toSql() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("variant");
+        sb.append("<");
+        if (!predefinedFields.isEmpty()) {
+            sb.append(predefinedFields.stream().map(VariantField::toSql).collect(Collectors.joining(",")));
+            sb.append(",");
+        }
+
+        sb.append("PROPERTIES (");
+        if (enableVariantDocMode) {
+            sb.append("\"variant_enable_doc_mode\" = \"")
+                                    .append(String.valueOf(enableVariantDocMode)).append("\"");
+            sb.append(",");
+            sb.append("\"variant_doc_materialization_min_rows\" = \"")
+                                    .append(String.valueOf(variantDocMaterializationMinRows)).append("\"");
+            sb.append(",");
+            sb.append("\"variant_doc_hash_shard_count\" = \"")
+                                    .append(String.valueOf(variantDocShardCount)).append("\"");
+        } else {
+            sb.append("\"variant_max_subcolumns_count\" = \"")
+                                    .append(String.valueOf(variantMaxSubcolumnsCount)).append("\"");
+            sb.append(",");
+            sb.append("\"variant_enable_typed_paths_to_sparse\" = \"")
+                                    .append(String.valueOf(enableTypedPathsToSparse)).append("\"");
+            sb.append(",");
+            sb.append("\"variant_max_sparse_column_statistics_size\" = \"")
+                                    .append(String.valueOf(variantMaxSparseColumnStatisticsSize))
+                                    .append("\"");
+            sb.append(",");
+            sb.append("\"variant_sparse_hash_shard_count\" = \"")
+                                    .append(String.valueOf(variantSparseHashShardCount))
+                                    .append("\"");
+        }
+        sb.append(")>");
+        return sb.toString();
     }
 
     @Override
@@ -58,12 +197,41 @@ public class VariantType extends PrimitiveType {
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        return super.equals(o);
+        VariantType other = (VariantType) o;
+        return this.variantMaxSubcolumnsCount == other.variantMaxSubcolumnsCount
+                    && this.enableTypedPathsToSparse == other.enableTypedPathsToSparse
+                    && this.enableVariantDocMode == other.enableVariantDocMode
+                    && this.variantDocMaterializationMinRows == other.variantDocMaterializationMinRows
+                    && Objects.equals(predefinedFields, other.predefinedFields);
+    }
+
+    @Override
+    public boolean equalsForRecursiveCte(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        VariantType other = (VariantType) o;
+        if (predefinedFields.size() != other.predefinedFields.size()) {
+            return false;
+        }
+        for (int i = 0; i < predefinedFields.size(); ++i) {
+            if (!predefinedFields.get(i).getDataType()
+                    .equalsForRecursiveCte(other.predefinedFields.get(i).getDataType())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode());
+        return Objects.hash(super.hashCode(), variantMaxSubcolumnsCount, enableTypedPathsToSparse,
+                            variantMaxSparseColumnStatisticsSize, variantSparseHashShardCount,
+                            enableVariantDocMode, variantDocMaterializationMinRows, variantDocShardCount,
+                            predefinedFields);
     }
 
     @Override
@@ -72,12 +240,51 @@ public class VariantType extends PrimitiveType {
     }
 
     @Override
-    public String toSql() {
-        return "VARIANT";
-    }
-
-    @Override
     public String toString() {
         return toSql();
+    }
+
+    public List<VariantField> getPredefinedFields() {
+        return predefinedFields;
+    }
+
+    /**
+     * Find the first matching VariantField for the given field name.
+     * The matching is done in definition order, so the first matching pattern wins.
+     *
+     * @param fieldName the field name to match
+     * @return Optional containing the matching VariantField, or empty if no match
+     */
+    public Optional<VariantField> findMatchingField(String fieldName) {
+        for (VariantField field : predefinedFields) {
+            if (field.matches(fieldName)) {
+                return Optional.of(field);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public int getVariantMaxSubcolumnsCount() {
+        return variantMaxSubcolumnsCount;
+    }
+
+    public int getVariantMaxSparseColumnStatisticsSize() {
+        return variantMaxSparseColumnStatisticsSize;
+    }
+
+    public int getVariantSparseHashShardCount() {
+        return variantSparseHashShardCount;
+    }
+
+    public boolean getEnableVariantDocMode() {
+        return enableVariantDocMode;
+    }
+
+    public long getvariantDocMaterializationMinRows() {
+        return variantDocMaterializationMinRows;
+    }
+
+    public int getVariantDocShardCount() {
+        return variantDocShardCount;
     }
 }

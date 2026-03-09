@@ -20,11 +20,11 @@
 #include <brpc/channel.h>
 #include <brpc/server.h>
 
+#include "exec/sink/load_stream_stub.h"
 #include "gtest/gtest_pred_impl.h"
-#include "olap/olap_common.h"
+#include "storage/olap_common.h"
 #include "util/debug/leakcheck_disabler.h"
 #include "util/faststring.h"
-#include "vec/sink/load_stream_stub.h"
 
 namespace doris {
 
@@ -59,8 +59,9 @@ class StreamSinkFileWriterTest : public testing::Test {
 
         // APPEND_DATA
         virtual Status append_data(int64_t partition_id, int64_t index_id, int64_t tablet_id,
-                                   int64_t segment_id, uint64_t offset, std::span<const Slice> data,
-                                   bool segment_eos = false) override {
+                                   int32_t segment_id, uint64_t offset, std::span<const Slice> data,
+                                   bool segment_eos = false,
+                                   FileType file_type = FileType::SEGMENT_FILE) override {
             EXPECT_EQ(PARTITION_ID, partition_id);
             EXPECT_EQ(INDEX_ID, index_id);
             EXPECT_EQ(TABLET_ID, tablet_id);

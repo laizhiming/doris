@@ -45,6 +45,9 @@ public class UpsertRecord {
 
             @SerializedName(value = "isTempPartition")
             public boolean isTemp;
+
+            @SerializedName(value = "stid")
+            public long subTxnId;
         }
 
         @SerializedName(value = "partitionRecords")
@@ -53,13 +56,22 @@ public class UpsertRecord {
         @SerializedName(value = "indexIds")
         private Set<Long> indexIds;
 
-        public TableRecord(Set<Long> indexIds) {
+        @SerializedName(value = "deltaRows")
+        private Map<Long, Long> deltaRows; // tablet id -> delta rows, null if not exist
+
+        public TableRecord(Set<Long> indexIds, Map<Long, Long> deltaRows) {
             partitionRecords = Lists.newArrayList();
             this.indexIds = indexIds;
+            this.deltaRows = deltaRows;
         }
 
-        public void addPartitionRecord(PartitionCommitInfo partitionCommitInfo) {
+        private void addPartitionRecord(PartitionCommitInfo partitionCommitInfo) {
+            addPartitionRecord(-1, partitionCommitInfo);
+        }
+
+        private void addPartitionRecord(long subTxnId, PartitionCommitInfo partitionCommitInfo) {
             PartitionRecord partitionRecord = new PartitionRecord();
+            partitionRecord.subTxnId = subTxnId;
             partitionRecord.partitionId = partitionCommitInfo.getPartitionId();
             partitionRecord.range = partitionCommitInfo.getPartitionRange();
             partitionRecord.version = partitionCommitInfo.getVersion();
@@ -87,6 +99,8 @@ public class UpsertRecord {
     // pair is (tableId, tableRecord)
     @SerializedName(value = "tableRecords")
     private Map<Long, TableRecord> tableRecords;
+    @SerializedName(value = "stids")
+    private List<Long> subTxnIds;
 
     // construct from TransactionState
     public UpsertRecord(long commitSeq, TransactionState state) {
@@ -98,13 +112,32 @@ public class UpsertRecord {
         tableRecords = Maps.newHashMap();
 
         Map<Long, Set<Long>> loadedTableIndexIds = state.getLoadedTblIndexes();
-        for (TableCommitInfo info : state.getIdToTableCommitInfos().values()) {
-            Set<Long> indexIds = loadedTableIndexIds.get(info.getTableId());
-            TableRecord tableRecord = new TableRecord(indexIds);
-            tableRecords.put(info.getTableId(), tableRecord);
+        Map<Long, Map<Long, Long>> tabletDeltaRows = state.getTableIdToTabletDeltaRows();
+        if (tabletDeltaRows == null) {
+            tabletDeltaRows = Maps.newHashMap();
+        }
+        final Map<Long, Map<Long, Long>> finalTabletDeltaRows = tabletDeltaRows;
+        if (state.getSubTxnIds() != null) {
+            state.getSubTxnIdToTableCommitInfo().forEach((subTxnId, tableCommitInfo) -> {
+                Set<Long> indexIds = loadedTableIndexIds.get(tableCommitInfo.getTableId());
+                Map<Long, Long> deltaRows = finalTabletDeltaRows.get(tableCommitInfo.getTableId());
+                TableRecord tableRecord = tableRecords.compute(tableCommitInfo.getTableId(),
+                        (k, v) -> v == null ? new TableRecord(indexIds, deltaRows) : v);
+                for (PartitionCommitInfo partitionCommitInfo : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                    tableRecord.addPartitionRecord(subTxnId, partitionCommitInfo);
+                }
+            });
+            subTxnIds = state.getSubTxnIds();
+        } else {
+            for (TableCommitInfo info : state.getIdToTableCommitInfos().values()) {
+                Set<Long> indexIds = loadedTableIndexIds.get(info.getTableId());
+                Map<Long, Long> deltaRows = tabletDeltaRows.get(info.getTableId());
+                TableRecord tableRecord = new TableRecord(indexIds, deltaRows);
+                tableRecords.put(info.getTableId(), tableRecord);
 
-            for (PartitionCommitInfo partitionCommitInfo : info.getIdToPartitionCommitInfo().values()) {
-                tableRecord.addPartitionRecord(partitionCommitInfo);
+                for (PartitionCommitInfo partitionCommitInfo : info.getIdToPartitionCommitInfo().values()) {
+                    tableRecord.addPartitionRecord(partitionCommitInfo);
+                }
             }
         }
     }

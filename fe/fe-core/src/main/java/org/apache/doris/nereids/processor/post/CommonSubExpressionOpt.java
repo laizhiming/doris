@@ -22,14 +22,14 @@ import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
-import org.apache.doris.nereids.trees.expressions.WhenClause;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalProject;
 
 import com.google.common.collect.Lists;
 
-import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -65,29 +65,31 @@ public class CommonSubExpressionOpt extends PlanPostProcessor {
         List<List<NamedExpression>> multiLayers = Lists.newArrayList();
         CommonSubExpressionCollector collector = new CommonSubExpressionCollector();
         for (Expression expr : projects) {
-            expr.accept(collector, null);
+            collector.collect(expr);
         }
-        Map<Expression, Alias> aliasMap = new HashMap<>();
+        // use linkedHashMap to make projects order stable
+        Map<Expression, Alias> aliasMap = new LinkedHashMap<>();
         if (!collector.commonExprByDepth.isEmpty()) {
+            Set<Alias> previousAlias = new HashSet<>();
             for (int i = 1; i <= collector.commonExprByDepth.size(); i++) {
                 List<NamedExpression> layer = Lists.newArrayList();
                 layer.addAll(inputSlots);
                 Set<Expression> exprsInDepth = CommonSubExpressionCollector
                         .getExpressionsFromDepthMap(i, collector.commonExprByDepth);
                 exprsInDepth.forEach(expr -> {
-                    if (!(expr instanceof WhenClause)) {
-                        // case whenClause1 whenClause2 END
-                        // whenClause should not be regarded as common-sub-expression, because
-                        // cse will be replaced by a slot, after rewrite the case clause becomes:
-                        // 'case slot whenClause2 END'
-                        // This is illegal.
-                        Expression rewritten = expr.accept(ExpressionReplacer.INSTANCE, aliasMap);
-                        // if rewritten is already alias, use it directly, because in materialized view rewriting
-                        // Should keep out slot immutably after rewritten successfully
-                        aliasMap.put(expr, rewritten instanceof Alias ? (Alias) rewritten : new Alias(rewritten));
-                    }
+                    Expression rewritten = expr.accept(ExpressionReplacer.INSTANCE, aliasMap);
+                    // if rewritten is already alias, use it directly, because in materialized view rewriting
+                    // Should keep out slot immutably after rewritten successfully
+                    aliasMap.put(expr, rewritten instanceof Alias ? (Alias) rewritten : new Alias(rewritten));
                 });
-                layer.addAll(aliasMap.values());
+                for (Alias alias : aliasMap.values()) {
+                    if (previousAlias.contains(alias)) {
+                        layer.add(alias.toSlot());
+                    } else {
+                        layer.add(alias);
+                        previousAlias.add(alias);
+                    }
+                }
                 multiLayers.add(layer);
             }
             // final layer

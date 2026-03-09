@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_jdbc_query_tvf") {
+suite("test_jdbc_query_tvf", "p0,external") {
 
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String user = "test_jdbc_user";
         String pwd = '123456';
-        String catalog_name = "mysql_jdbc_catalog";
+        String catalog_name = "test_jdbc_query_tvf";
         String mysql_port = context.config.otherConfigs.get("mysql_57_port");
 
         sql """drop catalog if exists ${catalog_name} """
@@ -36,7 +36,8 @@ suite("test_jdbc_query_tvf") {
             "password"="123456",
             "jdbc_url" = "jdbc:mysql://${externalEnvIp}:${mysql_port}/doris_test",
             "driver_url" = "${driver_url}",
-            "driver_class" = "com.mysql.cj.jdbc.Driver"
+            "driver_class" = "com.mysql.cj.jdbc.Driver",
+            "enable.mapping.varbinary" = "true"
         );"""
 
         order_qt_sql """desc function query('catalog' = '${catalog_name}', 'query' = 'select * from doris_test.all_types') """

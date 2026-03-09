@@ -123,10 +123,10 @@ public class ForeignKeyContext {
     }
 
     void putSlot(SlotReference slot) {
-        if (!slot.getColumn().isPresent()) {
+        if (!slot.getOriginalColumn().isPresent()) {
             return;
         }
-        Column c = slot.getColumn().get();
+        Column c = slot.getOriginalColumn().get();
         slotToColumn.put(slot, c);
     }
 
@@ -136,13 +136,28 @@ public class ForeignKeyContext {
         }
     }
 
+    private boolean isHiddenConjunct(Expression expression) {
+        for (Slot slot : expression.getInputSlots()) {
+            if (slot instanceof SlotReference
+                    && ((SlotReference) slot).getOriginalColumn().isPresent()
+                    && ((SlotReference) slot).getOriginalColumn().get().isDeleteSignColumn()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void addFilter(LogicalFilter<?> filter) {
-        filter.getOutput().stream()
-                .filter(slotToColumn::containsKey)
-                .forEach(slot -> {
-                    slotWithPredicates.computeIfAbsent(slot, v -> new HashSet<>());
-                    slotWithPredicates.get(slot).addAll(filter.getConjuncts());
-                });
+        for (Slot s : filter.getOutput()) {
+            if (slotToColumn.containsKey(s)) {
+                slotWithPredicates.computeIfAbsent(s, v -> new HashSet<>());
+                for (Expression conjunct : filter.getConjuncts()) {
+                    if (!isHiddenConjunct(conjunct)) {
+                        slotWithPredicates.get(s).add(conjunct);
+                    }
+                }
+            }
+        }
     }
 
     private void expirePrimaryKey(Plan plan) {

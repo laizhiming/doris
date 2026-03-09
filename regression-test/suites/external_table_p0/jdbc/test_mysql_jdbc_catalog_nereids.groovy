@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_mysql_jdbc_catalog_nereids", "p0,external,mysql,external_docker,external_docker_mysql") {
+suite("test_mysql_jdbc_catalog_nereids", "p0,external") {
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String catalog_name = "mysql_jdbc_catalog_nereids";
         String internal_db_name = "regression_test_jdbc_catalog_p0";
@@ -113,7 +113,7 @@ suite("test_mysql_jdbc_catalog_nereids", "p0,external,mysql,external_docker,exte
         order_qt_ex_tb18  """ select * from ${ex_tb18} order by num_tinyint; """
         order_qt_ex_tb19  """ select * from ${ex_tb19} order by date_value; """
         order_qt_ex_tb20  """ select * from ${ex_tb20} order by decimal_normal; """
-        order_qt_information_schema """ show tables from information_schema; """
+        order_qt_information_schema """ show tables from information_schema like "processlist"; """
 
         // test insert
         String uuid1 = UUID.randomUUID().toString();

@@ -17,39 +17,28 @@
 
 package org.apache.doris.mysql.privilege;
 
-import org.apache.doris.analysis.SetUserPropertyVar;
+import org.apache.doris.analysis.ResourceTypeEnum;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
+import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.FeMetaVersion;
-import org.apache.doris.common.LoadException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
-import org.apache.doris.load.DppConfig;
-import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.nereids.trees.plans.commands.info.SetUserPropertyVarOp;
 import org.apache.doris.resource.Tag;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -61,58 +50,46 @@ import java.util.regex.Pattern;
  * This usually means that the cluster administrator force user restrictions.
  * Users cannot modify these SessionVeriables with the same name.
  */
-public class UserProperty implements Writable {
+public class UserProperty {
     private static final Logger LOG = LogManager.getLogger(UserProperty.class);
     // advanced properties
-    private static final String PROP_MAX_USER_CONNECTIONS = "max_user_connections";
-    private static final String PROP_MAX_QUERY_INSTANCES = "max_query_instances";
-    private static final String PROP_PARALLEL_FRAGMENT_EXEC_INSTANCE_NUM = "parallel_fragment_exec_instance_num";
-    private static final String PROP_RESOURCE_TAGS = "resource_tags";
-    private static final String PROP_RESOURCE = "resource";
-    private static final String PROP_SQL_BLOCK_RULES = "sql_block_rules";
-    private static final String PROP_CPU_RESOURCE_LIMIT = "cpu_resource_limit";
-    private static final String PROP_EXEC_MEM_LIMIT = "exec_mem_limit";
-    private static final String PROP_USER_QUERY_TIMEOUT = "query_timeout";
+    public static final String PROP_MAX_USER_CONNECTIONS = "max_user_connections";
+    public static final String PROP_MAX_QUERY_INSTANCES = "max_query_instances";
+    public static final String PROP_PARALLEL_FRAGMENT_EXEC_INSTANCE_NUM = "parallel_fragment_exec_instance_num";
+    public static final String PROP_RESOURCE_TAGS = "resource_tags";
+    public static final String PROP_RESOURCE = "resource";
+    public static final String PROP_SQL_BLOCK_RULES = "sql_block_rules";
+    public static final String PROP_CPU_RESOURCE_LIMIT = "cpu_resource_limit";
+    public static final String PROP_EXEC_MEM_LIMIT = "exec_mem_limit";
+    public static final String PROP_USER_QUERY_TIMEOUT = "query_timeout";
 
-    private static final String PROP_USER_INSERT_TIMEOUT = "insert_timeout";
+    public static final String PROP_USER_INSERT_TIMEOUT = "insert_timeout";
     // advanced properties end
 
-    private static final String PROP_LOAD_CLUSTER = "load_cluster";
-    private static final String PROP_QUOTA = "quota";
-    private static final String PROP_DEFAULT_LOAD_CLUSTER = "default_load_cluster";
+    public static final String PROP_QUOTA = "quota";
 
-    private static final String PROP_WORKLOAD_GROUP = "default_workload_group";
+    public static final String PROP_DEFAULT_INIT_CATALOG = "default_init_catalog";
+    public static final String PROP_WORKLOAD_GROUP = "default_workload_group";
 
     public static final String DEFAULT_CLOUD_CLUSTER = "default_cloud_cluster";
+    public static final String DEFAULT_COMPUTE_GROUP = "default_compute_group";
+
+    public static final String PROP_ENABLE_PREFER_CACHED_ROWSET = "enable_prefer_cached_rowset";
+    public static final String PROP_QUERY_FRESHNESS_TOLERANCE = "query_freshness_tolerance_ms";
 
     // for system user
     public static final Set<Pattern> ADVANCED_PROPERTIES = Sets.newHashSet();
     // for normal user
     public static final Set<Pattern> COMMON_PROPERTIES = Sets.newHashSet();
 
-    @SerializedName(value = "qualifiedUser")
+    @SerializedName(value = "qu", alternate = {"qualifiedUser"})
     private String qualifiedUser;
 
-    @SerializedName(value = "commonProperties")
+    @SerializedName(value = "cp", alternate = {"commonProperties"})
     private CommonUserProperties commonProperties = new CommonUserProperties();
 
-    // load cluster
-    @SerializedName(value = "defaultLoadCluster")
-    private String defaultLoadCluster = null;
-
-    @SerializedName(value = "clusterToDppConfig")
-    private Map<String, DppConfig> clusterToDppConfig = Maps.newHashMap();
-
-    @SerializedName(value = "defaultCloudCluster")
+    @SerializedName(value = "dcc", alternate = {"defaultCloudCluster"})
     private String defaultCloudCluster = null;
-
-    /*
-     *  We keep white list here to save Baidu domain name (BNS) or DNS as white list.
-     *  Each frontend will periodically resolve the domain name to ip, and update the privilege table.
-     *  We never persist the resolved IPs.
-     */
-    @Deprecated
-    private WhiteList whiteList = new WhiteList();
 
     public static final Set<Tag> INVALID_RESOURCE_TAGS;
 
@@ -124,8 +101,6 @@ public class UserProperty implements Writable {
     static {
         ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_MAX_USER_CONNECTIONS + "$", Pattern.CASE_INSENSITIVE));
         ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_RESOURCE + ".", Pattern.CASE_INSENSITIVE));
-        ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_LOAD_CLUSTER + "." + DppConfig.CLUSTER_NAME_REGEX + "."
-                + DppConfig.PRIORITY + "$", Pattern.CASE_INSENSITIVE));
         ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_MAX_QUERY_INSTANCES + "$", Pattern.CASE_INSENSITIVE));
         ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_PARALLEL_FRAGMENT_EXEC_INSTANCE_NUM + "$",
                 Pattern.CASE_INSENSITIVE));
@@ -137,11 +112,12 @@ public class UserProperty implements Writable {
         ADVANCED_PROPERTIES.add(Pattern.compile("^" + PROP_USER_INSERT_TIMEOUT + "$", Pattern.CASE_INSENSITIVE));
 
         COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_QUOTA + ".", Pattern.CASE_INSENSITIVE));
-        COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_DEFAULT_LOAD_CLUSTER + "$", Pattern.CASE_INSENSITIVE));
-        COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_LOAD_CLUSTER + "." + DppConfig.CLUSTER_NAME_REGEX + ".",
-                Pattern.CASE_INSENSITIVE));
+        COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_DEFAULT_INIT_CATALOG + "$", Pattern.CASE_INSENSITIVE));
         COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_WORKLOAD_GROUP + "$", Pattern.CASE_INSENSITIVE));
         COMMON_PROPERTIES.add(Pattern.compile("^" + DEFAULT_CLOUD_CLUSTER + "$", Pattern.CASE_INSENSITIVE));
+        COMMON_PROPERTIES.add(Pattern.compile("^" + DEFAULT_COMPUTE_GROUP + "$", Pattern.CASE_INSENSITIVE));
+        COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_QUERY_FRESHNESS_TOLERANCE + "$", Pattern.CASE_INSENSITIVE));
+        COMMON_PROPERTIES.add(Pattern.compile("^" + PROP_ENABLE_PREFER_CACHED_ROWSET + "$", Pattern.CASE_INSENSITIVE));
     }
 
     public UserProperty() {
@@ -183,13 +159,12 @@ public class UserProperty implements Writable {
         return commonProperties.getCpuResourceLimit();
     }
 
-    public String getWorkloadGroup() {
-        return commonProperties.getWorkloadGroup();
+    public String getInitCatalog() {
+        return commonProperties.getInitCatalog();
     }
 
-    @Deprecated
-    public WhiteList getWhiteList() {
-        return whiteList;
+    public String getWorkloadGroup() {
+        return commonProperties.getWorkloadGroup();
     }
 
     public Set<Tag> getCopiedResourceTags() {
@@ -198,6 +173,14 @@ public class UserProperty implements Writable {
 
     public long getExecMemLimit() {
         return commonProperties.getExecMemLimit();
+    }
+
+    public long getQueryFreshnessToleranceMs() {
+        return commonProperties.getQueryFreshnessToleranceMs();
+    }
+
+    public boolean getEnablePreferCachedRowset() {
+        return commonProperties.getEnablePreferCachedRowset();
     }
 
     public void update(List<Pair<String, String>> properties) throws UserException {
@@ -215,18 +198,19 @@ public class UserProperty implements Writable {
         long execMemLimit = this.commonProperties.getExecMemLimit();
         int queryTimeout = this.commonProperties.getQueryTimeout();
         int insertTimeout = this.commonProperties.getInsertTimeout();
+        String initCatalog = this.commonProperties.getInitCatalog();
         String workloadGroup = this.commonProperties.getWorkloadGroup();
+        long queryFreshnessToleranceMs = this.commonProperties.getQueryFreshnessToleranceMs();
+        boolean enablePreferCachedRowset = this.commonProperties.getEnablePreferCachedRowset();
 
-        String newDefaultLoadCluster = defaultLoadCluster;
         String newDefaultCloudCluster = defaultCloudCluster;
-        Map<String, DppConfig> newDppConfigs = Maps.newHashMap(clusterToDppConfig);
 
         // update
         for (Pair<String, String> entry : properties) {
             String key = entry.first;
             String value = entry.second;
 
-            String[] keyArr = key.split("\\" + SetUserPropertyVar.DOT_SEPARATOR);
+            String[] keyArr = key.split("\\" + SetUserPropertyVarOp.DOT_SEPARATOR);
             if (keyArr[0].equalsIgnoreCase(PROP_MAX_USER_CONNECTIONS)) {
                 // set property "max_user_connections" = "1000"
                 if (keyArr.length != 1) {
@@ -242,27 +226,10 @@ public class UserProperty implements Writable {
                 if (newMaxConn <= 0 || newMaxConn > 10000) {
                     throw new DdlException(PROP_MAX_USER_CONNECTIONS + " is not valid, must between 1 and 10000");
                 }
-            } else if (keyArr[0].equalsIgnoreCase(PROP_LOAD_CLUSTER)) {
-                updateLoadCluster(keyArr, value, newDppConfigs);
-            } else if (keyArr[0].equalsIgnoreCase(PROP_DEFAULT_LOAD_CLUSTER)) {
-                // set property "default_load_cluster" = "cluster1"
-                if (keyArr.length != 1) {
-                    throw new DdlException(PROP_DEFAULT_LOAD_CLUSTER + " format error");
-                }
-                if (value != null && !newDppConfigs.containsKey(value)) {
-                    throw new DdlException("Load cluster[" + value + "] does not exist");
-                }
-
-                newDefaultLoadCluster = value;
-            }  else if (keyArr[0].equalsIgnoreCase(DEFAULT_CLOUD_CLUSTER)) {
-                // set property "DEFAULT_CLOUD_CLUSTER" = "cluster1"
-                if (keyArr.length != 1) {
-                    throw new DdlException(DEFAULT_CLOUD_CLUSTER + " format error");
-                }
-                if (value == null) {
-                    value = "";
-                }
-                newDefaultCloudCluster = value;
+            } else if (keyArr[0].equalsIgnoreCase(DEFAULT_CLOUD_CLUSTER)) {
+                newDefaultCloudCluster = checkCloudDefaultCluster(keyArr, value, DEFAULT_CLOUD_CLUSTER, isReplay);
+            } else if (keyArr[0].equalsIgnoreCase(DEFAULT_COMPUTE_GROUP)) {
+                newDefaultCloudCluster = checkCloudDefaultCluster(keyArr, value, DEFAULT_COMPUTE_GROUP, isReplay);
             } else if (keyArr[0].equalsIgnoreCase(PROP_MAX_QUERY_INSTANCES)) {
                 // set property "max_query_instances" = "1000"
                 if (keyArr.length != 1) {
@@ -289,13 +256,6 @@ public class UserProperty implements Writable {
                 // set property "sql_block_rules" = "test_rule1,test_rule2"
                 if (keyArr.length != 1) {
                     throw new DdlException(PROP_SQL_BLOCK_RULES + " format error");
-                }
-
-                // check if sql_block_rule has already exist
-                for (String ruleName : value.replaceAll(" ", "").split(",")) {
-                    if (!ruleName.equals("") && !Env.getCurrentEnv().getSqlBlockRuleMgr().existRule(ruleName)) {
-                        throw new DdlException("the sql block rule " + ruleName + " not exist");
-                    }
                 }
                 sqlBlockRules = value;
             } else if (keyArr[0].equalsIgnoreCase(PROP_CPU_RESOURCE_LIMIT)) {
@@ -356,6 +316,15 @@ public class UserProperty implements Writable {
                 } catch (NumberFormatException e) {
                     throw new DdlException(PROP_USER_INSERT_TIMEOUT + " is not number");
                 }
+            } else if (keyArr[0].equalsIgnoreCase(PROP_DEFAULT_INIT_CATALOG)) {
+                if (keyArr.length != 1) {
+                    throw new DdlException(PROP_DEFAULT_INIT_CATALOG + " format error");
+                }
+                CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(value);
+                if (catalog == null) {
+                    throw new DdlException("catalog " + value + " not exists");
+                }
+                initCatalog = value;
             } else if (keyArr[0].equalsIgnoreCase(PROP_WORKLOAD_GROUP)) {
                 if (keyArr.length != 1) {
                     throw new DdlException(PROP_WORKLOAD_GROUP + " format error");
@@ -365,6 +334,21 @@ public class UserProperty implements Writable {
                     throw new DdlException("workload group " + value + " not exists");
                 }
                 workloadGroup = value;
+            } else if (keyArr[0].equalsIgnoreCase(PROP_QUERY_FRESHNESS_TOLERANCE)) {
+                // set property "query_freshness_tolerance" = "1000";
+                if (keyArr.length != 1) {
+                    throw new DdlException(PROP_QUERY_FRESHNESS_TOLERANCE + " format error");
+                }
+                queryFreshnessToleranceMs = getLongProperty(key, value, keyArr, PROP_QUERY_FRESHNESS_TOLERANCE);
+            } else if (keyArr[0].equalsIgnoreCase(PROP_ENABLE_PREFER_CACHED_ROWSET)) {
+                if (keyArr.length != 1) {
+                    throw new DdlException(PROP_ENABLE_PREFER_CACHED_ROWSET + " format error");
+                }
+                try {
+                    enablePreferCachedRowset = Boolean.parseBoolean(value);
+                } catch (NumberFormatException e) {
+                    throw new DdlException(PROP_ENABLE_PREFER_CACHED_ROWSET + " is not boolean");
+                }
             } else {
                 if (isReplay) {
                     // After using SET PROPERTY to modify the user property, if FE rolls back to a version without
@@ -387,14 +371,46 @@ public class UserProperty implements Writable {
         this.commonProperties.setExecMemLimit(execMemLimit);
         this.commonProperties.setQueryTimeout(queryTimeout);
         this.commonProperties.setInsertTimeout(insertTimeout);
+        this.commonProperties.setInitCatalog(initCatalog);
         this.commonProperties.setWorkloadGroup(workloadGroup);
-        if (newDppConfigs.containsKey(newDefaultLoadCluster)) {
-            defaultLoadCluster = newDefaultLoadCluster;
-        } else {
-            defaultLoadCluster = null;
-        }
-        clusterToDppConfig = newDppConfigs;
+        this.commonProperties.setQueryFreshnessToleranceMs(queryFreshnessToleranceMs);
+        this.commonProperties.setEnablePreferCachedRowset(enablePreferCachedRowset);
         defaultCloudCluster = newDefaultCloudCluster;
+    }
+
+    private String checkCloudDefaultCluster(String[] keyArr, String value, String defaultComputeGroup, boolean isReplay)
+            throws ComputeGroupException, DdlException {
+        // isReplay not check auth, not throw exception
+        if (isReplay) {
+            return value;
+        }
+        // check cluster auth
+        // get all users with same name but different host
+        AccessControllerManager am = Env.getCurrentEnv().getAccessManager();
+        List<User> users = am.getAuth()
+                .getUserManager().getUserByName(qualifiedUser);
+        boolean pass = false;
+        for (User user : users) {
+            if (!Strings.isNullOrEmpty(value) && am.checkCloudPriv(
+                    user.getUserIdentity(), value, PrivPredicate.USAGE, ResourceTypeEnum.CLUSTER)) {
+                pass = true;
+            }
+        }
+        if (!pass && !Strings.isNullOrEmpty(value)) {
+            throw new ComputeGroupException(String.format("set default compute group failed, "
+                    + "user %s has no permission to use compute group '%s', please grant use privilege first ",
+                qualifiedUser, value),
+                ComputeGroupException.FailedTypeEnum.CURRENT_USER_NO_AUTH_TO_USE_COMPUTE_GROUP);
+
+        }
+        // set property "DEFAULT_CLOUD_CLUSTER" = "cluster1"
+        if (keyArr.length != 1) {
+            throw new DdlException(defaultComputeGroup + " format error");
+        }
+        if (value == null) {
+            value = "";
+        }
+        return value;
     }
 
     private long getLongProperty(String key, String value, String[] keyArr, String propName) throws DdlException {
@@ -426,77 +442,12 @@ public class UserProperty implements Writable {
         return tags;
     }
 
-    private void updateLoadCluster(String[] keyArr, String value, Map<String, DppConfig> newDppConfigs)
-            throws DdlException {
-        if (keyArr.length == 1 && Strings.isNullOrEmpty(value)) {
-            // set property "load_cluster" = '';
-            newDppConfigs.clear();
-        } else if (keyArr.length == 2 && Strings.isNullOrEmpty(value)) {
-            // set property "load_cluster.cluster1" = ''
-            String cluster = keyArr[1];
-            newDppConfigs.remove(cluster);
-        } else if (keyArr.length == 3 && Strings.isNullOrEmpty(value)) {
-            // set property "load_cluster.cluster1.xxx" = ''
-            String cluster = keyArr[1];
-            if (!newDppConfigs.containsKey(cluster)) {
-                throw new DdlException("Load cluster[" + value + "] does not exist");
-            }
-
-            try {
-                newDppConfigs.get(cluster).resetConfigByKey(keyArr[2]);
-            } catch (LoadException e) {
-                throw new DdlException(e.getMessage());
-            }
-        } else if (keyArr.length == 3 && value != null) {
-            // set property "load_cluster.cluster1.xxx" = "xxx"
-            String cluster = keyArr[1];
-            Map<String, String> configMap = Maps.newHashMap();
-            configMap.put(keyArr[2], value);
-
-            try {
-                DppConfig newDppConfig = DppConfig.create(configMap);
-
-                if (newDppConfigs.containsKey(cluster)) {
-                    newDppConfigs.get(cluster).update(newDppConfig, true);
-                } else {
-                    newDppConfigs.put(cluster, newDppConfig);
-                }
-            } catch (LoadException e) {
-                throw new DdlException(e.getMessage());
-            }
-        } else {
-            throw new DdlException(PROP_LOAD_CLUSTER + " format error");
-        }
-    }
-
     public String getDefaultCloudCluster() {
         return defaultCloudCluster;
     }
 
-    public String getDefaultLoadCluster() {
-        return defaultLoadCluster;
-    }
-
-    public Pair<String, DppConfig> getLoadClusterInfo(String cluster) {
-        String tmpCluster = cluster;
-        if (tmpCluster == null) {
-            tmpCluster = defaultLoadCluster;
-        }
-
-        DppConfig dppConfig = null;
-        if (tmpCluster != null) {
-            dppConfig = clusterToDppConfig.get(tmpCluster);
-            if (dppConfig != null) {
-                dppConfig = dppConfig.getCopiedDppConfig();
-            }
-        }
-
-        return Pair.of(tmpCluster, dppConfig);
-    }
-
     public List<List<String>> fetchProperty() {
         List<List<String>> result = Lists.newArrayList();
-        String dot = SetUserPropertyVar.DOT_SEPARATOR;
 
         // max user connections
         result.add(Lists.newArrayList(PROP_MAX_USER_CONNECTIONS, String.valueOf(commonProperties.getMaxConn())));
@@ -527,14 +478,15 @@ public class UserProperty implements Writable {
         // resource tag
         result.add(Lists.newArrayList(PROP_RESOURCE_TAGS, Joiner.on(", ").join(commonProperties.getResourceTags())));
 
+        // init catalog
+        result.add(Lists.newArrayList(PROP_DEFAULT_INIT_CATALOG, String.valueOf(commonProperties.getInitCatalog())));
+
         result.add(Lists.newArrayList(PROP_WORKLOAD_GROUP, String.valueOf(commonProperties.getWorkloadGroup())));
 
-        // load cluster
-        if (defaultLoadCluster != null) {
-            result.add(Lists.newArrayList(PROP_DEFAULT_LOAD_CLUSTER, defaultLoadCluster));
-        } else {
-            result.add(Lists.newArrayList(PROP_DEFAULT_LOAD_CLUSTER, ""));
-        }
+        result.add(Lists.newArrayList(PROP_ENABLE_PREFER_CACHED_ROWSET,
+                String.valueOf(commonProperties.getEnablePreferCachedRowset())));
+        result.add(Lists.newArrayList(PROP_QUERY_FRESHNESS_TOLERANCE,
+                String.valueOf(commonProperties.getQueryFreshnessToleranceMs())));
 
         // default cloud cluster
         if (defaultCloudCluster != null) {
@@ -543,104 +495,16 @@ public class UserProperty implements Writable {
             result.add(Lists.newArrayList(DEFAULT_CLOUD_CLUSTER, ""));
         }
 
-        for (Map.Entry<String, DppConfig> entry : clusterToDppConfig.entrySet()) {
-            String cluster = entry.getKey();
-            DppConfig dppConfig = entry.getValue();
-            String clusterPrefix = PROP_LOAD_CLUSTER + dot + cluster + dot;
-
-            // palo path
-            if (dppConfig.getPaloPath() != null) {
-                result.add(Lists.newArrayList(clusterPrefix + DppConfig.getPaloPathKey(), dppConfig.getPaloPath()));
-            }
-
-            // http port
-            result.add(Lists.newArrayList(clusterPrefix + DppConfig.getHttpPortKey(),
-                    String.valueOf(dppConfig.getHttpPort())));
-
-            // hadoop configs
-            if (dppConfig.getHadoopConfigs() != null) {
-                List<String> configs = Lists.newArrayList();
-                for (Map.Entry<String, String> configEntry : dppConfig.getHadoopConfigs().entrySet()) {
-                    configs.add(String.format("%s=%s", configEntry.getKey(), configEntry.getValue()));
-                }
-                result.add(Lists.newArrayList(clusterPrefix + DppConfig.getHadoopConfigsKey(),
-                        StringUtils.join(configs, ";")));
-            }
-
-            // priority
-            result.add(Lists.newArrayList(clusterPrefix + DppConfig.getPriorityKey(),
-                    String.valueOf(dppConfig.getPriority())));
+        // default compute group
+        if (defaultCloudCluster != null) {
+            result.add(Lists.newArrayList(DEFAULT_COMPUTE_GROUP, defaultCloudCluster));
+        } else {
+            result.add(Lists.newArrayList(DEFAULT_COMPUTE_GROUP, ""));
         }
 
         // sort
-        Collections.sort(result, new Comparator<List<String>>() {
-            @Override
-            public int compare(List<String> o1, List<String> o2) {
-                return o1.get(0).compareTo(o2.get(0));
-            }
-        });
+        Collections.sort(result, Comparator.comparing(o -> o.get(0)));
 
         return result;
-    }
-
-    public static UserProperty read(DataInput in) throws IOException {
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_130) {
-            UserProperty userProperty = new UserProperty();
-            userProperty.readFields(in);
-            return userProperty;
-        }
-        String json = Text.readString(in);
-        return GsonUtils.GSON.fromJson(json, UserProperty.class);
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
-    }
-
-    @Deprecated
-    public void readFields(DataInput in) throws IOException {
-        qualifiedUser = Text.readString(in);
-        // should be removed after version 3.0
-        qualifiedUser = ClusterNamespace.getNameFromFullName(qualifiedUser);
-
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_100) {
-            long maxConn = in.readLong();
-            this.commonProperties.setMaxConn(maxConn);
-        }
-
-        // call UserResource.readIn(out) to make sure that FE can rollback.
-        UserResource.readIn(in);
-
-        // load cluster
-        if (in.readBoolean()) {
-            defaultLoadCluster = Text.readString(in);
-        }
-
-        int clusterNum = in.readInt();
-        for (int i = 0; i < clusterNum; ++i) {
-            String cluster = Text.readString(in);
-            DppConfig dppConfig = new DppConfig();
-            dppConfig.readFields(in);
-            clusterToDppConfig.put(cluster, dppConfig);
-        }
-
-        if (Config.isCloudMode()) {
-            if (in.readBoolean()) {
-                defaultCloudCluster = Text.readString(in);
-            }
-        }
-
-        // whiteList
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_116) {
-            whiteList.readFields(in);
-        } else {
-            whiteList = new WhiteList();
-        }
-
-        // common properties
-        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_100) {
-            this.commonProperties = CommonUserProperties.read(in);
-        }
     }
 }

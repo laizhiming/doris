@@ -18,13 +18,20 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.DataProperty;
+import org.apache.doris.catalog.DistributionInfo;
+import org.apache.doris.catalog.HashDistributionInfo;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.util.AutoBucketCalculator;
+import org.apache.doris.common.util.PropertyAnalyzer;
+import org.apache.doris.nereids.trees.plans.commands.info.AddPartitionOp;
 import org.apache.doris.thrift.TNullableStringLiteral;
 
+import com.google.common.base.Objects;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -42,6 +49,7 @@ public class PartitionExprUtil {
     public static final String DATETIME_NAME_FORMATTER = "%04d%02d%02d%02d%02d%02d";
     private static final Logger LOG = LogManager.getLogger(PartitionExprUtil.class);
     private static final PartitionExprUtil partitionExprUtil = new PartitionExprUtil();
+    private static final int MAX_PARTITION_NAME_LENGTH = 50;
 
     public static FunctionIntervalInfo getFunctionIntervalInfo(ArrayList<Expr> partitionExprs,
             PartitionType partitionType) throws AnalysisException {
@@ -87,7 +95,7 @@ public class PartitionExprUtil {
         } else {
             throw new AnalysisException("now range partition only support date_trunc/date_floor/date_ceil.");
         }
-        return partitionExprUtil.new FunctionIntervalInfo(timeUnit, interval);
+        return partitionExprUtil.new FunctionIntervalInfo(fnName, timeUnit, interval);
     }
 
     public static DateLiteral getRangeEnd(DateLiteral beginTime, FunctionIntervalInfo intervalInfo)
@@ -117,10 +125,10 @@ public class PartitionExprUtil {
         return null;
     }
 
-    public static Map<String, AddPartitionClause> getAddPartitionClauseFromPartitionValues(OlapTable olapTable,
-            ArrayList<List<TNullableStringLiteral>> partitionValues, PartitionInfo partitionInfo)
+    public static Map<String, AddPartitionOp> getAddPartitionClauseFromPartitionValues(
+            OlapTable olapTable, ArrayList<List<TNullableStringLiteral>> partitionValues, PartitionInfo partitionInfo)
             throws AnalysisException {
-        Map<String, AddPartitionClause> result = Maps.newHashMap();
+        Map<String, AddPartitionOp> result = Maps.newHashMap();
         ArrayList<Expr> partitionExprs = partitionInfo.getPartitionExprs();
         PartitionType partitionType = partitionInfo.getType();
         List<Column> partitionColumn = partitionInfo.getPartitionColumns();
@@ -155,8 +163,8 @@ public class PartitionExprUtil {
                 Type partitionColumnType = partitionColumn.get(0).getType();
                 DateLiteral beginDateTime = new DateLiteral(beginTime, partitionColumnType);
                 partitionName += String.format(DATETIME_NAME_FORMATTER,
-                        beginDateTime.getYear(), beginDateTime.getMonth(), beginDateTime.getDay(),
-                        beginDateTime.getHour(), beginDateTime.getMinute(), beginDateTime.getSecond());
+                    beginDateTime.getYear(), beginDateTime.getMonth(), beginDateTime.getDay(),
+                    beginDateTime.getHour(), beginDateTime.getMinute(), beginDateTime.getSecond());
                 DateLiteral endDateTime = getRangeEnd(beginDateTime, intervalInfo);
                 partitionKeyDesc = createPartitionKeyDescWithRange(beginDateTime, endDateTime, partitionColumnType);
             } else if (partitionType == PartitionType.LIST) {
@@ -173,8 +181,9 @@ public class PartitionExprUtil {
                 partitionKeyDesc = PartitionKeyDesc.createIn(listValues);
                 partitionName += getFormatPartitionValue(filterStr);
                 if (hasStringType) {
-                    if (partitionName.length() > 50) {
-                        throw new AnalysisException("Partition name's length is over limit of 50. abort to create.");
+                    if (partitionName.length() > MAX_PARTITION_NAME_LENGTH) {
+                        partitionName = partitionName.substring(0, MAX_PARTITION_NAME_LENGTH)
+                            + "_" + Integer.toHexString(partitionName.hashCode());
                     }
                 }
             } else {
@@ -182,13 +191,42 @@ public class PartitionExprUtil {
             }
 
             Map<String, String> partitionProperties = Maps.newHashMap();
-            DistributionDesc distributionDesc = olapTable.getDefaultDistributionInfo().toDistributionDesc();
+            DistributionInfo defaultDistributionInfo = olapTable.getDefaultDistributionInfo();
+            DistributionDesc distributionDesc = defaultDistributionInfo.toDistributionDesc();
+            if (olapTable.isAutoBucket() && partitionType == PartitionType.RANGE) {
+                // Use unified auto bucket calculator
+                AutoBucketCalculator.AutoBucketContext context = new AutoBucketCalculator.AutoBucketContext(
+                        olapTable, partitionName, partitionName, false,
+                        defaultDistributionInfo.getBucketNum());
+
+                int bucketsNum = AutoBucketCalculator.calculateAutoBucketsWithBoundsCheck(context);
+
+                // Only update distribution if calculation was successful (bucketsNum != default)
+                if (bucketsNum != defaultDistributionInfo.getBucketNum()) {
+                    if (defaultDistributionInfo.getType() == DistributionInfo.DistributionInfoType.HASH) {
+                        HashDistributionInfo hashDistributionInfo = (HashDistributionInfo) defaultDistributionInfo;
+                        List<String> distColumnNames = new ArrayList<>();
+                        for (Column distributionColumn : hashDistributionInfo.getDistributionColumns()) {
+                            distColumnNames.add(distributionColumn.getName());
+                        }
+                        distributionDesc = new HashDistributionDesc(bucketsNum, distColumnNames);
+                    } else {
+                        distributionDesc = new RandomDistributionDesc(bucketsNum);
+                    }
+                }
+            }
 
             SinglePartitionDesc singleRangePartitionDesc = new SinglePartitionDesc(true, partitionName,
                     partitionKeyDesc, partitionProperties);
-
-            AddPartitionClause addPartitionClause = new AddPartitionClause(singleRangePartitionDesc,
-                    distributionDesc, partitionProperties, false);
+            // iff table's storage medium is not equal default storage medium,
+            // should add storage medium in partition properties
+            if (!DataProperty.DEFAULT_STORAGE_MEDIUM.equals(olapTable.getStorageMedium())) {
+                partitionProperties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM,
+                        olapTable.getStorageMedium().name());
+            }
+            AddPartitionOp addPartitionClause = new AddPartitionOp(
+                    singleRangePartitionDesc.translateToPartitionDefinition(),
+                    distributionDesc.toDistributionDescriptor(), partitionProperties, false);
             result.put(partitionName, addPartitionClause);
         }
         return result;
@@ -218,7 +256,8 @@ public class PartitionExprUtil {
         if (partitionColumnType.isDate() || partitionColumnType.isDateV2()) {
             timeString = String.format(DATE_FORMATTER, dateLiteral.getYear(), dateLiteral.getMonth(),
                     dateLiteral.getDay());
-        } else if (partitionColumnType.isDatetime() || partitionColumnType.isDatetimeV2()) {
+        } else if (partitionColumnType.isDatetime() || partitionColumnType.isDatetimeV2()
+                || partitionColumnType.isTimeStampTz()) {
             timeString = String.format(DATETIME_FORMATTER,
                     dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay(),
                     dateLiteral.getHour(), dateLiteral.getMinute(), dateLiteral.getSecond());
@@ -250,12 +289,32 @@ public class PartitionExprUtil {
     }
 
     public class FunctionIntervalInfo {
+        public String fnName;
         public String timeUnit;
         public long interval;
 
-        public FunctionIntervalInfo(String timeUnit, long interval) {
+        public FunctionIntervalInfo(String fnName, String timeUnit, long interval) {
+            this.fnName = fnName;
             this.timeUnit = timeUnit;
             this.interval = interval;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            FunctionIntervalInfo that = (FunctionIntervalInfo) o;
+            return interval == that.interval && Objects.equal(fnName, that.fnName)
+                    && Objects.equal(timeUnit, that.timeUnit);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hashCode(fnName, timeUnit, interval);
         }
     }
 }

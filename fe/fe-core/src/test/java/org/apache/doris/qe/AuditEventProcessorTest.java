@@ -19,9 +19,9 @@ package org.apache.doris.qe;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.util.DigitalVersion;
+import org.apache.doris.plugin.AuditEvent;
+import org.apache.doris.plugin.AuditEvent.EventType;
 import org.apache.doris.plugin.PluginInfo;
-import org.apache.doris.plugin.audit.AuditEvent;
-import org.apache.doris.plugin.audit.AuditEvent.EventType;
 import org.apache.doris.plugin.audit.AuditLogBuilder;
 import org.apache.doris.utframe.UtFrameUtils;
 
@@ -58,14 +58,18 @@ public class AuditEventProcessorTest {
                 .setDb("db1")
                 .setState("EOF")
                 .setQueryTime(2000)
+                .setQueueTimeMs(2000)
                 .setScanBytes(100000)
                 .setScanRows(200000)
                 .setReturnRows(1)
                 .setStmtId(1234)
+                .setStmtType("SELECT")
                 .setStmt("select * from tbl1").build();
 
         Assert.assertEquals("127.0.0.1", event.clientIp);
         Assert.assertEquals(200000, event.scanRows);
+        Assert.assertEquals("SELECT", event.stmtType);
+        Assert.assertEquals(2000, event.queueTimeMs);
     }
 
     @Test

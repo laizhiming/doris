@@ -21,7 +21,7 @@ suite("test_index_skip_read_data", "p0"){
     def indexTbName2 = "test_index_skip_read_data_mow"
     def indexTbName3 = "test_index_skip_read_data_mor"
 
-
+    sql """ set enable_common_expr_pushdown = true; """
     // dup
     sql "DROP TABLE IF EXISTS ${indexTbName1}"
 
@@ -31,7 +31,6 @@ suite("test_index_skip_read_data", "p0"){
       `k2` varchar(20) NULL COMMENT "",
       `data` text NULL COMMENT "",
       INDEX idx_k1 (`k1`) USING INVERTED COMMENT '',
-      INDEX idx_k2 (`k2`) USING BITMAP  COMMENT '',
       INDEX idx_data (`data`) USING INVERTED COMMENT ''
       ) ENGINE=OLAP
       DUPLICATE KEY(`k1`, `k2`)
@@ -67,7 +66,6 @@ suite("test_index_skip_read_data", "p0"){
       `k2` varchar(20) NULL COMMENT "",
       `data` text NULL COMMENT "",
       INDEX idx_k1 (`k1`) USING INVERTED COMMENT '',
-      INDEX idx_k2 (`k2`) USING BITMAP  COMMENT '',
       INDEX idx_data (`data`) USING INVERTED COMMENT ''
       ) ENGINE=OLAP
       UNIQUE KEY(`k1`, `k2`)
@@ -103,7 +101,6 @@ suite("test_index_skip_read_data", "p0"){
       `k2` varchar(20) NULL COMMENT "",
       `data` text NULL COMMENT "",
       INDEX idx_k1 (`k1`) USING INVERTED COMMENT '',
-      INDEX idx_k2 (`k2`) USING BITMAP  COMMENT '',
       INDEX idx_data (`data`) USING INVERTED COMMENT ''
       ) ENGINE=OLAP
       UNIQUE KEY(`k1`, `k2`)

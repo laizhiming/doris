@@ -44,14 +44,17 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
         this(child, false);
     }
 
-    public Not(Expression child, boolean isGeneratedIsNotNull) {
-        super(ImmutableList.of(child));
+    public Not(List<Expression> child, boolean isGeneratedIsNotNull, boolean inferred) {
+        super(child, inferred);
         this.isGeneratedIsNotNull = isGeneratedIsNotNull;
     }
 
+    public Not(Expression child, boolean isGeneratedIsNotNull) {
+        this(ImmutableList.of(child), isGeneratedIsNotNull);
+    }
+
     private Not(List<Expression> child, boolean isGeneratedIsNotNull) {
-        super(child);
-        this.isGeneratedIsNotNull = isGeneratedIsNotNull;
+        this(child, isGeneratedIsNotNull, false);
     }
 
     public boolean isGeneratedIsNotNull() {
@@ -87,7 +90,7 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(child().hashCode(), isGeneratedIsNotNull);
     }
 
@@ -97,7 +100,14 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
     }
 
     @Override
-    public String toSql() {
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("NOT ").append(child().toDigest());
+        return sb.toString();
+    }
+
+    @Override
+    public String computeToSql() {
         return "( not " + child().toSql() + ")";
     }
 
@@ -114,5 +124,10 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
     @Override
     public List<DataType> expectedInputTypes() {
         return EXPECTS_INPUT_TYPES;
+    }
+
+    @Override
+    public Expression withInferred(boolean inferred) {
+        return new Not(this.children, false, inferred);
     }
 }

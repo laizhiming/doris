@@ -33,6 +33,7 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalHashJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalIntersect;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLimit;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalNestedLoopJoin;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnion;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSetOperation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalTopN;
@@ -74,6 +75,15 @@ public class RuntimeFilterPruner extends PlanPostProcessor {
             }
         }
         return plan;
+    }
+
+    @Override
+    public PhysicalRecursiveUnion visitPhysicalRecursiveUnion(
+            PhysicalRecursiveUnion<? extends Plan, ? extends Plan> recursiveUnion, CascadesContext context) {
+        for (Plan child : recursiveUnion.children()) {
+            child.accept(this, context);
+        }
+        return recursiveUnion;
     }
 
     @Override
@@ -189,8 +199,8 @@ public class RuntimeFilterPruner extends PlanPostProcessor {
     private boolean isVisibleColumn(Slot slot) {
         if (slot instanceof SlotReference) {
             SlotReference slotReference = (SlotReference) slot;
-            if (slotReference.getColumn().isPresent()) {
-                return slotReference.getColumn().get().isVisible();
+            if (slotReference.getOriginalColumn().isPresent()) {
+                return slotReference.getOriginalColumn().get().isVisible();
             }
         }
         return true;
@@ -274,6 +284,9 @@ public class RuntimeFilterPruner extends PlanPostProcessor {
     private boolean isEffectiveRuntimeFilter(EqualTo equalTo, PhysicalHashJoin join) {
         Statistics leftStats = ((AbstractPlan) join.child(0)).getStats();
         Statistics rightStats = ((AbstractPlan) join.child(1)).getStats();
+        if (leftStats == null || rightStats == null) {
+            return true;
+        }
         Set<Slot> leftSlots = equalTo.child(0).getInputSlots();
         if (leftSlots.size() > 1) {
             return false;

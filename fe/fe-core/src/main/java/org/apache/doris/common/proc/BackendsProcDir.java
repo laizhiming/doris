@@ -20,18 +20,18 @@ package org.apache.doris.common.proc;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.profile.RuntimeProfile;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.ListComparator;
-import org.apache.doris.common.util.RuntimeProfile;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TUnit;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.gson.Gson;
 import org.apache.logging.log4j.LogManager;
@@ -45,19 +45,6 @@ import java.util.concurrent.TimeUnit;
 public class BackendsProcDir implements ProcDirInterface {
     private static final Logger LOG = LogManager.getLogger(BackendsProcDir.class);
 
-    public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>().add("BackendId")
-            .add("Host").add("HeartbeatPort").add("BePort").add("HttpPort").add("BrpcPort").add("ArrowFlightSqlPort")
-            .add("LastStartTime").add("LastHeartbeat").add("Alive").add("SystemDecommissioned").add("TabletNum")
-            .add("DataUsedCapacity").add("TrashUsedCapacity").add("AvailCapacity").add("TotalCapacity").add("UsedPct")
-            .add("MaxDiskUsedPct").add("RemoteUsedCapacity").add("Tag").add("ErrMsg").add("Version").add("Status")
-            .add("HeartbeatFailureCounter").add("NodeRole").add("CpuCores").add("Memory")
-            .build();
-
-    public static final ImmutableList<String> DISK_TITLE_NAMES = new ImmutableList.Builder<String>()
-            .add("BackendId").add("Host").add("RootPath").add("DirType").add("DiskState")
-            .add("TotalCapacity").add("UsedCapacity").add("AvailableCapacity").add("UsedPct")
-            .build();
-
     private SystemInfoService systemInfoService;
 
     public BackendsProcDir(SystemInfoService systemInfoService) {
@@ -69,7 +56,7 @@ public class BackendsProcDir implements ProcDirInterface {
         Preconditions.checkNotNull(systemInfoService);
 
         BaseProcResult result = new BaseProcResult();
-        result.setNames(TITLE_NAMES);
+        result.setNames(BackendsTableValuedFunction.getBackendsTitleNames());
 
         final List<List<String>> backendInfos = getBackendInfos();
         for (List<String> backendInfo : backendInfos) {
@@ -103,7 +90,7 @@ public class BackendsProcDir implements ProcDirInterface {
             }
 
             watch.start();
-            Integer tabletNum = Env.getCurrentInvertedIndex().getTabletNumByBackendId(backendId);
+            Integer tabletNum = systemInfoService.getTabletNumByBackendId(backendId);
             watch.stop();
             List<Comparable> backendInfo = Lists.newArrayList();
             backendInfo.add(String.valueOf(backendId));
@@ -173,6 +160,13 @@ public class BackendsProcDir implements ProcDirInterface {
 
             // memory
             backendInfo.add(RuntimeProfile.printCounter(backend.getBeMemory(), TUnit.BYTES));
+
+            // liveSince
+            backendInfo.add(TimeUtils.longToTimeString(backend.getLiveSince()));
+
+            // runningFragments
+            backendInfo.add(String.valueOf(backend.getRunningTasks()));
+
             comparableBackendInfos.add(backendInfo);
         }
 

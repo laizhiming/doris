@@ -28,22 +28,25 @@
 #include <vector>
 
 #include "common/status.h"
+#include "core/custom_allocator.h"
+#include "core/typeid_cast.h"
 #include "io/cache/cached_remote_file_reader.h"
 #include "io/file_factory.h"
 #include "io/fs/broker_file_reader.h"
 #include "io/fs/file_reader.h"
 #include "io/fs/path.h"
 #include "io/fs/s3_file_reader.h"
-#include "olap/olap_define.h"
-#include "util/runtime_profile.h"
+#include "io/io_common.h"
+#include "runtime/runtime_profile.h"
+#include "storage/olap_define.h"
 #include "util/slice.h"
-#include "vec/common/typeid_cast.h"
-
 namespace doris {
+
+#include "common/compile_check_begin.h"
+
 namespace io {
 
 class FileSystem;
-struct IOContext;
 
 struct PrefetchRange {
     size_t start_offset;
@@ -53,6 +56,149 @@ struct PrefetchRange {
             : start_offset(start_offset), end_offset(end_offset) {}
 
     PrefetchRange() : start_offset(0), end_offset(0) {}
+
+    bool operator==(const PrefetchRange& other) const {
+        return (start_offset == other.start_offset) && (end_offset == other.end_offset);
+    }
+
+    bool operator!=(const PrefetchRange& other) const { return !(*this == other); }
+
+    PrefetchRange span(const PrefetchRange& other) const {
+        return {std::min(start_offset, other.end_offset), std::max(start_offset, other.end_offset)};
+    }
+    PrefetchRange seq_span(const PrefetchRange& other) const {
+        return {start_offset, other.end_offset};
+    }
+
+    //Ranges needs to be sorted.
+    static std::vector<PrefetchRange> merge_adjacent_seq_ranges(
+            const std::vector<PrefetchRange>& seq_ranges, int64_t max_merge_distance_bytes,
+            int64_t once_max_read_bytes) {
+        if (seq_ranges.empty()) {
+            return {};
+        }
+        // Merge overlapping ranges
+        std::vector<PrefetchRange> result;
+        PrefetchRange last = seq_ranges.front();
+        for (size_t i = 1; i < seq_ranges.size(); ++i) {
+            PrefetchRange current = seq_ranges[i];
+            PrefetchRange merged = last.seq_span(current);
+            if (merged.end_offset <= once_max_read_bytes + merged.start_offset &&
+                last.end_offset + max_merge_distance_bytes >= current.start_offset) {
+                last = merged;
+            } else {
+                result.push_back(last);
+                last = current;
+            }
+        }
+        result.push_back(last);
+        return result;
+    }
+};
+
+class RangeFinder {
+public:
+    virtual ~RangeFinder() = default;
+    virtual Status get_range_for(int64_t desired_offset, io::PrefetchRange& result_range) = 0;
+    virtual size_t get_max_range_size() const = 0;
+};
+
+class LinearProbeRangeFinder : public RangeFinder {
+public:
+    LinearProbeRangeFinder(std::vector<io::PrefetchRange>&& ranges) : _ranges(std::move(ranges)) {}
+
+    Status get_range_for(int64_t desired_offset, io::PrefetchRange& result_range) override;
+
+    size_t get_max_range_size() const override {
+        size_t max_range_size = 0;
+        for (const auto& range : _ranges) {
+            max_range_size = std::max(max_range_size, range.end_offset - range.start_offset);
+        }
+        return max_range_size;
+    }
+
+    ~LinearProbeRangeFinder() override = default;
+
+private:
+    std::vector<io::PrefetchRange> _ranges;
+    size_t index {0};
+};
+
+/**
+ * The reader provides a solution to read one range at a time. You can customize RangeFinder to meet your scenario.
+ * For me, since there will be tiny stripes when reading orc files, in order to reduce the requests to hdfs,
+ * I first merge the access to the orc files to be read (of course there is a problem of read amplification,
+ * but in my scenario, compared with reading hdfs multiple times, it is faster to read more data on hdfs at one time),
+ * and then because the actual reading of orc files is in order from front to back, I provide LinearProbeRangeFinder.
+ */
+class RangeCacheFileReader : public io::FileReader {
+    struct RangeCacheReaderStatistics {
+        int64_t request_io = 0;
+        int64_t request_bytes = 0;
+        int64_t request_time = 0;
+        int64_t read_to_cache_time = 0;
+        int64_t cache_refresh_count = 0;
+        int64_t read_to_cache_bytes = 0;
+    };
+
+public:
+    RangeCacheFileReader(RuntimeProfile* profile, io::FileReaderSPtr inner_reader,
+                         std::shared_ptr<RangeFinder> range_finder);
+
+    ~RangeCacheFileReader() override = default;
+
+    Status close() override {
+        if (!_closed) {
+            _closed = true;
+        }
+        return Status::OK();
+    }
+
+    const io::Path& path() const override { return _inner_reader->path(); }
+
+    size_t size() const override { return _size; }
+
+    bool closed() const override { return _closed; }
+
+    int64_t mtime() const override { return _inner_reader->mtime(); }
+
+protected:
+    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                        const IOContext* io_ctx) override;
+
+    void _collect_profile_before_close() override;
+
+private:
+    RuntimeProfile* _profile = nullptr;
+    io::FileReaderSPtr _inner_reader;
+    std::shared_ptr<RangeFinder> _range_finder;
+
+    OwnedSlice _cache;
+    int64_t _current_start_offset = -1;
+
+    size_t _size;
+    bool _closed = false;
+
+    RuntimeProfile::Counter* _request_io = nullptr;
+    RuntimeProfile::Counter* _request_bytes = nullptr;
+    RuntimeProfile::Counter* _request_time = nullptr;
+    RuntimeProfile::Counter* _read_to_cache_time = nullptr;
+    RuntimeProfile::Counter* _cache_refresh_count = nullptr;
+    RuntimeProfile::Counter* _read_to_cache_bytes = nullptr;
+    RangeCacheReaderStatistics _cache_statistics;
+    /**
+     * `RangeCacheFileReader`:
+     *   1. `CacheRefreshCount`: how many IOs are merged
+     *   2. `ReadToCacheBytes`: how much data is actually read after merging
+     *   3. `ReadToCacheTime`: how long it takes to read data after merging
+     *   4. `RequestBytes`: how many bytes does the apache-orc library actually need to read the orc file
+     *   5. `RequestIO`: how many times the apache-orc library calls this read interface
+     *   6. `RequestTime`: how long it takes the apache-orc library to call this read interface
+     *
+     *   It should be noted that `RangeCacheFileReader` is a wrapper of the reader that actually reads data,such as
+     *   the hdfs reader, so strictly speaking, `CacheRefreshCount` is not equal to how many IOs are initiated to hdfs,
+     *  because each time the hdfs reader is requested, the hdfs reader may not be able to read all the data at once.
+     */
 };
 
 /**
@@ -81,15 +227,14 @@ public:
         int64_t merged_io = 0;
         int64_t request_bytes = 0;
         int64_t merged_bytes = 0;
-        int64_t apply_bytes = 0;
     };
 
     struct RangeCachedData {
         size_t start_offset;
         size_t end_offset;
-        std::vector<int16> ref_box;
-        std::vector<uint32> box_start_offset;
-        std::vector<uint32> box_end_offset;
+        std::vector<int16_t> ref_box;
+        std::vector<uint32_t> box_start_offset;
+        std::vector<uint32_t> box_end_offset;
         bool has_read = false;
 
         RangeCachedData(size_t start_offset, size_t end_offset)
@@ -109,11 +254,11 @@ public:
             box_end_offset.clear();
         }
 
-        int16 release_last_box() {
+        int16_t release_last_box() {
             // we can only release the last referenced box to ensure sequential read in range
             if (!empty()) {
-                int16 last_box_ref = ref_box.back();
-                uint32 released_size = box_end_offset.back() - box_start_offset.back();
+                int16_t last_box_ref = ref_box.back();
+                uint32_t released_size = box_end_offset.back() - box_start_offset.back();
                 ref_box.pop_back();
                 box_start_offset.pop_back();
                 box_end_offset.pop_back();
@@ -134,7 +279,8 @@ public:
     static constexpr size_t NUM_BOX = TOTAL_BUFFER_SIZE / BOX_SIZE; // 128
 
     MergeRangeFileReader(RuntimeProfile* profile, io::FileReaderSPtr reader,
-                         const std::vector<PrefetchRange>& random_access_ranges)
+                         const std::vector<PrefetchRange>& random_access_ranges,
+                         int64_t merge_read_slice_size = READ_SLICE_SIZE)
             : _profile(profile),
               _reader(std::move(reader)),
               _random_access_ranges(random_access_ranges) {
@@ -147,9 +293,13 @@ public:
         // 1MB for oss, 8KB for hdfs
         _equivalent_io_size =
                 _is_oss ? config::merged_oss_min_io_size : config::merged_hdfs_min_io_size;
-        for (const PrefetchRange& range : _random_access_ranges) {
-            _statistics.apply_bytes += range.end_offset - range.start_offset;
+
+        _merged_read_slice_size = merge_read_slice_size;
+
+        if (_merged_read_slice_size < 0) {
+            _merged_read_slice_size = READ_SLICE_SIZE;
         }
+
         if (_profile != nullptr) {
             const char* random_profile = "MergedSmallIO";
             ADD_TIMER_WITH_LEVEL(_profile, random_profile, 1);
@@ -163,17 +313,10 @@ public:
                                                           random_profile, 1);
             _merged_bytes = ADD_CHILD_COUNTER_WITH_LEVEL(_profile, "MergedBytes", TUnit::BYTES,
                                                          random_profile, 1);
-            _apply_bytes = ADD_CHILD_COUNTER_WITH_LEVEL(_profile, "ApplyBytes", TUnit::BYTES,
-                                                        random_profile, 1);
         }
     }
 
-    ~MergeRangeFileReader() override {
-        delete[] _read_slice;
-        for (char* box : _boxes) {
-            delete[] box;
-        }
-    }
+    ~MergeRangeFileReader() override = default;
 
     Status close() override {
         if (!_closed) {
@@ -188,6 +331,8 @@ public:
 
     bool closed() const override { return _closed; }
 
+    int64_t mtime() const override { return _reader->mtime(); }
+
     // for test only
     size_t buffer_remaining() const { return _remaining; }
 
@@ -195,7 +340,7 @@ public:
     const std::vector<RangeCachedData>& range_cached_data() const { return _range_cached_data; }
 
     // for test only
-    const std::vector<int16>& box_reference() const { return _box_ref; }
+    const std::vector<int16_t>& box_reference() const { return _box_ref; }
 
     // for test only
     const Statistics& statistics() const { return _statistics; }
@@ -212,7 +357,6 @@ protected:
             COUNTER_UPDATE(_merged_io, _statistics.merged_io);
             COUNTER_UPDATE(_request_bytes, _statistics.request_bytes);
             COUNTER_UPDATE(_merged_bytes, _statistics.merged_bytes);
-            COUNTER_UPDATE(_apply_bytes, _statistics.apply_bytes);
             if (_reader != nullptr) {
                 _reader->collect_profile_before_close();
             }
@@ -226,7 +370,6 @@ private:
     RuntimeProfile::Counter* _merged_io = nullptr;
     RuntimeProfile::Counter* _request_bytes = nullptr;
     RuntimeProfile::Counter* _merged_bytes = nullptr;
-    RuntimeProfile::Counter* _apply_bytes = nullptr;
 
     int _search_read_range(size_t start_offset, size_t end_offset);
     void _clean_cached_data(RangeCachedData& cached_data);
@@ -234,7 +377,7 @@ private:
                       size_t* bytes_read);
     Status _fill_box(int range_index, size_t start_offset, size_t to_read, size_t* bytes_read,
                      const IOContext* io_ctx);
-    void _dec_box_ref(int16 box_index);
+    void _dec_box_ref(int16_t box_index);
 
     RuntimeProfile* _profile = nullptr;
     io::FileReaderSPtr _reader;
@@ -244,14 +387,15 @@ private:
     bool _closed = false;
     size_t _remaining;
 
-    char* _read_slice = nullptr;
-    std::vector<char*> _boxes;
-    int16 _last_box_ref = -1;
-    uint32 _last_box_usage = 0;
-    std::vector<int16> _box_ref;
+    std::unique_ptr<OwnedSlice> _read_slice;
+    std::vector<OwnedSlice> _boxes;
+    int16_t _last_box_ref = -1;
+    uint32_t _last_box_usage = 0;
+    std::vector<int16_t> _box_ref;
     bool _is_oss;
     double _max_amplified_ratio;
     size_t _equivalent_io_size;
+    int64_t _merged_read_slice_size;
 
     Statistics _statistics;
 };
@@ -271,6 +415,12 @@ public:
             const FileDescription& file_description, const io::FileReaderOptions& reader_options,
             AccessMode access_mode = SEQUENTIAL, const IOContext* io_ctx = nullptr,
             const PrefetchRange file_range = PrefetchRange(0, 0));
+
+    static Result<io::FileReaderSPtr> create_file_reader(
+            RuntimeProfile* profile, const FileSystemProperties& system_properties,
+            const FileDescription& file_description, const io::FileReaderOptions& reader_options,
+            AccessMode access_mode, std::shared_ptr<const IOContext> io_ctx,
+            const PrefetchRange file_range = PrefetchRange(0, 0));
 };
 
 class PrefetchBufferedReader;
@@ -278,13 +428,14 @@ struct PrefetchBuffer : std::enable_shared_from_this<PrefetchBuffer>, public Pro
     enum class BufferStatus { RESET, PENDING, PREFETCHED, CLOSED };
 
     PrefetchBuffer(const PrefetchRange file_range, size_t buffer_size, size_t whole_buffer_size,
-                   io::FileReader* reader, const IOContext* io_ctx,
+                   io::FileReader* reader, std::shared_ptr<const IOContext> io_ctx,
                    std::function<void(PrefetchBuffer&)> sync_profile)
             : _file_range(file_range),
               _size(buffer_size),
               _whole_buffer_size(whole_buffer_size),
               _reader(reader),
-              _io_ctx(io_ctx),
+              _io_ctx_holder(std::move(io_ctx)),
+              _io_ctx(_io_ctx_holder.get()),
               _buf(new char[buffer_size]),
               _sync_profile(std::move(sync_profile)) {}
 
@@ -295,7 +446,8 @@ struct PrefetchBuffer : std::enable_shared_from_this<PrefetchBuffer>, public Pro
               _size(other._size),
               _whole_buffer_size(other._whole_buffer_size),
               _reader(other._reader),
-              _io_ctx(other._io_ctx),
+              _io_ctx_holder(std::move(other._io_ctx_holder)),
+              _io_ctx(_io_ctx_holder.get()),
               _buf(std::move(other._buf)),
               _sync_profile(std::move(other._sync_profile)) {}
 
@@ -311,6 +463,7 @@ struct PrefetchBuffer : std::enable_shared_from_this<PrefetchBuffer>, public Pro
     size_t _len {0};
     size_t _whole_buffer_size;
     io::FileReader* _reader = nullptr;
+    std::shared_ptr<const IOContext> _io_ctx_holder;
     const IOContext* _io_ctx = nullptr;
     std::unique_ptr<char[]> _buf;
     BufferStatus _buffer_status {BufferStatus::RESET};
@@ -380,7 +533,8 @@ constexpr int64_t s_max_pre_buffer_size = 4 * 1024 * 1024; // 4MB
 class PrefetchBufferedReader final : public io::FileReader {
 public:
     PrefetchBufferedReader(RuntimeProfile* profile, io::FileReaderSPtr reader,
-                           PrefetchRange file_range, const IOContext* io_ctx = nullptr,
+                           PrefetchRange file_range,
+                           std::shared_ptr<const IOContext> io_ctx = nullptr,
                            int64_t buffer_size = -1L);
     ~PrefetchBufferedReader() override;
 
@@ -391,6 +545,8 @@ public:
     size_t size() const override { return _size; }
 
     bool closed() const override { return _closed; }
+
+    int64_t mtime() const override { return _reader->mtime(); }
 
     void set_random_access_ranges(const std::vector<PrefetchRange>* random_access_ranges) {
         _random_access_ranges = random_access_ranges;
@@ -416,7 +572,7 @@ private:
     void reset_all_buffer(size_t position) {
         for (int64_t i = 0; i < _pre_buffers.size(); i++) {
             int64_t cur_pos = position + i * s_max_pre_buffer_size;
-            int cur_buf_pos = get_buffer_pos(cur_pos);
+            size_t cur_buf_pos = get_buffer_pos(cur_pos);
             // reset would do all the prefetch work
             _pre_buffers[cur_buf_pos]->reset_offset(get_buffer_offset(cur_pos));
         }
@@ -425,6 +581,7 @@ private:
     io::FileReaderSPtr _reader;
     PrefetchRange _file_range;
     const std::vector<PrefetchRange>* _random_access_ranges = nullptr;
+    std::shared_ptr<const IOContext> _io_ctx_holder;
     const IOContext* _io_ctx = nullptr;
     std::vector<std::shared_ptr<PrefetchBuffer>> _pre_buffers;
     int64_t _whole_pre_buffer_size;
@@ -452,6 +609,8 @@ public:
 
     bool closed() const override { return _closed; }
 
+    int64_t mtime() const override { return _reader->mtime(); }
+
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override;
@@ -471,12 +630,6 @@ private:
  */
 class BufferedStreamReader {
 public:
-    struct Statistics {
-        int64_t read_time = 0;
-        int64_t read_calls = 0;
-        int64_t read_bytes = 0;
-    };
-
     /**
      * Return the address of underlying buffer that locates the start of data between [offset, offset + bytes_to_read)
      * @param buf the buffer address to save the start address of data
@@ -489,13 +642,11 @@ public:
      * Save the data address to slice.data, and the slice.size is the bytes to read.
      */
     virtual Status read_bytes(Slice& slice, uint64_t offset, const IOContext* io_ctx) = 0;
-    Statistics& statistics() { return _statistics; }
     virtual ~BufferedStreamReader() = default;
     // return the file path
     virtual std::string path() = 0;
 
-protected:
-    Statistics _statistics;
+    virtual int64_t mtime() const = 0;
 };
 
 class BufferedFileStreamReader : public BufferedStreamReader, public ProfileCollector {
@@ -509,6 +660,8 @@ public:
     Status read_bytes(Slice& slice, uint64_t offset, const IOContext* io_ctx) override;
     std::string path() override { return _file->path(); }
 
+    int64_t mtime() const override { return _file->mtime(); }
+
 protected:
     void _collect_profile_before_close() override {
         if (_file != nullptr) {
@@ -517,7 +670,7 @@ protected:
     }
 
 private:
-    std::unique_ptr<uint8_t[]> _buf;
+    DorisUniqueBufferPtr<uint8_t> _buf;
     io::FileReaderSPtr _file;
     uint64_t _file_start_offset;
     uint64_t _file_end_offset;
@@ -529,4 +682,7 @@ private:
 };
 
 } // namespace io
+
+#include "common/compile_check_end.h"
+
 } // namespace doris

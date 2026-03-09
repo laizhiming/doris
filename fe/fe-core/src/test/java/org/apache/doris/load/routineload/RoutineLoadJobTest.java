@@ -17,8 +17,6 @@
 
 package org.apache.doris.load.routineload;
 
-import org.apache.doris.analysis.CreateRoutineLoadStmt;
-import org.apache.doris.analysis.SqlParser;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -30,15 +28,15 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.kafka.KafkaUtil;
-import org.apache.doris.persist.EditLog;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateRoutineLoadInfo;
 import org.apache.doris.thrift.TKafkaRLTaskProgress;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 import org.apache.doris.transaction.TransactionException;
 import org.apache.doris.transaction.TransactionState;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import java_cup.runtime.Symbol;
 import mockit.Expectations;
 import mockit.Injectable;
 import mockit.Mock;
@@ -53,16 +51,6 @@ import java.util.List;
 import java.util.Map;
 
 public class RoutineLoadJobTest {
-
-    @Mocked
-    EditLog editLog;
-    @Mocked
-    SqlParser sqlParser;
-    @Mocked
-    CreateRoutineLoadStmt createRoutineLoadStmt;
-    @Mocked
-    Symbol symbol;
-
     @Test
     public void testAfterAbortedReasonOffsetOutOfRange(@Mocked Env env,
                                                        @Injectable TransactionState transactionState,
@@ -290,7 +278,6 @@ public class RoutineLoadJobTest {
         };
 
         RoutineLoadJob routineLoadJob = new KafkaRoutineLoadJob();
-        Deencapsulation.setField(routineLoadJob, "state", RoutineLoadJob.JobState.RUNNING);
         Deencapsulation.setField(routineLoadJob, "progress", kafkaProgress);
         routineLoadJob.update();
 
@@ -302,7 +289,7 @@ public class RoutineLoadJobTest {
         RoutineLoadJob routineLoadJob = new KafkaRoutineLoadJob();
         Deencapsulation.setField(routineLoadJob, "maxErrorNum", 0);
         Deencapsulation.setField(routineLoadJob, "maxBatchRows", 0);
-        Deencapsulation.invoke(routineLoadJob, "updateNumOfData", 1L, 1L, 0L, 1L, false);
+        Deencapsulation.invoke(routineLoadJob, "updateNumOfData", 1L, 1L, 0L, 1L, 1L, false);
 
         Assert.assertEquals(RoutineLoadJob.JobState.PAUSED, Deencapsulation.getField(routineLoadJob, "state"));
 
@@ -317,7 +304,7 @@ public class RoutineLoadJobTest {
         RoutineLoadStatistic jobStatistic = Deencapsulation.getField(routineLoadJob, "jobStatistic");
         Deencapsulation.setField(jobStatistic, "currentErrorRows", 1);
         Deencapsulation.setField(jobStatistic, "currentTotalRows", 99);
-        Deencapsulation.invoke(routineLoadJob, "updateNumOfData", 2L, 0L, 0L, 1L, false);
+        Deencapsulation.invoke(routineLoadJob, "updateNumOfData", 2L, 0L, 0L, 1L, 1L, false);
 
         Assert.assertEquals(RoutineLoadJob.JobState.RUNNING, Deencapsulation.getField(routineLoadJob, "state"));
         Assert.assertEquals(new Long(0), Deencapsulation.getField(jobStatistic, "currentErrorRows"));
@@ -363,7 +350,7 @@ public class RoutineLoadJobTest {
                 + "\"desired_concurrent_number\" = \"0\",\n"
                 + "\"max_error_number\" = \"10\",\n"
                 + "\"max_filter_ratio\" = \"1.0\",\n"
-                + "\"max_batch_interval\" = \"10\",\n"
+                + "\"max_batch_interval\" = \"60\",\n"
                 + "\"max_batch_rows\" = \"10\",\n"
                 + "\"max_batch_size\" = \"1073741824\",\n"
                 + "\"format\" = \"csv\",\n"
@@ -381,6 +368,129 @@ public class RoutineLoadJobTest {
                 + ");";
         System.out.println(showCreateInfo);
         Assert.assertEquals(expect, showCreateInfo);
+    }
+
+    @Test
+    public void testParseUniqueKeyUpdateMode() {
+        // Test valid mode strings
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPSERT,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("UPSERT"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPSERT,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("upsert"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("UPDATE_FIXED_COLUMNS"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("update_fixed_columns"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("UPDATE_FLEXIBLE_COLUMNS"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS,
+                CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("Update_Flexible_Columns"));
+
+        // Test invalid mode strings
+        Assert.assertNull(CreateRoutineLoadInfo.parseUniqueKeyUpdateMode(null));
+        Assert.assertNull(CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("INVALID"));
+        Assert.assertNull(CreateRoutineLoadInfo.parseUniqueKeyUpdateMode(""));
+        Assert.assertNull(CreateRoutineLoadInfo.parseUniqueKeyUpdateMode("PARTIAL_UPDATE"));
+    }
+
+    @Test
+    public void testParseAndValidateUniqueKeyUpdateMode() throws Exception {
+        // Test valid mode strings
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPSERT,
+                CreateRoutineLoadInfo.parseAndValidateUniqueKeyUpdateMode("UPSERT"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS,
+                CreateRoutineLoadInfo.parseAndValidateUniqueKeyUpdateMode("UPDATE_FIXED_COLUMNS"));
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS,
+                CreateRoutineLoadInfo.parseAndValidateUniqueKeyUpdateMode("UPDATE_FLEXIBLE_COLUMNS"));
+
+        // Test invalid mode string throws exception
+        try {
+            CreateRoutineLoadInfo.parseAndValidateUniqueKeyUpdateMode("INVALID_MODE");
+            Assert.fail("Expected AnalysisException");
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("unique_key_update_mode"));
+            Assert.assertTrue(e.getMessage().contains("INVALID_MODE"));
+        }
+    }
+
+    @Test
+    public void testUniqueKeyUpdateModeInJobProperties() {
+        // Test that uniqueKeyUpdateMode is properly stored in jobProperties
+        KafkaRoutineLoadJob job = new KafkaRoutineLoadJob();
+        Map<String, String> jobProperties = Maps.newHashMap();
+        jobProperties.put(CreateRoutineLoadInfo.UNIQUE_KEY_UPDATE_MODE, "UPDATE_FLEXIBLE_COLUMNS");
+        Deencapsulation.setField(job, "jobProperties", jobProperties);
+        Deencapsulation.setField(job, "uniqueKeyUpdateMode", TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS);
+
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS, job.getUniqueKeyUpdateMode());
+    }
+
+    @Test
+    public void testBackwardCompatibilityPartialColumnsToUniqueKeyUpdateMode() throws Exception {
+        // Test backward compatibility: partial_columns=true should map to UPDATE_FIXED_COLUMNS
+        // This tests the logic in gsonPostProcess without calling the full method
+        KafkaRoutineLoadJob job = new KafkaRoutineLoadJob();
+        Map<String, String> jobProperties = Maps.newHashMap();
+        jobProperties.put(CreateRoutineLoadInfo.PARTIAL_COLUMNS, "true");
+        // Note: UNIQUE_KEY_UPDATE_MODE is NOT set - testing backward compatibility
+        Deencapsulation.setField(job, "jobProperties", jobProperties);
+        Deencapsulation.setField(job, "uniqueKeyUpdateMode", TUniqueKeyUpdateMode.UPSERT);
+
+        // Simulate the backward compatibility logic from gsonPostProcess
+        TUniqueKeyUpdateMode uniqueKeyUpdateMode = Deencapsulation.getField(job, "uniqueKeyUpdateMode");
+        boolean isPartialUpdate = false;
+
+        // Process PARTIAL_COLUMNS when UNIQUE_KEY_UPDATE_MODE is not set
+        if (uniqueKeyUpdateMode == TUniqueKeyUpdateMode.UPSERT) {
+            String partialColumnsValue = jobProperties.get(CreateRoutineLoadInfo.PARTIAL_COLUMNS);
+            isPartialUpdate = Boolean.parseBoolean(partialColumnsValue);
+            if (isPartialUpdate) {
+                uniqueKeyUpdateMode = TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS;
+            }
+        }
+
+        // Verify the backward compatibility logic
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS, uniqueKeyUpdateMode);
+        Assert.assertTrue(isPartialUpdate);
+    }
+
+    @Test
+    public void testUniqueKeyUpdateModeTakesPrecedenceOverPartialColumns() throws Exception {
+        // Test that unique_key_update_mode takes precedence over partial_columns
+        // This tests the logic in gsonPostProcess without calling the full method
+        KafkaRoutineLoadJob job = new KafkaRoutineLoadJob();
+        Map<String, String> jobProperties = Maps.newHashMap();
+        jobProperties.put(CreateRoutineLoadInfo.UNIQUE_KEY_UPDATE_MODE, "UPDATE_FLEXIBLE_COLUMNS");
+        jobProperties.put(CreateRoutineLoadInfo.PARTIAL_COLUMNS, "true");
+        Deencapsulation.setField(job, "jobProperties", jobProperties);
+
+        // Simulate the precedence logic from gsonPostProcess
+        TUniqueKeyUpdateMode uniqueKeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
+        boolean isPartialUpdate = false;
+
+        // Process UNIQUE_KEY_UPDATE_MODE first (takes precedence)
+        if (jobProperties.containsKey(CreateRoutineLoadInfo.UNIQUE_KEY_UPDATE_MODE)) {
+            String modeValue = jobProperties.get(CreateRoutineLoadInfo.UNIQUE_KEY_UPDATE_MODE);
+            TUniqueKeyUpdateMode mode = CreateRoutineLoadInfo.parseUniqueKeyUpdateMode(modeValue);
+            if (mode != null) {
+                uniqueKeyUpdateMode = mode;
+                isPartialUpdate = (uniqueKeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS);
+            }
+        }
+
+        // Process PARTIAL_COLUMNS only if UNIQUE_KEY_UPDATE_MODE results in UPSERT
+        if (uniqueKeyUpdateMode == TUniqueKeyUpdateMode.UPSERT) {
+            String partialColumnsValue = jobProperties.get(CreateRoutineLoadInfo.PARTIAL_COLUMNS);
+            isPartialUpdate = Boolean.parseBoolean(partialColumnsValue);
+            if (isPartialUpdate) {
+                uniqueKeyUpdateMode = TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS;
+            }
+        }
+
+        // unique_key_update_mode should take precedence
+        Assert.assertEquals(TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS, uniqueKeyUpdateMode);
+        // isPartialUpdate should be false for UPDATE_FLEXIBLE_COLUMNS
+        Assert.assertFalse(isPartialUpdate);
     }
 
 }

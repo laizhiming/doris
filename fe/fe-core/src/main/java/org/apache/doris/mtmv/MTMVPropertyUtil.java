@@ -33,12 +33,14 @@ public class MTMVPropertyUtil {
     public static final Set<String> MV_PROPERTY_KEYS = Sets.newHashSet(
             PropertyAnalyzer.PROPERTIES_GRACE_PERIOD,
             PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES,
+            PropertyAnalyzer.ASYNC_MV_QUERY_REWRITE_CONSISTENCY_RELAXED_TABLES,
             PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM,
             PropertyAnalyzer.PROPERTIES_WORKLOAD_GROUP,
             PropertyAnalyzer.PROPERTIES_PARTITION_SYNC_LIMIT,
             PropertyAnalyzer.PROPERTIES_PARTITION_TIME_UNIT,
             PropertyAnalyzer.PROPERTIES_PARTITION_DATE_FORMAT,
-            PropertyAnalyzer.PROPERTIES_ENABLE_NONDETERMINISTIC_FUNCTION
+            PropertyAnalyzer.PROPERTIES_ENABLE_NONDETERMINISTIC_FUNCTION,
+            PropertyAnalyzer.PROPERTIES_USE_FOR_REWRITE
     );
 
     public static void analyzeProperty(String key, String value) {
@@ -51,6 +53,9 @@ public class MTMVPropertyUtil {
                 break;
             case PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES:
                 analyzeExcludedTriggerTables(value);
+                break;
+            case PropertyAnalyzer.ASYNC_MV_QUERY_REWRITE_CONSISTENCY_RELAXED_TABLES:
+                analyzeDataChangeStillRewrittenTables(value);
                 break;
             case PropertyAnalyzer.PROPERTIES_WORKLOAD_GROUP:
                 analyzeWorkloadGroup(value);
@@ -65,6 +70,10 @@ public class MTMVPropertyUtil {
                 analyzePartitionSyncLimit(value);
                 break;
             case PropertyAnalyzer.PROPERTIES_ENABLE_NONDETERMINISTIC_FUNCTION:
+                analyzeBooleanProperty(value, PropertyAnalyzer.PROPERTIES_ENABLE_NONDETERMINISTIC_FUNCTION);
+                break;
+            case PropertyAnalyzer.PROPERTIES_USE_FOR_REWRITE:
+                analyzeBooleanProperty(value, PropertyAnalyzer.PROPERTIES_USE_FOR_REWRITE);
                 break;
             default:
                 throw new AnalysisException("illegal key:" + key);
@@ -116,6 +125,10 @@ public class MTMVPropertyUtil {
         // do nothing
     }
 
+    private static void analyzeDataChangeStillRewrittenTables(String value) {
+        // do nothing
+    }
+
     private static void analyzeGracePeriod(String value) {
         if (StringUtils.isEmpty(value)) {
             return;
@@ -138,4 +151,12 @@ public class MTMVPropertyUtil {
         }
     }
 
+    private static void analyzeBooleanProperty(String propertyValue, String propertyName) {
+        if (StringUtils.isEmpty(propertyValue)) {
+            return;
+        }
+        if (!"true".equalsIgnoreCase(propertyValue) && !"false".equalsIgnoreCase(propertyValue)) {
+            throw new AnalysisException(String.format("valid property %s fail", propertyName));
+        }
+    }
 }

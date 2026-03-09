@@ -26,7 +26,7 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.common.util.URI;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.VirtualSlotReference;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.Udf;
 import org.apache.doris.nereids.trees.expressions.functions.generator.TableGeneratingFunction;
@@ -39,7 +39,6 @@ import com.google.common.collect.ImmutableList;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -56,6 +55,8 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
     private final String prepareFn;
     private final String closeFn;
     private final String checkSum;
+    private final boolean isStaticLoad;
+    private final long expirationTime;
 
     /**
      * Constructor of UDTF
@@ -63,7 +64,7 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
     public JavaUdtf(String name, long functionId, String dbName, TFunctionBinaryType binaryType,
             FunctionSignature signature,
             NullableMode nullableMode, String objectFile, String symbol, String prepareFn, String closeFn,
-            String checkSum, Expression... args) {
+            String checkSum, boolean isStaticLoad, long expirationTime, Expression... args) {
         super(name, args);
         this.dbName = dbName;
         this.functionId = functionId;
@@ -75,6 +76,8 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
         this.prepareFn = prepareFn;
         this.closeFn = closeFn;
         this.checkSum = checkSum;
+        this.isStaticLoad = isStaticLoad;
+        this.expirationTime = expirationTime;
     }
 
     /**
@@ -84,7 +87,8 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
     public JavaUdtf withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == this.children.size());
         return new JavaUdtf(getName(), functionId, dbName, binaryType, signature, nullableMode,
-                objectFile, symbol, prepareFn, closeFn, checkSum, children.toArray(new Expression[0]));
+                objectFile, symbol, prepareFn, closeFn, checkSum, isStaticLoad, expirationTime,
+                children.toArray(new Expression[0]));
     }
 
     @Override
@@ -119,6 +123,8 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
             expr.setNullableMode(nullableMode);
             expr.setChecksum(checkSum);
             expr.setId(functionId);
+            expr.setStaticLoad(isStaticLoad);
+            expr.setExpirationTime(expirationTime);
             expr.setUDTFunction(true);
             return expr;
         } catch (Exception e) {
@@ -141,10 +147,9 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
                 ? sigBuilder.varArgs(argTypes.toArray(new DataType[0]))
                 : sigBuilder.args(argTypes.toArray(new DataType[0]));
 
-        VirtualSlotReference[] virtualSlots = argTypes.stream()
-                .map(type -> new VirtualSlotReference(type.toString(), type, Optional.empty(),
-                        (shape) -> ImmutableList.of()))
-                .toArray(VirtualSlotReference[]::new);
+        SlotReference[] arguments = argTypes.stream()
+                .map(type -> new SlotReference(type.toString(), type))
+                .toArray(SlotReference[]::new);
 
         JavaUdtf udf = new JavaUdtf(fnName, scalar.getId(), dbName, scalar.getBinaryType(), sig,
                 scalar.getNullableMode(),
@@ -153,7 +158,9 @@ public class JavaUdtf extends TableGeneratingFunction implements ExplicitlyCasta
                 scalar.getPrepareFnSymbol(),
                 scalar.getCloseFnSymbol(),
                 scalar.getChecksum(),
-                virtualSlots);
+                scalar.isStaticLoad(),
+                scalar.getExpirationTime(),
+                arguments);
 
         JavaUdtfBuilder builder = new JavaUdtfBuilder(udf);
         Env.getCurrentEnv().getFunctionRegistry().addUdf(dbName, fnName, builder);

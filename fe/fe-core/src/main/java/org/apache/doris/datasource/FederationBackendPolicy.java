@@ -20,15 +20,15 @@
 
 package org.apache.doris.datasource;
 
-import org.apache.doris.catalog.Env;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.IndexedPriorityQueue;
+import org.apache.doris.common.LoadException;
 import org.apache.doris.common.ResettableRandomizedIterator;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.ConsistentHash;
-import org.apache.doris.mysql.privilege.UserProperty;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.resource.Tag;
+import org.apache.doris.resource.computegroup.ComputeGroup;
 import org.apache.doris.spi.Split;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.BeSelectionPolicy;
@@ -36,7 +36,6 @@ import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
@@ -46,11 +45,10 @@ import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
-import com.google.common.collect.Sets;
 import com.google.common.hash.Funnel;
 import com.google.common.hash.Hashing;
 import com.google.common.hash.PrimitiveSink;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -65,12 +63,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
 public class FederationBackendPolicy {
     private static final Logger LOG = LogManager.getLogger(FederationBackendPolicy.class);
+
+    private static final long FIXED_SHUFFLE_SEED = 123456789L;
+
     protected final List<Backend> backends = Lists.newArrayList();
     private final Map<String, List<Backend>> backendMap = Maps.newHashMap();
 
@@ -154,39 +156,39 @@ public class FederationBackendPolicy {
     }
 
     public void init(List<String> preLocations) throws UserException {
-        Set<Tag> tags = Sets.newHashSet();
-        if (ConnectContext.get() != null && ConnectContext.get().getCurrentUserIdentity() != null) {
-            String qualifiedUser = ConnectContext.get().getCurrentUserIdentity().getQualifiedUser();
-            // Some request from stream load(eg, mysql load) may not set user info in ConnectContext
-            // just ignore it.
-            if (!Strings.isNullOrEmpty(qualifiedUser)) {
-                tags = Env.getCurrentEnv().getAuth().getResourceTags(qualifiedUser);
-                if (tags == UserProperty.INVALID_RESOURCE_TAGS) {
-                    throw new UserException("No valid resource tag for user: " + qualifiedUser);
-                }
-            }
-        } else {
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("user info in ExternalFileScanNode should not be null, add log to observer");
-            }
-        }
-
         // scan node is used for query
-        BeSelectionPolicy policy = new BeSelectionPolicy.Builder()
-                .needQueryAvailable()
+        BeSelectionPolicy.Builder builder = new BeSelectionPolicy.Builder();
+        builder.needQueryAvailable()
                 .needLoadAvailable()
-                .addTags(tags)
                 .preferComputeNode(Config.prefer_compute_node_for_external_table)
                 .assignExpectBeNum(Config.min_backend_num_for_external_table)
-                .addPreLocations(preLocations)
-                .build();
-        init(policy);
+                .addPreLocations(preLocations);
+        init(builder.build());
     }
 
     public void init(BeSelectionPolicy policy) throws UserException {
-        backends.addAll(policy.getCandidateBackends(Env.getCurrentSystemInfo().getBackendsByCurrentCluster()));
+        ConnectContext ctx = ConnectContext.get();
+        if (ctx == null) {
+            if (Config.isCloudMode()) {
+                throw new AnalysisException("ConnectContext is null");
+            } else {
+                ctx = new ConnectContext();
+            }
+
+        }
+        ComputeGroup computeGroup = ctx.getComputeGroup();
+        if (Config.isNotCloudMode() && computeGroup.equals(ComputeGroup.INVALID_COMPUTE_GROUP)) {
+            throw new LoadException(ComputeGroup.INVALID_COMPUTE_GROUP_ERR_MSG);
+        }
+
+        backends.addAll(policy.getCandidateBackends(computeGroup.getBackendList()));
         if (backends.isEmpty()) {
-            throw new UserException("No available backends");
+            if (Config.isCloudMode()) {
+                throw new UserException("No available backends, "
+                        + "in cloud maybe this cluster has been dropped, please `use @otherClusterName` switch it");
+            } else {
+                throw new UserException("No available backends for compute group: " + computeGroup.toString());
+            }
         }
         for (Backend backend : backends) {
             assignedWeightPerBackend.put(backend, 0L);
@@ -222,6 +224,7 @@ public class FederationBackendPolicy {
     public Multimap<Backend, Split> computeScanRangeAssignment(List<Split> splits) throws UserException {
         ListMultimap<Backend, Split> assignment = ArrayListMultimap.create();
 
+        Collections.shuffle(splits, new Random(FIXED_SHUFFLE_SEED));
         List<Split> remainingSplits;
 
         List<Backend> backends = new ArrayList<>();
@@ -229,8 +232,6 @@ public class FederationBackendPolicy {
             backends.addAll(backendList);
         }
         ResettableRandomizedIterator<Backend> randomCandidates = new ResettableRandomizedIterator<>(backends);
-
-        boolean splitsToBeRedistributed = false;
 
         // optimizedLocalScheduling enables prioritized assignment of splits to local nodes when splits contain
         // locality information
@@ -248,7 +249,6 @@ public class FederationBackendPolicy {
                         assignment.put(selectedBackend, split);
                         assignedWeightPerBackend.put(selectedBackend,
                                 assignedWeightPerBackend.get(selectedBackend) + split.getSplitWeight().getRawValue());
-                        splitsToBeRedistributed = true;
                         continue;
                     }
                 }
@@ -278,7 +278,6 @@ public class FederationBackendPolicy {
                     case CONSISTENT_HASHING: {
                         candidateNodes = consistentHash.getNode(split,
                                 Config.split_assigner_min_consistent_hash_candidate_num);
-                        splitsToBeRedistributed = true;
                         break;
                     }
                     default: {
@@ -304,7 +303,7 @@ public class FederationBackendPolicy {
                     assignedWeightPerBackend.get(selectedBackend) + split.getSplitWeight().getRawValue());
         }
 
-        if (enableSplitsRedistribution && splitsToBeRedistributed) {
+        if (enableSplitsRedistribution) {
             equateDistribution(assignment);
         }
         return assignment;
@@ -495,9 +494,10 @@ public class FederationBackendPolicy {
     private static class SplitHash implements Funnel<Split> {
         @Override
         public void funnel(Split split, PrimitiveSink primitiveSink) {
-            primitiveSink.putBytes(split.getPathString().getBytes(StandardCharsets.UTF_8));
+            primitiveSink.putBytes(split.getConsistentHashString().getBytes(StandardCharsets.UTF_8));
             primitiveSink.putLong(split.getStart());
             primitiveSink.putLong(split.getLength());
         }
     }
 }
+

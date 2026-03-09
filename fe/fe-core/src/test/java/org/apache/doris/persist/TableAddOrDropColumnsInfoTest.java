@@ -17,12 +17,12 @@
 
 package org.apache.doris.persist;
 
-import org.apache.doris.analysis.IndexDef;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.io.Text;
+import org.apache.doris.nereids.trees.plans.commands.info.IndexDefinition;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.collect.Lists;
@@ -64,11 +64,18 @@ public class TableAddOrDropColumnsInfoTest {
         Map<Long, LinkedList<Column>> indexSchemaMap = new HashMap<>();
         indexSchemaMap.put(tableId, fullSchema);
 
-        List<Index> indexes = Lists.newArrayList(
-                new Index(0, "index", Lists.newArrayList("testCol1"), IndexDef.IndexType.INVERTED, null, "xxxxxx"));
+        Map<Long, List<Column>> oldIndexSchemaMap = new HashMap<>();
+        oldIndexSchemaMap.put(tableId, fullSchema);
 
-        TableAddOrDropColumnsInfo tableAddOrDropColumnsInfo1 = new TableAddOrDropColumnsInfo("", dbId, tableId,
-                indexSchemaMap, indexes, jobId);
+        Map<String, Long> indexNameToId = new HashMap<>();
+        indexNameToId.put("index", 1L);
+
+        List<Index> indexes = Lists.newArrayList(
+                new Index(0, "index", Lists.newArrayList("testCol1"), IndexDefinition.IndexType.INVERTED, null, "xxxxxx"));
+
+        TableAddOrDropColumnsInfo tableAddOrDropColumnsInfo1 = new TableAddOrDropColumnsInfo(
+                "", dbId, tableId, tableId,
+                indexSchemaMap, oldIndexSchemaMap, indexNameToId, indexes, jobId);
 
         String c1Json = GsonUtils.GSON.toJson(tableAddOrDropColumnsInfo1);
         Text.writeString(out, c1Json);

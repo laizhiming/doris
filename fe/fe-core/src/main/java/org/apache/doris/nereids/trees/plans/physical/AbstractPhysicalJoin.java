@@ -32,6 +32,7 @@ import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Join;
+import org.apache.doris.nereids.trees.plans.algebra.ShuffleType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.JoinUtils;
 import org.apache.doris.nereids.util.Utils;
@@ -233,7 +234,7 @@ public abstract class AbstractPhysicalJoin<
         properties.put("HashJoinConjuncts", hashJoinConjuncts.toString());
         properties.put("OtherJoinConjuncts", otherJoinConjuncts.toString());
         properties.put("MarkJoinConjuncts", markJoinConjuncts.toString());
-        properties.put("JoinHint", hint.toString());
+        properties.put("JoinHint", hint.getExplainString());
         properties.put("MarkJoinSlotReference", markJoinSlotReference.toString());
         physicalJoin.put("Properties", properties);
         return physicalJoin;
@@ -266,9 +267,20 @@ public abstract class AbstractPhysicalJoin<
     }
 
     @Override
+    public String getFingerprint() {
+        List<Object> args = Lists.newArrayList(
+                "type", joinType,
+                "hashCondition", hashJoinConjuncts,
+                "otherCondition", otherJoinConjuncts,
+                "markCondition", markJoinConjuncts);
+        return Utils.toSqlString("JOIN", args.toArray());
+    }
+
+    @Override
     public String toString() {
-        List<Object> args = Lists.newArrayList("type", joinType,
+        List<Object> args = Lists.newArrayList(
                 "stats", statistics,
+                "type", joinType,
                 "hashCondition", hashJoinConjuncts,
                 "otherCondition", otherJoinConjuncts,
                 "markCondition", markJoinConjuncts);
@@ -285,8 +297,12 @@ public abstract class AbstractPhysicalJoin<
             args.add(hint.getExplainString());
         }
         if (!runtimeFilters.isEmpty()) {
-            args.add("runtimeFilters");
+            args.add("RFs");
             args.add(runtimeFilters.stream().map(rf -> rf.toString() + " ").collect(Collectors.toList()));
+        }
+        if (!runtimeFiltersV2.isEmpty()) {
+            args.add("RFV2");
+            args.add(runtimeFiltersV2);
         }
         return Utils.toSqlString(this.getClass().getSimpleName() + "[" + id.asInt() + "]" + getGroupIdWithPrefix(),
                 args.toArray());
@@ -305,7 +321,7 @@ public abstract class AbstractPhysicalJoin<
         return false;
     }
 
-    protected Join.ShuffleType shuffleType() {
+    protected ShuffleType shuffleType() {
         if (left() instanceof PhysicalDistribute) {
             if (right() instanceof PhysicalDistribute) {
                 return ShuffleType.shuffle;

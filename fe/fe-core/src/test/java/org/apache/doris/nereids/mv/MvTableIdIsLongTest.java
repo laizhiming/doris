@@ -31,6 +31,9 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.BitSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Test mv rewrite when base table id is lager then integer
@@ -49,10 +52,18 @@ public class MvTableIdIsLongTest extends SqlTestBase {
         };
         new MockUp<MTMVRelationManager>() {
             @Mock
-            public boolean isMVPartitionValid(MTMV mtmv, ConnectContext ctx) {
+            public boolean isMVPartitionValid(MTMV mtmv, ConnectContext ctx, boolean isMVPartitionValid,
+                    Map<List<String>, Set<String>> queryUsedPartitions) {
                 return true;
             }
         };
+        new MockUp<MTMV>() {
+            @Mock
+            public boolean canBeCandidate() {
+                return true;
+            }
+        };
+        connectContext.getState().setIsQuery(true);
         connectContext.getSessionVariable().enableMaterializedViewRewrite = true;
         connectContext.getSessionVariable().enableMaterializedViewNestRewrite = true;
         createMvByNereids("create materialized view mv1 BUILD IMMEDIATE REFRESH COMPLETE ON MANUAL\n"
@@ -67,8 +78,10 @@ public class MvTableIdIsLongTest extends SqlTestBase {
                 connectContext
         );
         PlanChecker.from(c1)
+                .setIsQuery()
                 .analyze()
                 .rewrite()
+                .preMvRewrite()
                 .optimize()
                 .printlnBestPlanTree();
         Assertions.assertTrue(c1.getMemo().toString().contains("mv1"));

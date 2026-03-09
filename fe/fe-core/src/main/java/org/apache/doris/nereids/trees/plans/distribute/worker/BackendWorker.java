@@ -24,9 +24,20 @@ import java.util.Objects;
 /** BackendWorker */
 public class BackendWorker implements DistributedPlanWorker {
     private final Backend backend;
+    private final long catalogId;
 
-    public BackendWorker(Backend backend) {
-        this.backend = backend;
+    public BackendWorker(long catalogId, Backend backend) {
+        this.backend = Objects.requireNonNull(backend, "backend can not be null");
+        this.catalogId = catalogId;
+    }
+
+    public Backend getBackend() {
+        return backend;
+    }
+
+    @Override
+    public long getCatalogId() {
+        return catalogId;
     }
 
     @Override
@@ -37,6 +48,16 @@ public class BackendWorker implements DistributedPlanWorker {
     @Override
     public String address() {
         return backend.getAddress();
+    }
+
+    @Override
+    public String brpcAddress() {
+        return backend.getHost() + ":" + brpcPort();
+    }
+
+    @Override
+    public int brpcPort() {
+        return backend.getBrpcPort();
     }
 
     @Override
@@ -56,7 +77,7 @@ public class BackendWorker implements DistributedPlanWorker {
 
     @Override
     public int hashCode() {
-        return Objects.hash(backend.getId());
+        return Objects.hash(backend.getId(), catalogId);
     }
 
     @Override
@@ -64,7 +85,8 @@ public class BackendWorker implements DistributedPlanWorker {
         if (!(obj instanceof BackendWorker)) {
             return false;
         }
-        return backend.getId() == ((BackendWorker) obj).backend.getId();
+        return backend.getId() == ((BackendWorker) obj).backend.getId()
+                && getCatalogId() == ((BackendWorker) obj).getCatalogId();
     }
 
     @Override

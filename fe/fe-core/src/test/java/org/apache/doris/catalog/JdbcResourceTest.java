@@ -17,17 +17,16 @@
 
 package org.apache.doris.catalog;
 
-import org.apache.doris.analysis.AccessTestUtil;
-import org.apache.doris.analysis.Analyzer;
-import org.apache.doris.analysis.CreateResourceStmt;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
 import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.nereids.trees.plans.commands.CreateResourceCommand;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateResourceInfo;
 import org.apache.doris.qe.ConnectContext;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import mockit.Expectations;
 import mockit.Injectable;
@@ -35,6 +34,7 @@ import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
 
 import java.util.Map;
 
@@ -44,12 +44,9 @@ public class JdbcResourceTest {
 
     private Map<String, String> jdbcProperties;
 
-    private Analyzer analyzer;
-
     @Before
     public void setUp() {
         FeConstants.runningUnitTest = true;
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         jdbcProperties = Maps.newHashMap();
         jdbcProperties.put("type", "jdbc");
         jdbcProperties.put("user", "postgres");
@@ -75,11 +72,9 @@ public class JdbcResourceTest {
 
         jdbcProperties.remove("checksum");
 
-        CreateResourceStmt stmt = new CreateResourceStmt(true, false, "jdbc_resource_pg_14", jdbcProperties);
-
-        stmt.analyze(analyzer);
-
-        resourceMgr.createResource(stmt);
+        CreateResourceCommand createResourceCommand = new CreateResourceCommand(new CreateResourceInfo(true, false, "jdbc_resource_pg_14", ImmutableMap.copyOf(jdbcProperties)));
+        createResourceCommand.getInfo().validate();
+        resourceMgr.createResource(createResourceCommand);
 
         JdbcResource jdbcResource = (JdbcResource) resourceMgr.getResource("jdbc_resource_pg_14");
 
@@ -204,16 +199,51 @@ public class JdbcResourceTest {
     }
 
     @Test
-    public void testJdbcDriverPtah() {
-        String driverPath = "postgresql-42.5.0.jar";
-        Config.jdbc_driver_secure_path = "";
-        String fullPath = JdbcResource.getFullDriverUrl(driverPath);
-        Assert.assertEquals(fullPath, "file://" + Config.jdbc_drivers_dir + "/" + driverPath);
-        Config.jdbc_driver_secure_path = "file:///jdbc/;http://jdbc";
-        String driverPath2 = "file:///postgresql-42.5.0.jar";
-        Exception exception = Assert.assertThrows(IllegalArgumentException.class, () -> {
-            JdbcResource.getFullDriverUrl(driverPath2);
+    public void testValidDriverUrls() {
+        String fileUrl = "file://path/to/driver.jar";
+        Assertions.assertDoesNotThrow(() -> {
+            String result = JdbcResource.getFullDriverUrl(fileUrl);
+            Assert.assertEquals(fileUrl, result);
         });
-        Assert.assertEquals("Driver URL does not match any allowed paths: file:///postgresql-42.5.0.jar", exception.getMessage());
+
+        String httpUrl = "http://example.com/driver.jar";
+        Assertions.assertDoesNotThrow(() -> {
+            String result = JdbcResource.getFullDriverUrl(httpUrl);
+            Assert.assertEquals(httpUrl, result);
+        });
+
+        String httpsUrl = "https://example.com/driver.jar";
+        Assertions.assertDoesNotThrow(() -> {
+            String result = JdbcResource.getFullDriverUrl(httpsUrl);
+            Assert.assertEquals(httpsUrl, result);
+        });
+
+        String jarFile = "driver.jar";
+        Assertions.assertThrows(RuntimeException.class, () -> {
+            JdbcResource.getFullDriverUrl(jarFile);
+        });
+    }
+
+    @Test
+    public void testInvalidDriverUrls() {
+        String invalidUrl1 = "/mnt/path/to/driver.jar";
+        Assert.assertThrows(IllegalArgumentException.class, () -> {
+            JdbcResource.getFullDriverUrl(invalidUrl1);
+        });
+
+        String invalidUrl2 = "ftp://example.com/driver.jar";
+        Assert.assertThrows(IllegalArgumentException.class, () -> {
+            JdbcResource.getFullDriverUrl(invalidUrl2);
+        });
+
+        String invalidUrl3 = "";
+        Assert.assertThrows(IllegalArgumentException.class, () -> {
+            JdbcResource.getFullDriverUrl(invalidUrl3);
+        });
+
+        String invalidUrl4 = "example.com/driver";
+        Assert.assertThrows(IllegalArgumentException.class, () -> {
+            JdbcResource.getFullDriverUrl(invalidUrl4);
+        });
     }
 }

@@ -17,36 +17,56 @@
 
 package org.apache.doris.httpv2.rest;
 
-import org.apache.doris.analysis.InlineViewRef;
-import org.apache.doris.analysis.SelectStmt;
 import org.apache.doris.analysis.StatementBase;
-import org.apache.doris.analysis.TableName;
-import org.apache.doris.analysis.TableRef;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.cloud.qe.ComputeGroupException;
+import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DorisHttpException;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 import org.apache.doris.httpv2.rest.manager.HttpUtils;
 import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.analyzer.UnboundRelation;
+import org.apache.doris.nereids.glue.LogicalPlanAdapter;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.trees.plans.commands.Command;
+import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
+import org.apache.doris.nereids.trees.plans.commands.NeedAuditEncryption;
+import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.logical.LogicalResultSink;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
+import org.apache.doris.nereids.util.RelationUtil;
 import org.apache.doris.planner.PlanFragment;
-import org.apache.doris.planner.Planner;
 import org.apache.doris.planner.ScanNode;
+import org.apache.doris.plugin.AuditEvent;
+import org.apache.doris.qe.AuditLogHelper;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.GlobalVariable;
-import org.apache.doris.qe.OriginStatement;
+import org.apache.doris.qe.QueryState;
+import org.apache.doris.qe.SessionVariable;
+import org.apache.doris.qe.SqlModeHelper;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.TDataSink;
 import org.apache.doris.thrift.TDataSinkType;
 import org.apache.doris.thrift.TMemoryScratchSink;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPaloScanRange;
 import org.apache.doris.thrift.TPlanFragment;
-import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TQueryPlanInfo;
 import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TTabletVersionInfo;
@@ -54,6 +74,9 @@ import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Strings;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
@@ -71,8 +94,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * This class responsible for parse the sql and generate the query plan fragment for a (only one) table{@see OlapTable}
@@ -133,7 +154,7 @@ public class TableQueryPlanAction extends RestBaseController {
                     ConnectContext.get().getSessionVariable().setEnableTwoPhaseReadOpt(false);
                 }
                 if (Config.isCloudMode()) { // Choose a cluster to for this query
-                    ConnectContext.get().getCurrentCloudCluster();
+                    ConnectContext.get().getCloudCluster();
                 }
                 // parse/analysis/plan the sql and acquire tablet distributions
                 handleQuery(ConnectContext.get(), fullDbName, tblName, sql, resultMap);
@@ -163,120 +184,252 @@ public class TableQueryPlanAction extends RestBaseController {
      */
     private void handleQuery(ConnectContext context, String requestDb, String requestTable, String sql,
             Map<String, Object> result) throws DorisHttpException {
-        // use SE to resolve sql
-        StmtExecutor stmtExecutor = new StmtExecutor(context, new OriginStatement(sql, 0), false);
+        List<StatementBase> stmts = null;
+        SessionVariable sessionVariable = context.getSessionVariable();
+        boolean needSetParallelResultSinkToFalse = false;
         try {
-            TQueryOptions tQueryOptions = context.getSessionVariable().toThrift();
-            // Conduct Planner create SingleNodePlan#createPlanFragments
-            tQueryOptions.num_nodes = 1;
-            // analyze sql
-            stmtExecutor.analyze(tQueryOptions);
-        } catch (Exception e) {
-            throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST, e.getMessage());
-        }
-        // the parsed logical statement
-        StatementBase query = stmtExecutor.getParsedStmt();
-        // only process select semantic
-        if (!(query instanceof SelectStmt)) {
-            throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "Select statement needed, but found [" + sql + " ]");
-        }
-        SelectStmt stmt = (SelectStmt) query;
-        // just only process sql like `select * from table where <predicate>`, only support executing scan semantic
-        if (stmt.hasAggInfo() || stmt.hasAnalyticInfo()
-                || stmt.hasOrderByClause() || stmt.hasOffset() || stmt.hasLimit() || stmt.isExplain()) {
-            throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "only support single table filter-prune-scan, but found [ " + sql + "]");
-        }
-        // process only one table by one http query
-        List<TableRef> fromTables = stmt.getTableRefs();
-        if (fromTables.size() != 1) {
-            throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "Select statement must have only one table");
-        }
-
-        TableRef fromTable = fromTables.get(0);
-        if (fromTable instanceof InlineViewRef) {
-            throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "Select statement must not embed another statement");
-        }
-        // check consistent http requested resource with sql referenced
-        // if consistent in this way, can avoid check privilege
-        TableName tableAndDb = fromTables.get(0).getName();
-        int lower = GlobalVariable.lowerCaseTableNames;
-        //Determine whether table names are case-sensitive
-        if (lower == 0) {
-            if (!(tableAndDb.getDb().equals(requestDb) && tableAndDb.getTbl().equals(requestTable))) {
-                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                        "requested database and table must consistent with sql: request [ "
-                                + requestDb + "." + requestTable + "]" + "and sql [" + tableAndDb.toString() + "]");
+            try {
+                if (!sessionVariable.enableParallelResultSink()) {
+                    sessionVariable.setParallelResultSink(true);
+                    needSetParallelResultSinkToFalse = true;
+                }
+                stmts = new NereidsParser().parseSQL(sql, context.getSessionVariable());
+            } catch (Exception e) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST, e.getMessage());
             }
-        } else {
-            if (!(tableAndDb.getDb().equalsIgnoreCase(requestDb)
-                    && tableAndDb.getTbl().equalsIgnoreCase(requestTable))) {
+            // the parsed logical statement
+            StatementBase query = stmts.get(0);
+            if (!(query instanceof LogicalPlanAdapter)) {
                 throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
-                        "requested database and table must consistent with sql: request [ "
-                                + requestDb + "." + requestTable + "]" + "and sql [" + tableAndDb.toString() + "]");
+                        "Select statement needed, but found [" + sql + " ]");
+            }
+            LogicalPlan parsedPlan = ((LogicalPlanAdapter) query).getLogicalPlan();
+            // only process select semantic
+            if (parsedPlan instanceof Command) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "Select statement needed, but found [" + sql + " ]");
+            }
+
+            if (!parsedPlan.collectToList(LogicalSubQueryAlias.class::isInstance).isEmpty()) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "Select statement must not embed another statement");
+            }
+
+            List<UnboundRelation> unboundRelations = parsedPlan.collectToList(UnboundRelation.class::isInstance);
+            if (unboundRelations.size() != 1) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "Select statement must have only one table");
+            }
+
+            // check consistent http requested resource with sql referenced
+            // if consistent in this way, can avoid check privilege
+            List<String> tableQualifier = RelationUtil.getQualifierName(context,
+                    unboundRelations.get(0).getNameParts());
+            if (tableQualifier.size() != 3) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "can't find table " + String.join(",", tableQualifier));
+            }
+            String dbName = tableQualifier.get(1);
+            String tableName = tableQualifier.get(2);
+
+            if (Env.getLowerCaseTableNames(InternalCatalog.INTERNAL_CATALOG_NAME) == 0) {
+                if (!(dbName.equals(requestDb) && tableName.equals(requestTable))) {
+                    throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                            "requested database and table must consistent with sql: request [ "
+                                    + requestDb + "." + requestTable + "]" + "and sql [" + dbName
+                                    + "." + tableName + "]");
+                }
+            } else {
+                if (!(dbName.equalsIgnoreCase(requestDb)
+                        && tableName.equalsIgnoreCase(requestTable))) {
+                    throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                            "requested database and table must consistent with sql: request [ "
+                                    + requestDb + "." + requestTable + "]" + "and sql [" + dbName
+                                    + "." + tableName + "]");
+                }
+            }
+            UUID uuid = UUID.randomUUID();
+            TUniqueId queryId = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
+            context.setQueryId(queryId);
+            context.setStartTime();
+            context.setSqlHash(DigestUtils.md5Hex(sql));
+
+            NereidsPlanner nereidsPlanner = new NereidsPlanner(context.getStatementContext());
+            LogicalPlan rewrittenPlan = (LogicalPlan) nereidsPlanner.planWithLock(parsedPlan,
+                    PhysicalProperties.GATHER, ExplainCommand.ExplainLevel.REWRITTEN_PLAN);
+            if (!rewrittenPlan.allMatch(planTreeNode -> planTreeNode instanceof LogicalOlapScan
+                    || planTreeNode instanceof LogicalFilter || planTreeNode instanceof LogicalProject
+                    || planTreeNode instanceof LogicalResultSink || planTreeNode instanceof LogicalEmptyRelation)) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "only support single table filter-prune-scan, but found [ " + sql + "]");
+            }
+            NereidsPlanner planner = new NereidsPlanner(context.getStatementContext());
+            try {
+                planner.plan(query, context.getSessionVariable().toThrift());
+            } catch (Exception ex) {
+                throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
+                        "only support single table filter-prune-scan, but found [ " + sql + "]");
+            }
+
+            // acquire ScanNode to obtain pruned tablet
+            // in this way, just retrieve only one scannode
+            List<ScanNode> scanNodes = planner.getScanNodes();
+            if (scanNodes.size() > 1) {
+                throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                        "Planner should plan just only one ScanNode but found [ " + scanNodes.size() + "]");
+            }
+            List<TScanRangeLocations> scanRangeLocations = scanNodes.size() == 1
+                    ? scanNodes.get(0).getScanRangeLocations(0) : new ArrayList<>();
+            // acquire the PlanFragment which the executable template
+            List<PlanFragment> fragments = planner.getFragments();
+            if (fragments.size() != 1) {
+                throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                        "Planner should plan just only one PlanFragment but found [ " + fragments.size() + "]");
+            }
+
+            TQueryPlanInfo tQueryPlanInfo = new TQueryPlanInfo();
+
+
+            // acquire TPlanFragment
+            TPlanFragment tPlanFragment = fragments.get(0).toThrift();
+            // set up TMemoryScratchSink
+            TDataSink tDataSink = new TDataSink();
+            tDataSink.type = TDataSinkType.MEMORY_SCRATCH_SINK;
+            tDataSink.memory_scratch_sink = new TMemoryScratchSink();
+            tPlanFragment.output_sink = tDataSink;
+
+            tQueryPlanInfo.plan_fragment = tPlanFragment;
+            tQueryPlanInfo.desc_tbl = planner.getDescTable().toThrift();
+            // set query_id
+            tQueryPlanInfo.query_id = queryId;
+
+
+            Map<Long, TTabletVersionInfo> tabletInfo = new HashMap<>();
+            // acquire resolved tablet distribution
+            Map<String, Node> tabletRoutings = assemblePrunedPartitions(scanRangeLocations);
+            tabletRoutings.forEach((tabletId, node) -> {
+                long tablet = Long.parseLong(tabletId);
+                tabletInfo.put(tablet, new TTabletVersionInfo(tablet, node.version,
+                        0L /*version hash*/, node.schemaHash));
+            });
+            tQueryPlanInfo.tablet_info = tabletInfo;
+
+            // serialize TQueryPlanInfo and encode plan with Base64 to string in order to translate by json format
+            TSerializer serializer;
+            String opaquedQueryPlan;
+            try {
+                serializer = new TSerializer();
+                byte[] queryPlanStream = serializer.serialize(tQueryPlanInfo);
+                opaquedQueryPlan = Base64.getEncoder().encodeToString(queryPlanStream);
+            } catch (TException e) {
+                throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                        "TSerializer failed to serialize PlanFragment, reason [ " + e.getMessage() + " ]");
+            }
+            result.put("partitions", tabletRoutings);
+            result.put("opaqued_query_plan", opaquedQueryPlan);
+            result.put("status", 200);
+            addToAuditLog(context, sql, query);
+        } finally {
+            if (needSetParallelResultSinkToFalse) {
+                sessionVariable.setParallelResultSink(false);
             }
         }
 
-        // acquired Planner to get PlanNode and fragment templates
-        Planner planner = stmtExecutor.planner();
-        // acquire ScanNode to obtain pruned tablet
-        // in this way, just retrieve only one scannode
-        List<ScanNode> scanNodes = planner.getScanNodes();
-        if (scanNodes.size() != 1) {
-            throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "Planner should plan just only one ScanNode but found [ " + scanNodes.size() + "]");
-        }
-        List<TScanRangeLocations> scanRangeLocations = scanNodes.get(0).getScanRangeLocations(0);
-        // acquire the PlanFragment which the executable template
-        List<PlanFragment> fragments = planner.getFragments();
-        if (fragments.size() != 1) {
-            throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "Planner should plan just only one PlanFragment but found [ " + fragments.size() + "]");
-        }
+    }
 
-        TQueryPlanInfo tQueryPlanInfo = new TQueryPlanInfo();
-
-
-        // acquire TPlanFragment
-        TPlanFragment tPlanFragment = fragments.get(0).toThrift();
-        // set up TMemoryScratchSink
-        TDataSink tDataSink = new TDataSink();
-        tDataSink.type = TDataSinkType.MEMORY_SCRATCH_SINK;
-        tDataSink.memory_scratch_sink = new TMemoryScratchSink();
-        tPlanFragment.output_sink = tDataSink;
-
-        tQueryPlanInfo.plan_fragment = tPlanFragment;
-        tQueryPlanInfo.desc_tbl = query.getAnalyzer().getDescTbl().toThrift();
-        // set query_id
-        UUID uuid = UUID.randomUUID();
-        tQueryPlanInfo.query_id = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
-
-        Map<Long, TTabletVersionInfo> tabletInfo = new HashMap<>();
-        // acquire resolved tablet distribution
-        Map<String, Node> tabletRoutings = assemblePrunedPartitions(scanRangeLocations);
-        tabletRoutings.forEach((tabletId, node) -> {
-            long tablet = Long.parseLong(tabletId);
-            tabletInfo.put(tablet, new TTabletVersionInfo(tablet, node.version, 0L /*version hash*/, node.schemaHash));
-        });
-        tQueryPlanInfo.tablet_info = tabletInfo;
-
-        // serialize TQueryPlanInfo and encode plan with Base64 to string in order to translate by json format
-        TSerializer serializer;
-        String opaquedQueryPlan;
+    private static void addToAuditLog(ConnectContext ctx, String origStmt, StatementBase parsedStmt) {
+        // slow query
+        long elapseMs = System.currentTimeMillis() - ctx.getStartTime();
+        CatalogIf catalog = ctx.getCurrentCatalog();
+        String cluster = "";
         try {
-            serializer = new TSerializer();
-            byte[] queryPlanStream = serializer.serialize(tQueryPlanInfo);
-            opaquedQueryPlan = Base64.getEncoder().encodeToString(queryPlanStream);
-        } catch (TException e) {
-            throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "TSerializer failed to serialize PlanFragment, reason [ " + e.getMessage() + " ]");
+            if (Config.isCloudMode()) {
+                cluster = ctx.getCloudCluster(false);
+            }
+        } catch (ComputeGroupException e) {
+            LOG.warn("Failed to get cloud cluster", e);
         }
-        result.put("partitions", tabletRoutings);
-        result.put("opaqued_query_plan", opaquedQueryPlan);
-        result.put("status", 200);
+
+        AuditEvent.AuditEventBuilder auditEventBuilder = ctx.getAuditEventBuilder();
+        // ATTN: MUST reset, otherwise, the same AuditEventBuilder instance will be used in the next query.
+        auditEventBuilder.reset();
+        auditEventBuilder
+                .setEventType(AuditEvent.EventType.AFTER_QUERY)
+                .setQueryId(DebugUtil.printId(ctx.queryId()))
+                .setTimestamp(ctx.getStartTime())
+                .setClientIp(ctx.getClientIP())
+                .setUser(ClusterNamespace.getNameFromFullName(ctx.getQualifiedUser()))
+                .setFeIp(FrontendOptions.getLocalHostAddress())
+                .setCtl(catalog == null ? InternalCatalog.INTERNAL_CATALOG_NAME : catalog.getName())
+                .setDb(ClusterNamespace.getNameFromFullName(ctx.getDatabase()))
+                .setState(ctx.getState().toString())
+                .setErrorCode(ctx.getState().getErrorCode() == null ? 0 : ctx.getState().getErrorCode().getCode())
+                .setErrorMessage((ctx.getState().getErrorMessage() == null ? "" :
+                        ctx.getState().getErrorMessage().replace("\n", " ").replace("\t", " ")))
+                .setQueryTime(elapseMs)
+                .setCpuTimeMs(0)
+                .setPeakMemoryBytes(0)
+                .setScanBytes(0)
+                .setScanRows(0)
+                .setReturnRows(ctx.getReturnRows())
+                .setSpillWriteBytesToLocalStorage(0)
+                .setSpillReadBytesFromLocalStorage(0)
+                .setScanBytesFromLocalStorage(0)
+                .setScanBytesFromRemoteStorage(0)
+                .setFuzzyVariables("")
+                .setCommandType("HttpPlan")
+                .setStmtType("SELECT")
+                .setStmtId(ctx.getStmtId())
+                .setSqlHash(ctx.getSqlHash())
+                .setIsQuery(true)
+                .setIsNereids(true)
+                .setisInternal(false)
+                .setCloudCluster(Strings.isNullOrEmpty(cluster) ? "UNKNOWN" : cluster)
+                .setWorkloadGroup(ctx.getWorkloadGroupName());
+
+        // sql mode
+        SessionVariable sessionVariable = ctx.getSessionVariable();
+        if (sessionVariable != null) {
+            try {
+                auditEventBuilder.setSqlMode(SqlModeHelper.decode(sessionVariable.getSqlMode()));
+            } catch (Exception e) {
+                LOG.warn("decode sql mode {} failed.", sessionVariable.getSqlMode(), e);
+            }
+        }
+
+        boolean isSyntaxErr = ctx.getState().getStateType() == QueryState.MysqlStateType.ERR
+                && ctx.getState().getErrType() == QueryState.ErrType.SYNTAX_PARSE_ERR;
+        String encryptSql = isSyntaxErr ? "Syntax Error" : origStmt;
+        if (isSyntaxErr) {
+            auditEventBuilder.setErrorMessage("Syntax Error");
+        }
+        // We put origin query stmt at the end of audit log, for parsing the log more convenient.
+        LogicalPlan logicalPlan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
+        if ((logicalPlan instanceof NeedAuditEncryption)) {
+            encryptSql = ((NeedAuditEncryption) logicalPlan).geneEncryptionSQL(origStmt);
+        }
+
+        int maxLen = GlobalVariable.auditPluginMaxSqlLength;
+        encryptSql = AuditLogHelper.truncateByBytes(encryptSql, maxLen,
+                " ... /* truncated. audit_plugin_max_sql_length=" + maxLen + " */");
+        auditEventBuilder.setStmt(encryptSql);
+
+        if (!Env.getCurrentEnv().isMaster()) {
+            StmtExecutor executor = ctx.getExecutor();
+            if (executor != null && executor.isForwardToMaster()) {
+                auditEventBuilder.setState(executor.getProxyStatus());
+                int proxyStatusCode = executor.getProxyStatusCode();
+                if (proxyStatusCode != 0) {
+                    auditEventBuilder.setErrorCode(proxyStatusCode);
+                    auditEventBuilder.setErrorMessage(executor.getProxyErrMsg());
+                }
+            }
+        }
+        AuditEvent event = auditEventBuilder.build();
+        Env.getCurrentEnv().getWorkloadRuntimeStatusMgr().submitFinishQueryToAudit(event);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("submit audit event: {}", event.queryId);
+        }
     }
 
     /**

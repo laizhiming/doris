@@ -18,18 +18,16 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.io.Text;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TLargeIntLiteral;
 
 import com.google.gson.annotations.SerializedName;
 
-import java.io.DataInput;
-import java.io.IOException;
-import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -41,27 +39,18 @@ public class LargeIntLiteral extends NumericLiteralExpr {
     public static final BigInteger LARGE_INT_MIN = new BigInteger("-170141183460469231731687303715884105728");
     // 2^127 - 1
     public static final BigInteger LARGE_INT_MAX = new BigInteger("170141183460469231731687303715884105727");
-    // 2^127
-    public static final BigInteger LARGE_INT_MAX_ABS = new BigInteger("170141183460469231731687303715884105728");
 
     @SerializedName("v")
     private BigInteger value;
 
     public LargeIntLiteral() {
         super();
-        analysisDone();
-    }
-
-    public LargeIntLiteral(boolean isMax) throws AnalysisException {
-        super();
-        type = Type.LARGEINT;
-        value = isMax ? LARGE_INT_MAX : LARGE_INT_MIN;
-        analysisDone();
     }
 
     public LargeIntLiteral(BigInteger v) {
         super();
         type = Type.LARGEINT;
+        this.nullable = false;
         value = v;
     }
 
@@ -73,7 +62,8 @@ public class LargeIntLiteral extends NumericLiteralExpr {
             // ATTN: value from 'sql_parser.y' is always be positive. for example: '-256' will to be
             // 256, and for int8_t, 256 is invalid, while -256 is valid. So we check the right border
             // is LARGE_INT_MAX_ABS
-            if (bigInt.compareTo(LARGE_INT_MIN) < 0 || bigInt.compareTo(LARGE_INT_MAX_ABS) > 0) {
+            // if (bigInt.compareTo(LARGE_INT_MIN) < 0 || bigInt.compareTo(LARGE_INT_MAX_ABS) > 0) {
+            if (bigInt.compareTo(LARGE_INT_MIN) < 0 || bigInt.compareTo(LARGE_INT_MAX) > 0) {
                 throw new AnalysisException("Large int literal is out of range: " + value);
             }
         } catch (NumberFormatException e) {
@@ -81,26 +71,7 @@ public class LargeIntLiteral extends NumericLiteralExpr {
         }
         this.value = bigInt;
         type = Type.LARGEINT;
-        analysisDone();
-    }
-
-    public LargeIntLiteral(BigDecimal value) throws AnalysisException {
-        super();
-        BigInteger bigInt;
-        try {
-            bigInt = new BigInteger(value.toPlainString());
-            // ATTN: value from 'sql_parser.y' is always be positive. for example: '-256' will to be
-            // 256, and for int8_t, 256 is invalid, while -256 is valid. So we check the right border
-            // is LARGE_INT_MAX_ABS
-            if (bigInt.compareTo(LARGE_INT_MIN) < 0 || bigInt.compareTo(LARGE_INT_MAX_ABS) > 0) {
-                throw new AnalysisException("Large int literal is out of range: " + value);
-            }
-        } catch (NumberFormatException e) {
-            throw new AnalysisException("Invalid integer literal: " + value, e);
-        }
-        this.value = bigInt;
-        type = Type.LARGEINT;
-        analysisDone();
+        this.nullable = false;
     }
 
     protected LargeIntLiteral(LargeIntLiteral other) {
@@ -121,19 +92,12 @@ public class LargeIntLiteral extends NumericLiteralExpr {
     }
 
     @Override
-    public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
-        if (value.compareTo(LARGE_INT_MIN) < 0 || value.compareTo(LARGE_INT_MAX) > 0) {
-            throw new AnalysisException("Number Overflow. literal: " + value);
-        }
-    }
-
-    @Override
     public boolean isMinValue() {
         return this.value.compareTo(LARGE_INT_MIN) == 0;
     }
 
     @Override
-    public Object getRealValue() {
+    public BigInteger getRealValue() {
         return this.value;
     }
 
@@ -197,11 +161,6 @@ public class LargeIntLiteral extends NumericLiteralExpr {
     }
 
     @Override
-    public String getStringValueForArray() {
-        return "\"" + getStringValue() + "\"";
-    }
-
-    @Override
     public long getLongValue() {
         return value.longValue();
     }
@@ -217,49 +176,15 @@ public class LargeIntLiteral extends NumericLiteralExpr {
     }
 
     @Override
+    public String toSqlImpl(boolean disableTableName, boolean needExternalSql, TableType tableType,
+            TableIf table) {
+        return getStringValue();
+    }
+
+    @Override
     protected void toThrift(TExprNode msg) {
         msg.node_type = TExprNodeType.LARGE_INT_LITERAL;
         msg.large_int_literal = new TLargeIntLiteral(value.toString());
-    }
-
-    @Override
-    protected Expr uncheckedCastTo(Type targetType) throws AnalysisException {
-        if (targetType.isFloatingPointType()) {
-            return new FloatLiteral(new Double(value.doubleValue()), targetType);
-        } else if (targetType.isDecimalV2() || targetType.isDecimalV3()) {
-            DecimalLiteral res = new DecimalLiteral(new BigDecimal(value));
-            res.setType(targetType);
-            return res;
-        } else if (targetType.isIntegerType()) {
-            try {
-                return new IntLiteral(value.longValueExact(), targetType);
-            } catch (ArithmeticException e) {
-                throw new AnalysisException("Number out of range[" + value + "]. type: " + targetType);
-            }
-        }
-        return super.uncheckedCastTo(targetType);
-    }
-
-    @Override
-    public void setupParamFromBinary(ByteBuffer data, boolean isUnsigned) {
-        value = new BigInteger(Long.toUnsignedString(data.getLong()));
-    }
-
-    @Override
-    public void swapSign() {
-        // swapping sign does not change the type
-        value = value.negate();
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        value = new BigInteger(Text.readString(in));
-    }
-
-    public static LargeIntLiteral read(DataInput in) throws IOException {
-        LargeIntLiteral largeIntLiteral = new LargeIntLiteral();
-        largeIntLiteral.readFields(in);
-        return largeIntLiteral;
     }
 
     @Override

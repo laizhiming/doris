@@ -75,7 +75,7 @@ public class HttpDialectConverterPlugin extends Plugin implements DialectConvert
                 "builtin sql dialect converter", DigitalVersion.fromString("2.1.0"),
                 DigitalVersion.fromString("1.8.31"), HttpDialectConverterPlugin.class.getName(), null, null);
         acceptDialects = ImmutableSet.copyOf(Arrays.asList(Dialect.PRESTO, Dialect.TRINO, Dialect.HIVE,
-                Dialect.SPARK, Dialect.POSTGRES, Dialect.CLICKHOUSE));
+                Dialect.SPARK, Dialect.POSTGRES, Dialect.CLICKHOUSE, Dialect.STARROCKS));
     }
 
     public PluginInfo getPluginInfo() {
@@ -103,7 +103,17 @@ public class HttpDialectConverterPlugin extends Plugin implements DialectConvert
         if (Strings.isNullOrEmpty(targetURL)) {
             return null;
         }
-        return HttpDialectUtils.convertSql(targetURL, originSql, sessionVariable.getSqlDialect());
+        // TODO: support multiple URLs load balancing, here we just use the first one
+        String[] urlArray = targetURL.split(",");
+        for (String url : urlArray) {
+            String trimmedUrl = url.trim();
+            if (!trimmedUrl.isEmpty()) {
+                targetURL = trimmedUrl;
+                break;
+            }
+        }
+        return HttpDialectUtils.convertSql(targetURL, originSql, sessionVariable.getSqlDialect(),
+                sessionVariable.getSqlConvertorFeatures(), sessionVariable.getSqlConvertorConfig());
     }
 
     // no need to override parseSqlWithDialect, just return null

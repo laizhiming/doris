@@ -21,6 +21,7 @@ import org.apache.doris.catalog.JdbcResource;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.datasource.CatalogFactory;
+import org.apache.doris.datasource.ExternalCatalog;
 
 import com.google.common.collect.Maps;
 import org.junit.Assert;
@@ -41,24 +42,34 @@ public class JdbcExternalCatalogTest {
         properties.put(JdbcResource.DRIVER_URL, "ojdbc8.jar");
         properties.put(JdbcResource.JDBC_URL, "jdbc:oracle:thin:@127.0.0.1:1521:XE");
         properties.put(JdbcResource.DRIVER_CLASS, "oracle.jdbc.driver.OracleDriver");
-        jdbcExternalCatalog = new JdbcExternalCatalog(1L, "testCatalog", null, properties, "testComment", false);
+        jdbcExternalCatalog = new JdbcExternalCatalog(1L, "testCatalog", null, properties, "testComment");
     }
 
     @Test
-    public void testProcessCompatibleProperties() throws DdlException {
+    public void testProcessCompatibleProperties() {
         // Create a properties map with lower_case_table_names
-        Map<String, String> inputProps = new HashMap<>();
-        inputProps.put("lower_case_table_names", "true");
+        jdbcExternalCatalog.getCatalogProperty().addProperty("lower_case_table_names", "true");
 
         // Call processCompatibleProperties
-        Map<String, String> resultProps = jdbcExternalCatalog.processCompatibleProperties(inputProps, true);
+        jdbcExternalCatalog.setDefaultPropsIfMissing(true);
 
         // Assert that lower_case_meta_names is present and has the correct value
-        Assert.assertTrue(resultProps.containsKey("lower_case_meta_names"));
-        Assert.assertEquals("true", resultProps.get("lower_case_meta_names"));
+        Assert.assertTrue(
+                jdbcExternalCatalog.getCatalogProperty().getProperties().containsKey("lower_case_meta_names"));
+        Assert.assertEquals("true",
+                jdbcExternalCatalog.getCatalogProperty().getProperties().get("lower_case_meta_names"));
 
         // Assert that lower_case_table_names is not present
-        Assert.assertFalse(resultProps.containsKey("lower_case_table_names"));
+        Assert.assertFalse(
+                jdbcExternalCatalog.getCatalogProperty().getProperties().containsKey("lower_case_table_names"));
+
+        jdbcExternalCatalog.getCatalogProperty().addProperty("lower_case_table_names", "true");
+        IllegalArgumentException exceptione = Assert.assertThrows(IllegalArgumentException.class,
+                () -> jdbcExternalCatalog.setDefaultPropsIfMissing(false));
+        Assert.assertEquals(
+                "Jdbc catalog property lower_case_table_names is not supported, please use lower_case_meta_names instead.",
+                exceptione.getMessage());
+        jdbcExternalCatalog.getCatalogProperty().deleteProperty("lower_case_table_names");
     }
 
     @Test
@@ -86,14 +97,14 @@ public class JdbcExternalCatalogTest {
                 exception1.getMessage());
 
         jdbcExternalCatalog.getCatalogProperty().addProperty(JdbcResource.ONLY_SPECIFIED_DATABASE, "true");
-        jdbcExternalCatalog.getCatalogProperty().addProperty(JdbcResource.LOWER_CASE_META_NAMES, "1");
+        jdbcExternalCatalog.getCatalogProperty().addProperty(ExternalCatalog.LOWER_CASE_META_NAMES, "1");
         Exception exception2 = Assert.assertThrows(DdlException.class, () -> jdbcExternalCatalog.checkProperties());
         Assert.assertEquals("errCode = 2, detailMessage = lower_case_meta_names must be true or false",
                 exception2.getMessage());
 
         jdbcExternalCatalog.getCatalogProperty().addProperty(JdbcResource.ONLY_SPECIFIED_DATABASE, "false");
-        jdbcExternalCatalog.getCatalogProperty().addProperty(JdbcResource.LOWER_CASE_META_NAMES, "false");
-        jdbcExternalCatalog.getCatalogProperty().addProperty(JdbcResource.INCLUDE_DATABASE_LIST, "db1,db2");
+        jdbcExternalCatalog.getCatalogProperty().addProperty(ExternalCatalog.LOWER_CASE_META_NAMES, "false");
+        jdbcExternalCatalog.getCatalogProperty().addProperty(ExternalCatalog.INCLUDE_DATABASE_LIST, "db1,db2");
         DdlException exceptione3 = Assert.assertThrows(DdlException.class, () -> jdbcExternalCatalog.checkProperties());
         Assert.assertEquals(
                 "errCode = 2, detailMessage = include_database_list and exclude_database_list cannot be set when only_specified_database is false",

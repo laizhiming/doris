@@ -69,6 +69,13 @@ public interface Job<T extends AbstractTask, C> {
     boolean isReadyForScheduling(C taskContext);
 
     /**
+     * Checks if the job is running.
+     *
+     * @return True if the job is runnning.
+     */
+    boolean isJobRunning();
+
+    /**
      * Retrieves the metadata for the job, which is used to display job information.
      *
      * @return The metadata for the job.
@@ -101,7 +108,7 @@ public interface Job<T extends AbstractTask, C> {
      * Cancels all running tasks of this job.
      * @throws JobException If cancelling a running task fails.
      */
-    void cancelAllTasks() throws JobException;
+    void cancelAllTasks(boolean needWaitCancelComplete) throws JobException;
 
     /**
      * register job
@@ -153,4 +160,11 @@ public interface Job<T extends AbstractTask, C> {
      * @return TRow
      */
     TRow getTvfInfo();
+
+    /**
+     * Generates a common error message when the execution queue is full.
+     * @param taskId task id
+     * @return error msg for user
+     */
+    String formatMsgWhenExecuteQueueFull(Long taskId);
 }

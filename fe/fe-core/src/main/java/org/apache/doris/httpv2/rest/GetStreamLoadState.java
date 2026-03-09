@@ -22,13 +22,12 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 
 import com.google.common.base.Strings;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
-
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 @RestController
 public class GetStreamLoadState extends RestBaseController {
@@ -38,9 +37,12 @@ public class GetStreamLoadState extends RestBaseController {
                           HttpServletRequest request, HttpServletResponse response) {
         executeCheckPassword(request, response);
 
-        Object redirectView = redirectToMaster(request, response);
-        if (redirectView != null) {
-            return redirectView;
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
+
+        if (checkForwardToMaster(request)) {
+            return forwardToMaster(request);
         }
 
         String label = request.getParameter(LABEL_KEY);

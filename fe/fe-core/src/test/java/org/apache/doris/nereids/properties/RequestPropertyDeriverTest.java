@@ -22,20 +22,34 @@ import org.apache.doris.nereids.hint.DistributeHint;
 import org.apache.doris.nereids.jobs.JobContext;
 import org.apache.doris.nereids.memo.Group;
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.memo.GroupId;
 import org.apache.doris.nereids.properties.DistributionSpecHash.ShuffleType;
+import org.apache.doris.nereids.rules.implementation.LogicalWindowToPhysicalWindow.WindowFrameGroup;
+import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.AssertNumRowsElement;
 import org.apache.doris.nereids.trees.expressions.ExprId;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.OrderExpression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.expressions.WindowExpression;
+import org.apache.doris.nereids.trees.expressions.WindowFrame;
+import org.apache.doris.nereids.trees.expressions.WindowFrame.FrameBoundary;
+import org.apache.doris.nereids.trees.expressions.WindowFrame.FrameUnitsType;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateParam;
+import org.apache.doris.nereids.trees.expressions.functions.window.RowNumber;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.plans.AggMode;
 import org.apache.doris.nereids.trees.plans.AggPhase;
 import org.apache.doris.nereids.trees.plans.DistributeType;
 import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.JoinType;
+import org.apache.doris.nereids.trees.plans.RelationId;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalAssertNumRows;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalNestedLoopJoin;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalWindow;
 import org.apache.doris.nereids.types.IntegerType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.qe.ConnectContext;
@@ -56,8 +70,19 @@ import java.util.Optional;
 
 class RequestPropertyDeriverTest {
 
-    @Mocked
-    GroupPlan groupPlan;
+    GroupExpression ge = new GroupExpression(
+            new LogicalOneRowRelation(
+                    new RelationId(1),
+                    ImmutableList.of(new Alias(Literal.of(1)))
+            ),
+            ImmutableList.of()
+    );
+
+    GroupPlan groupPlan = new GroupPlan(
+            new Group(GroupId.createGenerator().getNextId(),
+                    ge.getPlan().getLogicalProperties()
+            )
+    );
 
     @Mocked
     LogicalProperties logicalProperties;
@@ -175,7 +200,6 @@ class RequestPropertyDeriverTest {
                 new AggregateParam(AggPhase.LOCAL, AggMode.INPUT_TO_RESULT),
                 true,
                 logicalProperties,
-                RequireProperties.of(PhysicalProperties.ANY),
                 groupPlan
         );
         GroupExpression groupExpression = new GroupExpression(aggregate);
@@ -198,7 +222,6 @@ class RequestPropertyDeriverTest {
                 new AggregateParam(AggPhase.GLOBAL, AggMode.BUFFER_TO_RESULT),
                 true,
                 logicalProperties,
-                RequireProperties.of(PhysicalProperties.createHash(ImmutableList.of(partition), ShuffleType.REQUIRE)),
                 groupPlan
         );
         GroupExpression groupExpression = new GroupExpression(aggregate);
@@ -223,7 +246,6 @@ class RequestPropertyDeriverTest {
                 new AggregateParam(AggPhase.GLOBAL, AggMode.BUFFER_TO_RESULT),
                 true,
                 logicalProperties,
-                RequireProperties.of(PhysicalProperties.GATHER),
                 groupPlan
         );
         GroupExpression groupExpression = new GroupExpression(aggregate);
@@ -251,5 +273,191 @@ class RequestPropertyDeriverTest {
         List<List<PhysicalProperties>> expected = Lists.newArrayList();
         expected.add(Lists.newArrayList(PhysicalProperties.GATHER));
         Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testWindowWithPartitionKeyAndOrderKey() {
+        SlotReference col1 = new SlotReference("col1", IntegerType.INSTANCE);
+        SlotReference col2 = new SlotReference("col2", IntegerType.INSTANCE);
+        Expression rowNumber = new RowNumber();
+        WindowExpression windowExpression = new WindowExpression(rowNumber, ImmutableList.of(col1),
+                ImmutableList.of(new OrderExpression(new OrderKey(col2, true, false))),
+                new WindowFrame(FrameUnitsType.RANGE,
+                        FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary()));
+        Alias alias = new Alias(windowExpression);
+        WindowFrameGroup windowFrameGroup = new WindowFrameGroup(alias);
+        PhysicalWindow<GroupPlan> window = new PhysicalWindow<>(windowFrameGroup, null,
+                ImmutableList.of(alias), false, logicalProperties, groupPlan);
+        GroupExpression groupExpression = new GroupExpression(window);
+        new Group(null, groupExpression, null);
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(null, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+        List<List<PhysicalProperties>> expected = Lists.newArrayList();
+        expected.add(Lists.newArrayList(PhysicalProperties.createHash(ImmutableList.of(col1.getExprId()), ShuffleType.REQUIRE).withOrderSpec(
+                new OrderSpec(ImmutableList.of(new OrderKey(col1, true, false), new OrderKey(col2, true, false)))
+        )));
+        Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testWindowWithPartitionKeyAndNoOrderKey() {
+        SlotReference col1 = new SlotReference("col1", IntegerType.INSTANCE);
+        Expression rowNumber = new RowNumber();
+        WindowExpression windowExpression = new WindowExpression(rowNumber, ImmutableList.of(col1),
+                ImmutableList.of(),
+                new WindowFrame(FrameUnitsType.RANGE,
+                        FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary()));
+        Alias alias = new Alias(windowExpression);
+        WindowFrameGroup windowFrameGroup = new WindowFrameGroup(alias);
+        PhysicalWindow<GroupPlan> window = new PhysicalWindow<>(windowFrameGroup, null,
+                ImmutableList.of(alias), false, logicalProperties, groupPlan);
+        GroupExpression groupExpression = new GroupExpression(window);
+        new Group(null, groupExpression, null);
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(null, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+        List<List<PhysicalProperties>> expected = Lists.newArrayList();
+        expected.add(Lists.newArrayList(PhysicalProperties.createHash(ImmutableList.of(col1.getExprId()), ShuffleType.REQUIRE).withOrderSpec(
+                new OrderSpec(ImmutableList.of(new OrderKey(col1, true, false)))
+        )));
+        Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testWindowWithNoPartitionKeyAndOrderKey() {
+        SlotReference col2 = new SlotReference("col2", IntegerType.INSTANCE);
+        Expression rowNumber = new RowNumber();
+        WindowExpression windowExpression = new WindowExpression(rowNumber, ImmutableList.of(),
+                ImmutableList.of(new OrderExpression(new OrderKey(col2, true, false))),
+                new WindowFrame(FrameUnitsType.RANGE,
+                        FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary()));
+        Alias alias = new Alias(windowExpression);
+        WindowFrameGroup windowFrameGroup = new WindowFrameGroup(alias);
+        PhysicalWindow<GroupPlan> window = new PhysicalWindow<>(windowFrameGroup, null,
+                ImmutableList.of(alias), false, logicalProperties, groupPlan);
+        GroupExpression groupExpression = new GroupExpression(window);
+        new Group(null, groupExpression, null);
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(null, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+        List<List<PhysicalProperties>> expected = Lists.newArrayList();
+        expected.add(Lists.newArrayList(PhysicalProperties.GATHER.withOrderSpec(
+                new OrderSpec(ImmutableList.of(new OrderKey(col2, true, false)))
+        )));
+        Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testWindowWithNoPartitionKeyAndNoOrderKey() {
+        Expression rowNumber = new RowNumber();
+        WindowExpression windowExpression = new WindowExpression(rowNumber, ImmutableList.of(),
+                ImmutableList.of(),
+                new WindowFrame(FrameUnitsType.RANGE,
+                        FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary()));
+        Alias alias = new Alias(windowExpression);
+        WindowFrameGroup windowFrameGroup = new WindowFrameGroup(alias);
+        PhysicalWindow<GroupPlan> window = new PhysicalWindow<>(windowFrameGroup, null,
+                ImmutableList.of(alias), false, logicalProperties, groupPlan);
+        GroupExpression groupExpression = new GroupExpression(window);
+        new Group(null, groupExpression, null);
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(null, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+        List<List<PhysicalProperties>> expected = Lists.newArrayList();
+        expected.add(Lists.newArrayList(PhysicalProperties.GATHER));
+        Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testAggregateWithAggShuffleUseParentKeyDisabled() {
+        // Create ConnectContext with aggShuffleUseParentKey = false
+        ConnectContext testConnectContext = new ConnectContext();
+        testConnectContext.getSessionVariable().aggShuffleUseParentKey = false;
+
+        SlotReference key1 = new SlotReference(new ExprId(0), "col1", IntegerType.INSTANCE, true, ImmutableList.of());
+        SlotReference key2 = new SlotReference(new ExprId(1), "col2", IntegerType.INSTANCE, true, ImmutableList.of());
+        PhysicalHashAggregate<GroupPlan> aggregate = new PhysicalHashAggregate<>(
+                Lists.newArrayList(key1, key2),
+                Lists.newArrayList(key1, key2),
+                new AggregateParam(AggPhase.GLOBAL, AggMode.BUFFER_TO_RESULT),
+                true,
+                logicalProperties,
+                groupPlan
+        );
+        GroupExpression groupExpression = new GroupExpression(aggregate);
+        new Group(null, groupExpression, null);
+
+        // Create a parent hash distribution with key1 only
+        PhysicalProperties parentProperties = PhysicalProperties.createHash(
+                Lists.newArrayList(key1.getExprId()), ShuffleType.REQUIRE);
+
+        new Expectations() {
+            {
+                jobContext.getRequiredProperties();
+                result = parentProperties;
+            }
+        };
+
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(testConnectContext, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+
+        // When aggShuffleUseParentKey is false, should only use all groupByExpressions (key1, key2)
+        // and not use parent key (key1) separately
+        List<List<PhysicalProperties>> expected = Lists.newArrayList();
+        expected.add(Lists.newArrayList(PhysicalProperties.createHash(
+                Lists.newArrayList(key1.getExprId(), key2.getExprId()), ShuffleType.REQUIRE)));
+        Assertions.assertEquals(1, actual.size());
+        Assertions.assertEquals(expected, actual);
+    }
+
+    @Test
+    void testAggregateWithAggShuffleUseParentKeyEnabled() {
+        // Create ConnectContext with aggShuffleUseParentKey = true (default value)
+        ConnectContext testConnectContext = new ConnectContext();
+        testConnectContext.getSessionVariable().aggShuffleUseParentKey = true;
+
+        SlotReference key1 = new SlotReference(new ExprId(0), "col1", IntegerType.INSTANCE, true, ImmutableList.of());
+        SlotReference key2 = new SlotReference(new ExprId(1), "col2", IntegerType.INSTANCE, true, ImmutableList.of());
+        PhysicalHashAggregate<GroupPlan> aggregate = new PhysicalHashAggregate<>(
+                Lists.newArrayList(key1, key2),
+                Lists.newArrayList(key1, key2),
+                new AggregateParam(AggPhase.GLOBAL, AggMode.BUFFER_TO_RESULT),
+                true,
+                logicalProperties,
+                groupPlan
+        );
+        GroupExpression groupExpression = new GroupExpression(aggregate);
+        new Group(null, groupExpression, null);
+
+        // Create a parent hash distribution with key1 only
+        PhysicalProperties parentProperties = PhysicalProperties.createHash(
+                Lists.newArrayList(key1.getExprId()), ShuffleType.REQUIRE);
+
+        new Expectations() {
+            {
+                jobContext.getRequiredProperties();
+                result = parentProperties;
+            }
+        };
+        new MockUp<org.apache.doris.nereids.memo.GroupExpression>() {
+            @mockit.Mock
+            org.apache.doris.statistics.Statistics childStatistics(int idx) {
+                return null;
+            }
+        };
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(testConnectContext, jobContext);
+        List<List<PhysicalProperties>> actual
+                = requestPropertyDeriver.getRequestChildrenPropertyList(groupExpression);
+
+        // When aggShuffleUseParentKey is true, shouldUseParent may return true
+        // If shouldUseParent returns true, it will add parent key (key1) first, then all groupByExpressions (key1, key2)
+        Assertions.assertEquals(2, actual.size(), "Should have at least one property request");
+        PhysicalProperties parentProp = PhysicalProperties.createHash(
+                Lists.newArrayList(key1.getExprId()), ShuffleType.REQUIRE);
+        PhysicalProperties aggProp = PhysicalProperties.createHash(
+                Lists.newArrayList(key1.getExprId(), key2.getExprId()), ShuffleType.REQUIRE);
+        Assertions.assertTrue(actual.contains(ImmutableList.of(aggProp)) && actual.contains(ImmutableList.of(parentProp)));
     }
 }

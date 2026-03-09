@@ -27,6 +27,7 @@ import org.apache.doris.qe.QueryState.MysqlStateType;
 import org.apache.doris.transaction.SubTransactionState.SubTransactionType;
 import org.apache.doris.transaction.TransactionEntry;
 import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.TransactionStatus;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -41,12 +42,9 @@ public class OlapTxnInsertExecutor extends OlapInsertExecutor {
 
     public OlapTxnInsertExecutor(ConnectContext ctx, Table table,
             String labelName, NereidsPlanner planner, Optional<InsertCommandContext> insertCtx,
-            boolean emptyInsert) {
-        super(ctx, table, labelName, planner, insertCtx, emptyInsert);
-    }
-
-    public long getTxnId() {
-        return txnId;
+            boolean emptyInsert, long jobId) {
+        super(ctx, table, labelName, planner, insertCtx, emptyInsert, jobId);
+        txnStatus = TransactionStatus.PREPARE;
     }
 
     @Override
@@ -58,7 +56,7 @@ public class OlapTxnInsertExecutor extends OlapInsertExecutor {
                 throw new AnalysisException("Transaction insert expect label " + txnEntry.getLabel()
                         + ", but got " + this.labelName);
             }
-            this.txnId = txnEntry.beginTransaction(table);
+            this.txnId = txnEntry.beginTransaction(table, SubTransactionType.INSERT);
             this.labelName = txnEntry.getLabel();
         } catch (Exception e) {
             throw new AnalysisException("begin transaction failed. " + e.getMessage(), e);

@@ -26,6 +26,8 @@ import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 
+import com.google.common.collect.ImmutableMap;
+
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -49,8 +51,7 @@ public abstract class AbstractMaterializedViewJoinRule extends AbstractMateriali
                 queryStructInfo.getTopPlan(),
                 materializationContext.getShuttledExprToScanExprMapping(),
                 targetToSourceMapping,
-                true,
-                queryStructInfo.getTableBitSet()
+                ImmutableMap.of(), cascadesContext
         );
         // Can not rewrite, bail out
         if (expressionsRewritten.isEmpty()) {
@@ -79,6 +80,8 @@ public abstract class AbstractMaterializedViewJoinRule extends AbstractMateriali
     protected boolean checkQueryPattern(StructInfo structInfo, CascadesContext cascadesContext) {
         PlanCheckContext checkContext = PlanCheckContext.of(SUPPORTED_JOIN_TYPE_SET);
         return structInfo.getTopPlan().accept(StructInfo.PLAN_PATTERN_CHECKER, checkContext)
-                && !checkContext.isContainsTopAggregate();
+                && !checkContext.isContainsTopAggregate()
+                && !checkContext.isContainsTopLimit() && !checkContext.isContainsTopTopN()
+                && !checkContext.isContainsTopWindow();
     }
 }

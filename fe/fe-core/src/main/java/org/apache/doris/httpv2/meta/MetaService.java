@@ -32,6 +32,8 @@ import org.apache.doris.system.Frontend;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -42,8 +44,6 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.Map;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 @RestController
 public class MetaService extends RestBaseController {
@@ -55,9 +55,7 @@ public class MetaService extends RestBaseController {
 
     private File imageDir = MetaHelper.getMasterImageDir();
 
-    private boolean isFromValidFe(HttpServletRequest request) {
-        String clientHost = request.getHeader(Env.CLIENT_NODE_HOST_KEY);
-        String clientPortStr = request.getHeader(Env.CLIENT_NODE_PORT_KEY);
+    private boolean isFromValidFe(String clientHost, String clientPortStr) {
         Integer clientPort;
         try {
             clientPort = Integer.valueOf(clientPortStr);
@@ -74,11 +72,13 @@ public class MetaService extends RestBaseController {
         return true;
     }
 
-
     private void checkFromValidFe(HttpServletRequest request)
             throws InvalidClientException {
-        if (!isFromValidFe(request)) {
-            throw new InvalidClientException("invalid client host: " + request.getRemoteHost());
+        String clientHost = request.getHeader(Env.CLIENT_NODE_HOST_KEY);
+        String clientPort = request.getHeader(Env.CLIENT_NODE_PORT_KEY);
+        if (!isFromValidFe(clientHost, clientPort)) {
+            throw new InvalidClientException("invalid client host: " + clientHost + ":" + clientPort
+                + ", request from " + request.getRemoteHost());
         }
     }
 
@@ -135,6 +135,9 @@ public class MetaService extends RestBaseController {
     public Object put(HttpServletRequest request, HttpServletResponse response) throws DdlException {
         checkFromValidFe(request);
 
+        String clientHost = request.getHeader(Env.CLIENT_NODE_HOST_KEY);
+        String clientPort = request.getHeader(Env.CLIENT_NODE_PORT_KEY);
+
         String portStr = request.getParameter(PORT);
 
         // check port to avoid SSRF(Server-Side Request Forgery)
@@ -153,10 +156,16 @@ public class MetaService extends RestBaseController {
         }
 
         checkLongParam(versionStr);
-
+        // request.getRemoteHost() may return proxy address
         String machine = request.getRemoteHost();
-        String url = "http://" + NetUtils.getHostPortInAccessibleFormat(machine, Integer.valueOf(portStr))
+
+        LOG.info("put image. clientHost: {}, clientPort: {}, machine: {}, portStr: {}",
+                clientHost, clientPort, machine, portStr);
+
+        clientHost = Strings.isNullOrEmpty(clientHost) ? machine : clientHost;
+        String url = "http://" + NetUtils.getHostPortInAccessibleFormat(clientHost, Integer.valueOf(portStr))
                 + "/image?version=" + versionStr;
+
         String filename = Storage.IMAGE + "." + versionStr;
         File dir = new File(Env.getCurrentEnv().getImageDir());
         try {

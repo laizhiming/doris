@@ -20,45 +20,43 @@ package org.apache.doris.nereids.trees.expressions.functions.agg;
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.NeedSessionVarGuard;
 import org.apache.doris.nereids.trees.expressions.functions.ComputePrecisionForSum;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
-import org.apache.doris.nereids.types.BigIntType;
-import org.apache.doris.nereids.types.DoubleType;
-import org.apache.doris.nereids.types.LargeIntType;
+import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 
 /** MultiDistinctSum */
 public class MultiDistinctSum extends NullableAggregateFunction implements UnaryExpression,
-        ExplicitlyCastableSignature, ComputePrecisionForSum, MultiDistinction {
-
-    public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(BigIntType.INSTANCE),
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(DoubleType.INSTANCE),
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(LargeIntType.INSTANCE)
-    );
-
+        ExplicitlyCastableSignature, ComputePrecisionForSum, MultiDistinction, NeedSessionVarGuard {
     public MultiDistinctSum(Expression arg0) {
-        super("multi_distinct_sum", true, false, arg0);
+        this(false, arg0);
     }
 
     public MultiDistinctSum(boolean distinct, Expression arg0) {
-        super("multi_distinct_sum", true, false, arg0);
+        this(false, false, arg0);
     }
 
     public MultiDistinctSum(boolean distinct, boolean alwaysNullable, Expression arg0) {
-        super("multi_distinct_sum", true, alwaysNullable, arg0);
+        super("multi_distinct_sum", false, alwaysNullable, arg0);
+    }
+
+    /** constructor for withChildren and reuse signature */
+    private MultiDistinctSum(NullableAggregateFunctionParams functionParams) {
+        super(functionParams);
     }
 
     @Override
     public void checkLegalityBeforeTypeCoercion() {
-        if (child().getDataType().isDateLikeType()) {
-            throw new AnalysisException("Sum in multi distinct functions do not support Date/Datetime type");
+        DataType argType = child().getDataType();
+        if ((!argType.isNumericType() && !argType.isBooleanType() && !argType.isNullType())
+                || argType.isOnlyMetricType()) {
+            throw new AnalysisException("sum requires a numeric or boolean parameter: " + this.toSql());
         }
     }
 
@@ -74,13 +72,13 @@ public class MultiDistinctSum extends NullableAggregateFunction implements Unary
 
     @Override
     public NullableAggregateFunction withAlwaysNullable(boolean alwaysNullable) {
-        return new MultiDistinctSum(distinct, alwaysNullable, children.get(0));
+        return new MultiDistinctSum(getAlwaysNullableFunctionParams(alwaysNullable));
     }
 
     @Override
     public MultiDistinctSum withDistinctAndChildren(boolean distinct, List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new MultiDistinctSum(distinct, children.get(0));
+        return new MultiDistinctSum(getFunctionParams(false, children));
     }
 
     @Override

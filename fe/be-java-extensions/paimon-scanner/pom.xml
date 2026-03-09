@@ -39,12 +39,7 @@ under the License.
             <groupId>org.apache.doris</groupId>
             <artifactId>java-common</artifactId>
             <version>${project.version}</version>
-            <exclusions>
-                <exclusion>
-                    <artifactId>fe-common</artifactId>
-                    <groupId>org.apache.doris</groupId>
-                </exclusion>
-            </exclusions>
+            <scope>provided</scope>
         </dependency>
 
         <dependency>
@@ -58,6 +53,11 @@ under the License.
             <artifactId>paimon-common</artifactId>
             <version>${paimon.version}</version>
         </dependency>
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-hive-connector-3.1</artifactId>
+            <version>${paimon.version}</version>
+        </dependency>
 
         <dependency>
             <groupId>org.apache.paimon</groupId>
@@ -65,16 +65,11 @@ under the License.
             <version>${paimon.version}</version>
         </dependency>
 
-        <dependency>
-            <groupId>org.apache.doris</groupId>
-            <artifactId>hive-catalog-shade</artifactId>
-            <version>${doris.hive.catalog.shade.version}</version>
-        </dependency>
-
     </dependencies>
 
     <build>
         <finalName>paimon-scanner</finalName>
+        <directory>${project.basedir}/target/</directory>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

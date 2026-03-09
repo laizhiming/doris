@@ -26,7 +26,7 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.common.util.URI;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.VirtualSlotReference;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.Udf;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
@@ -39,7 +39,6 @@ import com.google.common.collect.ImmutableList;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -62,6 +61,8 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
     private final String getValueFn;
     private final String removeFn;
     private final String checkSum;
+    private final boolean isStaticLoad;
+    private final long expirationTime;
 
     /**
      * Constructor of UDAF
@@ -72,7 +73,7 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
             String objectFile, String symbol,
             String initFn, String updateFn, String mergeFn,
             String serializeFn, String finalizeFn, String getValueFn, String removeFn,
-            boolean isDistinct, String checkSum, Expression... args) {
+            boolean isDistinct, String checkSum, boolean isStaticLoad, long expirationTime, Expression... args) {
         super(name, isDistinct, args);
         this.dbName = dbName;
         this.functionId = functionId;
@@ -90,6 +91,8 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
         this.getValueFn = getValueFn;
         this.removeFn = removeFn;
         this.checkSum = checkSum;
+        this.isStaticLoad = isStaticLoad;
+        this.expirationTime = expirationTime;
     }
 
     @Override
@@ -120,7 +123,7 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
         Preconditions.checkArgument(children.size() == this.children.size());
         return new JavaUdaf(getName(), functionId, dbName, binaryType, signature, intermediateType, nullableMode,
                 objectFile, symbol, initFn, updateFn, mergeFn, serializeFn, finalizeFn, getValueFn, removeFn,
-                isDistinct, checkSum, children.toArray(new Expression[0]));
+                isDistinct, checkSum, isStaticLoad, expirationTime, children.toArray(new Expression[0]));
     }
 
     /**
@@ -138,10 +141,9 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
                 ? sigBuilder.varArgs(argTypes.toArray(new DataType[0]))
                 : sigBuilder.args(argTypes.toArray(new DataType[0]));
 
-        VirtualSlotReference[] virtualSlots = argTypes.stream()
-                .map(type -> new VirtualSlotReference(type.toString(), type, Optional.empty(),
-                        (shape) -> ImmutableList.of()))
-                .toArray(VirtualSlotReference[]::new);
+        SlotReference[] arguments = argTypes.stream()
+                .map(type -> new SlotReference(type.toString(), type))
+                .toArray(SlotReference[]::new);
 
         DataType intermediateType = null;
         if (aggregate.getIntermediateType() != null) {
@@ -162,7 +164,9 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
                 aggregate.getRemoveFnSymbol(),
                 false,
                 aggregate.getChecksum(),
-                virtualSlots);
+                aggregate.isStaticLoad(),
+                aggregate.getExpirationTime(),
+                arguments);
 
         JavaUdafBuilder builder = new JavaUdafBuilder(udaf);
         Env.getCurrentEnv().getFunctionRegistry().addUdf(dbName, fnName, builder);
@@ -196,6 +200,8 @@ public class JavaUdaf extends AggregateFunction implements ExplicitlyCastableSig
             expr.setNullableMode(nullableMode);
             expr.setChecksum(checkSum);
             expr.setId(functionId);
+            expr.setStaticLoad(isStaticLoad);
+            expr.setExpirationTime(expirationTime);
             return expr;
         } catch (Exception e) {
             throw new AnalysisException(e.getMessage(), e.getCause());

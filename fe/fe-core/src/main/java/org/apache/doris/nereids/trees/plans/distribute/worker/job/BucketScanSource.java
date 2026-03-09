@@ -24,6 +24,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -36,7 +37,7 @@ public class BucketScanSource extends ScanSource {
     public final Map<Integer, Map<ScanNode, ScanRanges>> bucketIndexToScanNodeToTablets;
 
     public BucketScanSource(Map<Integer, Map<ScanNode, ScanRanges>> bucketIndexToScanNodeToTablets) {
-        this.bucketIndexToScanNodeToTablets = bucketIndexToScanNodeToTablets;
+        this.bucketIndexToScanNodeToTablets = Maps.newLinkedHashMap(bucketIndexToScanNodeToTablets);
     }
 
     @Override
@@ -124,6 +125,29 @@ public class BucketScanSource extends ScanSource {
         return bucketIndexToScanRanges;
     }
 
+    public BucketScanSource newMergeBucketScanSource(BucketScanSource bucketScanSource) {
+        BucketScanSource merged = new BucketScanSource(new LinkedHashMap<>());
+        Map<Integer, Map<ScanNode, ScanRanges>> mergeMap = merged.bucketIndexToScanNodeToTablets;
+        mergeBucketScanSource(mergeMap, this);
+        mergeBucketScanSource(mergeMap, bucketScanSource);
+        return merged;
+    }
+
+    private static void mergeBucketScanSource(
+            Map<Integer, Map<ScanNode, ScanRanges>> mergeMap, BucketScanSource bucketScanSource) {
+        for (Entry<Integer, Map<ScanNode, ScanRanges>> kv
+                : bucketScanSource.bucketIndexToScanNodeToTablets.entrySet()) {
+            Integer bucketIndex = kv.getKey();
+            Map<ScanNode, ScanRanges> oldScanNodeToRanges = kv.getValue();
+            Map<ScanNode, ScanRanges> newScanNodeToRanges
+                    = mergeMap.computeIfAbsent(bucketIndex, k -> new LinkedHashMap<>());
+            for (Entry<ScanNode, ScanRanges> kv2 : oldScanNodeToRanges.entrySet()) {
+                ScanRanges scanRanges = newScanNodeToRanges.computeIfAbsent(kv2.getKey(), k -> new ScanRanges());
+                scanRanges.addScanRanges(kv2.getValue());
+            }
+        }
+    }
+
     /** toString */
     public void toString(StringBuilder str, String prefix) {
         int i = 0;
@@ -139,6 +163,11 @@ public class BucketScanSource extends ScanSource {
             }
         }
         str.append("\n").append(prefix).append("]");
+    }
+
+    @Override
+    public ScanSource newEmpty() {
+        return new BucketScanSource(Maps.newLinkedHashMap());
     }
 
     @Override

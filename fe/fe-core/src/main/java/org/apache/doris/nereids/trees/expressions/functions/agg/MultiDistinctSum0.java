@@ -20,42 +20,46 @@ package org.apache.doris.nereids.trees.expressions.functions.agg;
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.functions.AlwaysNotNullable;
+import org.apache.doris.nereids.trees.expressions.NeedSessionVarGuard;
 import org.apache.doris.nereids.trees.expressions.functions.ComputePrecisionForSum;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
+import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.DecimalV3Literal;
+import org.apache.doris.nereids.trees.expressions.literal.DoubleLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.LargeIntLiteral;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
-import org.apache.doris.nereids.types.BigIntType;
-import org.apache.doris.nereids.types.DoubleType;
-import org.apache.doris.nereids.types.LargeIntType;
+import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.DecimalV3Type;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.List;
 
 /** MultiDistinctSum0 */
-public class MultiDistinctSum0 extends AggregateFunction implements UnaryExpression,
-        ExplicitlyCastableSignature, ComputePrecisionForSum, MultiDistinction, AlwaysNotNullable {
-
-    public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(BigIntType.INSTANCE),
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(DoubleType.INSTANCE),
-            FunctionSignature.ret(BigIntType.INSTANCE).varArgs(LargeIntType.INSTANCE)
-    );
-
+public class MultiDistinctSum0 extends NotNullableAggregateFunction implements UnaryExpression,
+        ExplicitlyCastableSignature, ComputePrecisionForSum, MultiDistinction, NeedSessionVarGuard {
     public MultiDistinctSum0(Expression arg0) {
-        super("multi_distinct_sum0", true, arg0);
+        this(false, arg0);
     }
 
     public MultiDistinctSum0(boolean distinct, Expression arg0) {
-        super("multi_distinct_sum0", true, arg0);
+        super("multi_distinct_sum0", false, arg0);
+    }
+
+    /** constructor for withChildren and reuse signature */
+    public MultiDistinctSum0(AggregateFunctionParams functionParams) {
+        super(functionParams);
     }
 
     @Override
     public void checkLegalityBeforeTypeCoercion() {
-        if (child().getDataType().isDateLikeType()) {
-            throw new AnalysisException("Sum0 in multi distinct functions do not support Date/Datetime type");
+        DataType argType = child().getDataType();
+        if ((!argType.isNumericType() && !argType.isBooleanType() && !argType.isNullType())
+                || argType.isOnlyMetricType()) {
+            throw new AnalysisException("sum0 requires a numeric or boolean parameter: " + this.toSql());
         }
     }
 
@@ -72,11 +76,27 @@ public class MultiDistinctSum0 extends AggregateFunction implements UnaryExpress
     @Override
     public MultiDistinctSum0 withDistinctAndChildren(boolean distinct, List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new MultiDistinctSum0(distinct, children.get(0));
+        return new MultiDistinctSum0(getFunctionParams(false, children));
     }
 
     @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitMultiDistinctSum0(this, context);
+    }
+
+    @Override
+    public Expression resultForEmptyInput() {
+        DataType dataType = getDataType();
+        if (dataType.isBigIntType()) {
+            return new BigIntLiteral(0);
+        } else if (dataType.isLargeIntType()) {
+            return new LargeIntLiteral(new BigInteger("0"));
+        } else if (dataType.isDecimalV3Type()) {
+            return new DecimalV3Literal((DecimalV3Type) dataType, new BigDecimal("0"));
+        } else if (dataType.isDoubleType()) {
+            return new DoubleLiteral(0);
+        } else {
+            return new DoubleLiteral(0);
+        }
     }
 }

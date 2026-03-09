@@ -17,7 +17,6 @@
 
 package org.apache.doris.statistics;
 
-import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
@@ -30,9 +29,11 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import mockit.Mock;
 import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
@@ -98,7 +99,7 @@ public class StatisticsJobAppenderTest {
         };
 
         Queue<QueryColumn> testQueue = new ArrayBlockingQueue<>(100);
-        Map<TableName, Set<Pair<String, String>>> testMap = new HashMap<>();
+        Map<TableNameInfo, Set<Pair<String, String>>> testMap = new HashMap<>();
         QueryColumn high1 = new QueryColumn(10, 20, 30, "high1");
         testQueue.add(high1);
 
@@ -106,7 +107,7 @@ public class StatisticsJobAppenderTest {
         appender.appendColumnsToJobs(testQueue, testMap);
         Assertions.assertEquals(1, testMap.size());
         Assertions.assertEquals(1, testMap.values().size());
-        Assertions.assertTrue(testMap.get(new TableName("internal", "testDb", "testTable")).contains(Pair.of("mockIndex", "high1")));
+        Assertions.assertTrue(testMap.get(new TableNameInfo("internal", "testDb", "testTable")).contains(Pair.of("mockIndex", "high1")));
 
         QueryColumn high2 = new QueryColumn(10, 20, 30, "high2");
         QueryColumn high3 = new QueryColumn(10, 20, 30, "high3");
@@ -115,17 +116,17 @@ public class StatisticsJobAppenderTest {
         appender.appendColumnsToJobs(testQueue, testMap);
         Assertions.assertEquals(2, testMap.size());
 
-        Set<Pair<String, String>> table1Column = testMap.get(new TableName("internal", "testDb", "testTable"));
+        Set<Pair<String, String>> table1Column = testMap.get(new TableNameInfo("internal", "testDb", "testTable"));
         Assertions.assertEquals(2, table1Column.size());
         Assertions.assertTrue(table1Column.contains(Pair.of("mockIndex", "high1")));
         Assertions.assertTrue(table1Column.contains(Pair.of("mockIndex", "high3")));
 
-        Set<Pair<String, String>> table2Column = testMap.get(new TableName("internal", "testDb", "testTable2"));
+        Set<Pair<String, String>> table2Column = testMap.get(new TableNameInfo("internal", "testDb", "testTable2"));
         Assertions.assertEquals(1, table2Column.size());
         Assertions.assertTrue(table2Column.contains(Pair.of("mockIndex", "high2")));
 
         for (int i = 0; i < StatisticsJobAppender.JOB_MAP_SIZE - 2; i++) {
-            testMap.put(new TableName("a", "b", UUID.randomUUID().toString()), new HashSet<>());
+            testMap.put(new TableNameInfo("a", "b", UUID.randomUUID().toString()), new HashSet<>());
         }
         Assertions.assertEquals(StatisticsJobAppender.JOB_MAP_SIZE, testMap.size());
 
@@ -137,7 +138,7 @@ public class StatisticsJobAppenderTest {
         QueryColumn high5 = new QueryColumn(10, 20, 30, "high5");
         testQueue.add(high5);
         appender.appendColumnsToJobs(testQueue, testMap);
-        table2Column = testMap.get(new TableName("internal", "testDb", "testTable2"));
+        table2Column = testMap.get(new TableNameInfo("internal", "testDb", "testTable2"));
         Assertions.assertEquals(2, table2Column.size());
         Assertions.assertTrue(table2Column.contains(Pair.of("mockIndex", "high2")));
         Assertions.assertTrue(table2Column.contains(Pair.of("mockIndex", "high5")));
@@ -178,15 +179,48 @@ public class StatisticsJobAppenderTest {
             }
         };
 
-        Map<TableName, Set<Pair<String, String>>> testMap = new HashMap<>();
-        StatisticsJobAppender appender = new StatisticsJobAppender();
-        appender.appendToLowJobs(testMap);
-        Assertions.assertEquals(100, testMap.size());
-        testMap.clear();
-        appender.appendToLowJobs(testMap);
-        Assertions.assertEquals(40, testMap.size());
+        new MockUp<StatisticsUtil>() {
+            @Mock
+            public boolean needAnalyzeColumn(TableIf table, Pair<String, String> column) {
+                return true;
+            }
+        };
 
-        for (int i = 0; i < StatisticsJobAppender.JOB_MAP_SIZE; i++) {
+        Map<TableNameInfo, Set<Pair<String, String>>> testLowMap = new HashMap<>();
+        Map<TableNameInfo, Set<Pair<String, String>>> testVeryLowMap = new HashMap<>();
+        StatisticsJobAppender appender = new StatisticsJobAppender();
+        appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(100, testLowMap.size());
+        Assertions.assertEquals(0, testVeryLowMap.size());
+        testLowMap.clear();
+        appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(40, testLowMap.size());
+        Assertions.assertEquals(0, testVeryLowMap.size());
+        testLowMap.clear();
+        // Less than 1 minutes since last iteration.
+        appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
+        Assertions.assertEquals(0, testVeryLowMap.size());
+
+        testLowMap.clear();
+        appender.setLastRoundFinishTime(0);
+        int processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(100, testLowMap.size());
+        Assertions.assertEquals(0, testVeryLowMap.size());
+        Assertions.assertEquals(100, processed);
+        appender.setLastRoundFinishTime(0);
+        processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(100, testLowMap.size());
+        Assertions.assertEquals(0, testVeryLowMap.size());
+        Assertions.assertEquals(StatisticsJobAppender.JOB_MAP_SIZE, testLowMap.size());
+        Assertions.assertEquals(0, processed);
+    }
+
+    @Test
+    public void testAppendQueryColumnToVeryLowJobMap() throws DdlException {
+        InternalCatalog testCatalog = new InternalCatalog();
+        int id = 10;
+        for (int i = 0; i < 70; i++) {
             Database db = new Database(id++, "testDb" + i);
             testCatalog.unprotectCreateDb(db);
             Column column1 = new Column("placeholder", PrimitiveType.INT);
@@ -198,38 +232,62 @@ public class StatisticsJobAppenderTest {
             db.createTableWithLock(table2, true, false);
         }
 
-        testMap.clear();
+        new MockUp<Env>() {
+            @Mock
+            public InternalCatalog getCurrentInternalCatalog() {
+                return testCatalog;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public List<Column> getBaseSchema() {
+                return Lists.newArrayList();
+            }
+
+            @Mock
+            public Set<Pair<String, String>> getColumnIndexPairs(Set<String> columns) {
+                return Collections.singleton(Pair.of("mockIndex", "mockColumn"));
+            }
+        };
+
+        new MockUp<StatisticsUtil>() {
+            @Mock
+            public boolean needAnalyzeColumn(TableIf table, Pair<String, String> column) {
+                return false;
+            }
+
+            @Mock
+            public boolean isLongTimeColumn(TableIf table, Pair<String, String> column, long version) {
+                return true;
+            }
+        };
+
+        Map<TableNameInfo, Set<Pair<String, String>>> testLowMap = new HashMap<>();
+        Map<TableNameInfo, Set<Pair<String, String>>> testVeryLowMap = new HashMap<>();
+        StatisticsJobAppender appender = new StatisticsJobAppender();
+        int processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
+        Assertions.assertEquals(100, testVeryLowMap.size());
+        Assertions.assertEquals(100, processed);
+        testVeryLowMap.clear();
+        processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
+        Assertions.assertEquals(40, testVeryLowMap.size());
+        Assertions.assertEquals(40, processed);
+
+        testLowMap.clear();
         appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
+        processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
+        Assertions.assertEquals(100, testVeryLowMap.size());
+        Assertions.assertEquals(100, processed);
+
         appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        Assertions.assertEquals(StatisticsJobAppender.JOB_MAP_SIZE, testMap.size());
+        processed = appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
+        Assertions.assertEquals(100, testVeryLowMap.size());
+        Assertions.assertEquals(0, processed);
     }
 
     @Test
@@ -270,12 +328,69 @@ public class StatisticsJobAppenderTest {
                 return thresholds[count++];
             }
         };
-        Map<TableName, Set<Pair<String, String>>> testMap = new HashMap<>();
+        Map<TableNameInfo, Set<Pair<String, String>>> testLowMap = new HashMap<>();
+        Map<TableNameInfo, Set<Pair<String, String>>> testVeryLowMap = new HashMap<>();
         StatisticsJobAppender appender = new StatisticsJobAppender();
-        appender.appendToLowJobs(testMap);
-        Assertions.assertEquals(0, testMap.size());
+        appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(0, testLowMap.size());
         appender.setLastRoundFinishTime(0);
-        appender.appendToLowJobs(testMap);
-        Assertions.assertEquals(1, testMap.size());
+        appender.appendToLowJobs(testLowMap, testVeryLowMap);
+        Assertions.assertEquals(1, testLowMap.size());
+    }
+
+    @Test
+    public void testDoAppend() {
+        Map<TableNameInfo, Set<Pair<String, String>>> jobMap = Maps.newHashMap();
+        TableNameInfo tableNameInfo1 = new TableNameInfo("catalog1", "db1", "table1");
+        TableNameInfo tableNameInfo2 = new TableNameInfo("catalog2", "db2", "table2");
+        Pair<String, String> pair1 = Pair.of("index1", "col1");
+
+        StatisticsJobAppender appender = new StatisticsJobAppender();
+        Assertions.assertTrue(appender.doAppend(jobMap, pair1, tableNameInfo1));
+        Assertions.assertEquals(1, jobMap.size());
+        Assertions.assertTrue(jobMap.containsKey(tableNameInfo1));
+        Assertions.assertEquals(1, jobMap.get(tableNameInfo1).size());
+        Assertions.assertTrue(jobMap.get(tableNameInfo1).contains(pair1));
+
+        Pair<String, String> pair2 = Pair.of("index2", "col2");
+        Assertions.assertTrue(appender.doAppend(jobMap, pair2, tableNameInfo1));
+        Assertions.assertEquals(1, jobMap.size());
+        Assertions.assertTrue(jobMap.containsKey(tableNameInfo1));
+        Assertions.assertEquals(2, jobMap.get(tableNameInfo1).size());
+        Assertions.assertTrue(jobMap.get(tableNameInfo1).contains(pair1));
+        Assertions.assertTrue(jobMap.get(tableNameInfo1).contains(pair2));
+
+        Pair<String, String> pair3 = Pair.of("index3", "col3");
+        Assertions.assertTrue(appender.doAppend(jobMap, pair3, tableNameInfo2));
+        Assertions.assertEquals(2, jobMap.size());
+        Assertions.assertTrue(jobMap.containsKey(tableNameInfo2));
+        Assertions.assertEquals(1, jobMap.get(tableNameInfo2).size());
+        Assertions.assertTrue(jobMap.get(tableNameInfo2).contains(pair3));
+    }
+
+    @Test
+    public void testSortTables() {
+        Column column1 = new Column("placeholder", PrimitiveType.INT);
+        List<Column> schema = new ArrayList<>();
+        schema.add(column1);
+        OlapTable table1 = new OlapTable(1340000000000L, "testTable", schema, null, null, null);
+        OlapTable table2 = new OlapTable(3000000000L, "testTable2", schema, null, null, null);
+        OlapTable table3 = new OlapTable(5000000000L, "testTable3", schema, null, null, null);
+        OlapTable table4 = new OlapTable(1, "testTable4", schema, null, null, null);
+        List<Table> tables = Lists.newArrayList();
+        tables.add(table1);
+        tables.add(table2);
+        tables.add(table3);
+        tables.add(table4);
+        StatisticsJobAppender appender = new StatisticsJobAppender();
+        List<Table> sortedTables = appender.sortTables(tables);
+        Assertions.assertEquals(4, sortedTables.size());
+        Assertions.assertEquals(1, sortedTables.get(0).getId());
+        Assertions.assertEquals(3000000000L, sortedTables.get(1).getId());
+        Assertions.assertEquals(5000000000L, sortedTables.get(2).getId());
+        Assertions.assertEquals(1340000000000L, sortedTables.get(3).getId());
+
+        sortedTables = appender.sortTables(null);
+        Assertions.assertEquals(0, sortedTables.size());
     }
 }

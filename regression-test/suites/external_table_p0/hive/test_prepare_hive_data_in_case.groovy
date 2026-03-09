@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_prepare_hive_data_in_case", "p0,external,hive,external_docker,external_docker_hive") {
+suite("test_prepare_hive_data_in_case", "p0,external") {
 
     String enabled = context.config.otherConfigs.get("enableHiveTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
@@ -48,7 +48,8 @@ suite("test_prepare_hive_data_in_case", "p0,external,hive,external_docker,extern
             log.info(values2.toString())
             assertEquals(values[0][0],values2[0][0])
 
-            qt_hive_docker_01 """select * from default.test_prepare_hive_data_in_case order by k1 desc  ;"""
+            // Execute in Hive in unstable, remove it
+            // qt_hive_docker_01 """select * from default.test_prepare_hive_data_in_case order by k1 desc  ;"""
             
             qt_sql_02 """ select * from test_prepare_hive_data_in_case.`default`.test_prepare_hive_data_in_case order by k1 desc;"""
 

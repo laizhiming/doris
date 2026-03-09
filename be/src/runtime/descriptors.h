@@ -21,23 +21,26 @@
 #pragma once
 
 #include <gen_cpp/Descriptors_types.h>
+#include <gen_cpp/Exprs_types.h>
 #include <gen_cpp/Types_types.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/port.h>
-#include <stdint.h>
 
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common/be_mock_util.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/global_types.h"
+#include "common/object_pool.h"
 #include "common/status.h"
-#include "runtime/define_primitive_type.h"
-#include "runtime/types.h"
-#include "vec/data_types/data_type.h"
+#include "core/data_type/data_type.h"
+#include "core/data_type/define_primitive_type.h"
+#include "storage/utils.h"
 
 namespace google::protobuf {
 template <typename Element>
@@ -45,24 +48,26 @@ class RepeatedField;
 } // namespace google::protobuf
 
 namespace doris {
-
+#include "common/compile_check_begin.h"
 class ObjectPool;
 class PTupleDescriptor;
 class PSlotDescriptor;
 
+using TColumnAccessPaths = std::vector<TColumnAccessPath>;
+
 class SlotDescriptor {
 public:
-    // virtual ~SlotDescriptor() {};
+    MOCK_DEFINE(virtual ~SlotDescriptor() = default;)
     SlotId id() const { return _id; }
-    const TypeDescriptor& type() const { return _type; }
+    vectorized::DataTypePtr type() const { return _type; }
     TupleId parent() const { return _parent; }
     // Returns the column index of this slot, including partition keys.
     // (e.g., col_pos - num_partition_keys = the table column this slot corresponds to)
     int col_pos() const { return _col_pos; }
     // Returns the field index in the generated llvm struct for this slot's tuple
     int field_idx() const { return _field_idx; }
-    bool is_materialized() const { return _is_materialized; }
-    bool is_nullable() const { return _is_nullable; }
+    bool is_nullable() const;
+    vectorized::DataTypePtr get_data_type_ptr() const;
 
     const std::string& col_name() const { return _col_name; }
     const std::string& col_name_lower_case() const { return _col_name_lower_case; }
@@ -73,18 +78,30 @@ public:
 
     vectorized::MutableColumnPtr get_empty_mutable_column() const;
 
-    doris::vectorized::DataTypePtr get_data_type_ptr() const;
-
-    int32_t col_unique_id() const { return _col_unique_id; }
+    MOCK_FUNCTION int32_t col_unique_id() const { return _col_unique_id; }
 
     bool is_key() const { return _is_key; }
-    bool need_materialize() const { return _need_materialize; }
     const std::vector<std::string>& column_paths() const { return _column_paths; };
+
+    const TColumnAccessPaths& all_access_paths() const { return _all_access_paths; }
+    const TColumnAccessPaths& predicate_access_paths() const { return _predicate_access_paths; }
 
     bool is_auto_increment() const { return _is_auto_increment; }
 
+    bool is_skip_bitmap_col() const { return _col_name == SKIP_BITMAP_COL; }
+    bool is_sequence_col() const { return _col_name == SEQUENCE_COL; }
+
     const std::string& col_default_value() const { return _col_default_value; }
-    PrimitiveType col_type() const { return _col_type; }
+    PrimitiveType col_type() const;
+
+    std::shared_ptr<doris::TExpr> get_virtual_column_expr() const {
+        // virtual_column_expr need do prepare.
+        return virtual_column_expr;
+    }
+
+    void set_is_predicate(bool is_predicate) { _is_predicate = is_predicate; }
+
+    bool is_predicate() const { return _is_predicate; }
 
 private:
     friend class DescriptorTbl;
@@ -96,16 +113,14 @@ private:
     friend class Tablet;
     friend class TabletSchema;
 
-    const SlotId _id;
-    const TypeDescriptor _type;
+    MOCK_REMOVE(const) SlotId _id;
+    MOCK_REMOVE(const) vectorized::DataTypePtr _type;
     const TupleId _parent;
     const int _col_pos;
-    bool _is_nullable;
-    const std::string _col_name;
+    MOCK_REMOVE(const) std::string _col_name;
     const std::string _col_name_lower_case;
 
     const int32_t _col_unique_id;
-    const PrimitiveType _col_type;
 
     // the idx of the slot in the tuple descriptor (0-based).
     // this is provided by the FE
@@ -116,17 +131,22 @@ private:
     // leading null bytes.
     int _field_idx;
 
-    const bool _is_materialized;
-
     const bool _is_key;
-    const bool _need_materialize;
     const std::vector<std::string> _column_paths;
+
+    TColumnAccessPaths _all_access_paths;
+    TColumnAccessPaths _predicate_access_paths;
 
     const bool _is_auto_increment;
     const std::string _col_default_value;
 
+    std::shared_ptr<doris::TExpr> virtual_column_expr = nullptr;
+
+    bool _is_predicate = false;
+
     SlotDescriptor(const TSlotDescriptor& tdesc);
     SlotDescriptor(const PSlotDescriptor& pdesc);
+    MOCK_DEFINE(SlotDescriptor();)
 };
 
 // Base class for table descriptors.
@@ -161,6 +181,12 @@ private:
 class OlapTableDescriptor : public TableDescriptor {
 public:
     OlapTableDescriptor(const TTableDescriptor& tdesc);
+    std::string debug_string() const override;
+};
+
+class DictionaryTableDescriptor : public TableDescriptor {
+public:
+    DictionaryTableDescriptor(const TTableDescriptor& tdesc);
     std::string debug_string() const override;
 };
 
@@ -215,16 +241,24 @@ public:
     std::string access_key() const { return _access_key; }
     std::string secret_key() const { return _secret_key; }
     std::string public_access() const { return _public_access; }
+    std::string endpoint() const { return _endpoint; }
+    std::string quota() const { return _quota; }
+    Status init_status() const { return _init_status; }
+    std::map<std::string, std::string> properties() const { return _props; }
 
 private:
-    std::string _region;
+    std::string _region; //deprecated
     std::string _project;
     std::string _table;
-    std::string _odps_url;
-    std::string _tunnel_url;
-    std::string _access_key;
-    std::string _secret_key;
-    std::string _public_access;
+    std::string _odps_url;      //deprecated
+    std::string _tunnel_url;    //deprecated
+    std::string _access_key;    //deprecated
+    std::string _secret_key;    //deprecated
+    std::string _public_access; //deprecated
+    std::string _endpoint;
+    std::string _quota;
+    std::map<std::string, std::string> _props;
+    Status _init_status = Status::OK();
 };
 
 class TrinoConnectorTableDescriptor : public TableDescriptor {
@@ -267,30 +301,6 @@ private:
     std::string _charset;
 };
 
-class ODBCTableDescriptor : public TableDescriptor {
-public:
-    ODBCTableDescriptor(const TTableDescriptor& tdesc);
-    std::string debug_string() const override;
-    std::string db() const { return _db; }
-    std::string table() const { return _table; }
-    std::string host() const { return _host; }
-    std::string port() const { return _port; }
-    std::string user() const { return _user; }
-    std::string passwd() const { return _passwd; }
-    std::string driver() const { return _driver; }
-    TOdbcTableType::type type() const { return _type; }
-
-private:
-    std::string _db;
-    std::string _table;
-    std::string _host;
-    std::string _port;
-    std::string _user;
-    std::string _passwd;
-    std::string _driver;
-    TOdbcTableType::type _type;
-};
-
 class JdbcTableDescriptor : public TableDescriptor {
 public:
     JdbcTableDescriptor(const TTableDescriptor& tdesc);
@@ -327,20 +337,32 @@ private:
     bool _connection_pool_keep_alive;
 };
 
+class RemoteDorisTableDescriptor : public TableDescriptor {
+public:
+    RemoteDorisTableDescriptor(const TTableDescriptor& tdesc);
+    ~RemoteDorisTableDescriptor() override;
+    std::string debug_string() const override;
+
+private:
+};
+
 class TupleDescriptor {
 public:
     TupleDescriptor(TupleDescriptor&&) = delete;
     void operator=(const TupleDescriptor&) = delete;
 
-    ~TupleDescriptor() {
+    MOCK_DEFINE(virtual) ~TupleDescriptor() {
         if (_own_slots) {
             for (SlotDescriptor* slot : _slots) {
                 delete slot;
             }
         }
     }
+
+    MOCK_DEFINE(TupleDescriptor() : _id {0} {};)
+
     int num_materialized_slots() const { return _num_materialized_slots; }
-    const std::vector<SlotDescriptor*>& slots() const { return _slots; }
+    MOCK_FUNCTION const std::vector<SlotDescriptor*>& slots() const { return _slots; }
 
     bool has_varlen_slots() const { return _has_varlen_slots; }
     const TableDescriptor* table_desc() const { return _table_desc; }
@@ -377,13 +399,18 @@ private:
 
 class DescriptorTbl {
 public:
+#ifdef BE_TEST
+    DescriptorTbl() = default;
+    virtual ~DescriptorTbl() = default;
+#endif
+
     // Creates a descriptor tbl within 'pool' from thrift_tbl and returns it via 'tbl'.
     // Returns OK on success, otherwise error (in which case 'tbl' will be unset).
     static Status create(ObjectPool* pool, const TDescriptorTable& thrift_tbl, DescriptorTbl** tbl);
 
     TableDescriptor* get_table_descriptor(TableId id) const;
     TupleDescriptor* get_tuple_descriptor(TupleId id) const;
-    SlotDescriptor* get_slot_descriptor(SlotId id) const;
+    MOCK_FUNCTION SlotDescriptor* get_slot_descriptor(SlotId id) const;
     const std::vector<TTupleId>& get_row_tuples() const { return _row_tuples; }
 
     // return all registered tuple descriptors
@@ -409,7 +436,9 @@ private:
     SlotDescriptorMap _slot_desc_map;
     std::vector<TTupleId> _row_tuples;
 
+#ifndef BE_TEST
     DescriptorTbl() = default;
+#endif
 };
 
 #define RETURN_IF_INVALID_TUPLE_IDX(tuple_id, tuple_idx)                                         \
@@ -428,13 +457,11 @@ private:
 // case)
 class RowDescriptor {
 public:
-    RowDescriptor(const DescriptorTbl& desc_tbl, const std::vector<TTupleId>& row_tuples,
-                  const std::vector<bool>& nullable_tuples);
+    RowDescriptor(const DescriptorTbl& desc_tbl, const std::vector<TTupleId>& row_tuples);
 
     // standard copy c'tor, made explicit here
     RowDescriptor(const RowDescriptor& desc)
             : _tuple_desc_map(desc._tuple_desc_map),
-              _tuple_idx_nullable_map(desc._tuple_idx_nullable_map),
               _tuple_idx_map(desc._tuple_idx_map),
               _has_varlen_slots(desc._has_varlen_slots) {
         auto it = desc._tuple_desc_map.begin();
@@ -444,12 +471,14 @@ public:
         }
     }
 
-    RowDescriptor(TupleDescriptor* tuple_desc, bool is_nullable);
+    RowDescriptor(TupleDescriptor* tuple_desc);
 
     RowDescriptor(const RowDescriptor& lhs_row_desc, const RowDescriptor& rhs_row_desc);
 
     // dummy descriptor, needed for the JNI EvalPredicate() function
     RowDescriptor() = default;
+
+    MOCK_DEFINE(virtual ~RowDescriptor() = default;)
 
     int num_materialized_slots() const { return _num_materialized_slots; }
 
@@ -464,7 +493,9 @@ public:
     bool has_varlen_slots() const { return _has_varlen_slots; }
 
     // Return descriptors for all tuples in this row, in order of appearance.
-    const std::vector<TupleDescriptor*>& tuple_descriptors() const { return _tuple_desc_map; }
+    MOCK_FUNCTION const std::vector<TupleDescriptor*>& tuple_descriptors() const {
+        return _tuple_desc_map;
+    }
 
     // Populate row_tuple_ids with our ids.
     void to_thrift(std::vector<TTupleId>* row_tuple_ids);
@@ -479,7 +510,7 @@ public:
 
     std::string debug_string() const;
 
-    int get_column_id(int slot_id, bool force_materialize_slot = false) const;
+    int get_column_id(int slot_id) const;
 
 private:
     // Initializes tupleIdxMap during c'tor using the _tuple_desc_map.
@@ -491,9 +522,6 @@ private:
     // map from position of tuple w/in row to its descriptor
     std::vector<TupleDescriptor*> _tuple_desc_map;
 
-    // _tuple_idx_nullable_map[i] is true if tuple i can be null
-    std::vector<bool> _tuple_idx_nullable_map;
-
     // map from TupleId to position of tuple w/in row
     std::vector<int> _tuple_idx_map;
 
@@ -503,5 +531,5 @@ private:
     int _num_materialized_slots = 0;
     int _num_slots = 0;
 };
-
+#include "common/compile_check_end.h"
 } // namespace doris

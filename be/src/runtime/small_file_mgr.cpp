@@ -18,6 +18,7 @@
 #include "runtime/small_file_mgr.h"
 
 // IWYU pragma: no_include <bthread/errno.h>
+#include <absl/strings/str_split.h>
 #include <errno.h> // IWYU pragma: keep
 #include <gen_cpp/HeartbeatService_types.h>
 #include <gen_cpp/Types_types.h>
@@ -31,15 +32,14 @@
 #include <utility>
 #include <vector>
 
+#include "common/metrics/doris_metrics.h"
+#include "common/metrics/metrics.h"
 #include "common/status.h"
-#include "gutil/strings/split.h"
-#include "http/http_client.h"
 #include "io/fs/file_system.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
-#include "util/doris_metrics.h"
+#include "service/http/http_client.h"
 #include "util/md5.h"
-#include "util/metrics.h"
 #include "util/string_util.h"
 
 namespace doris {
@@ -84,7 +84,7 @@ Status SmallFileMgr::_load_local_files() {
 Status SmallFileMgr::_load_single_file(const std::string& path, const std::string& file_name) {
     // file name format should be like:
     // file_id.md5
-    std::vector<std::string> parts = strings::Split(file_name, ".");
+    std::vector<std::string> parts = absl::StrSplit(file_name, ".");
     if (parts.size() != 2) {
         return Status::InternalError("Not a valid file name: {}", file_name);
     }
@@ -169,10 +169,10 @@ Status SmallFileMgr::_download_file(int64_t file_id, const std::string& md5,
     HttpClient client;
 
     std::stringstream url_ss;
-    TMasterInfo* master_info = _exec_env->master_info();
-    url_ss << master_info->network_address.hostname << ":" << master_info->http_port
+    ClusterInfo* cluster_info = _exec_env->cluster_info();
+    url_ss << cluster_info->master_fe_addr.hostname << ":" << cluster_info->master_fe_http_port
            << "/api/get_small_file?"
-           << "file_id=" << file_id << "&token=" << master_info->token;
+           << "file_id=" << file_id << "&token=" << cluster_info->token;
 
     std::string url = url_ss.str();
 

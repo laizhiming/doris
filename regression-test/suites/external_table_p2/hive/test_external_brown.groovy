@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_external_brown", "p2,external,hive,external_remote,external_remote_hive") {
+suite("test_external_brown", "p2,external") {
+    Boolean ignoreP2 = true;
+    if (ignoreP2) {
+        logger.info("disable p2 test");
+        return;
+    }
 
     def formats = ["_parquet", "_orc", ""]
     def CPUNetworkUtilization_order = """

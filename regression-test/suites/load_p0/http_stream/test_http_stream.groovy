@@ -34,7 +34,9 @@ suite("test_http_stream", "p0") {
             dt_1 DATETIME DEFAULT CURRENT_TIMESTAMP,
             dt_2 DATETIMEV2 DEFAULT CURRENT_TIMESTAMP,
             dt_3 DATETIMEV2(3) DEFAULT CURRENT_TIMESTAMP,
-            dt_4 DATETIMEV2(6) DEFAULT CURRENT_TIMESTAMP
+            dt_4 DATETIMEV2(6) DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_dt_2 (`dt_2`) USING INVERTED,
+            INDEX idx_dt_3 (`dt_3`) USING INVERTED
         )
         DISTRIBUTED BY HASH(id) BUCKETS 1
         PROPERTIES (
@@ -58,6 +60,25 @@ suite("test_http_stream", "p0") {
                 assertEquals("success", json.Status.toLowerCase())
                 assertEquals(11, json.NumberTotalRows)
                 assertEquals(0, json.NumberFilteredRows)
+            }
+        }
+
+        // test error sql
+        streamLoad {
+            set 'version', '1'
+            set 'sql', """
+                    insert into ${db}.${tableName1} (id, name) select
+                    """
+            time 10000
+            file 'test_http_stream.csv'
+            check { result, exception, startTime, endTime ->
+                if (exception != null) {
+                    throw exception
+                }
+                log.info("http_stream result: ${result}".toString())
+                def json = parseJson(result)
+                assertEquals("fail", json.Status.toLowerCase())
+                assertTrue(json.Message.contains("Nereids parse failed"))
             }
         }
 
@@ -298,7 +319,9 @@ suite("test_http_stream", "p0") {
             sex TINYINT,
             phone LARGEINT,
             address VARCHAR(500),
-            register_time DATETIME
+            register_time DATETIME,
+            INDEX idx_username (`username`) USING INVERTED,
+            INDEX idx_address (`address`) USING INVERTED
         )
         DUPLICATE KEY(`user_id`, `username`)
         DISTRIBUTED BY HASH(`user_id`) BUCKETS 1
@@ -373,7 +396,7 @@ suite("test_http_stream", "p0") {
             }
         }
 
-        qt_sql8 "select * from ${tableName8}"
+        order_qt_sql8 "select * from ${tableName8}"
     } finally {
         try_sql "DROP TABLE IF EXISTS ${tableName8}"
     }
@@ -421,7 +444,7 @@ suite("test_http_stream", "p0") {
             }
         }
 
-        qt_sql9 "select * from ${tableName9}"
+        order_qt_sql9 "select * from ${tableName9}"
     } finally {
         try_sql "DROP TABLE IF EXISTS ${tableName9}"
     }
@@ -627,7 +650,9 @@ suite("test_http_stream", "p0") {
                 }
                 log.info("http_stream result: ${result}".toString())
                 def json = parseJson(result)
-                assertEquals(label, json.Label.toLowerCase())
+                if (!isGroupCommitMode()) {
+                    assertEquals(label, json.Label.toLowerCase())
+                }
                 assertEquals("success", json.Status.toLowerCase())
                 assertEquals(11, json.NumberTotalRows)
                 assertEquals(0, json.NumberFilteredRows)

@@ -1,0 +1,17 @@
+src:*/rapidjson/*
+src:*/storage/key_coder.h
+src:*/storage/types.h
+src:*/storage/field.h
+src:*/storage/row_cursor.cpp
+src:*/storage/wrapper_field.h
+src:*/storage/wrapper_field.cpp
+src:*/segment_v2/column_reader.cpp
+src:*/json/new_json_reader.cpp
+src:*/common/memcpy_small.h
+src:*/util/mysql_row_buffer.cpp
+src:*/util/bitmap_intersect.h
+src:*/util/slice.h
+src:*/bvar/reducer.h
+fun:*BaseFieldTypeTraits*
+fun:*FieldTypeTraits*
+fun:*KeyCoderTraits*

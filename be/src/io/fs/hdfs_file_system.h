@@ -32,7 +32,7 @@
 #include "io/fs/hdfs.h"
 #include "io/fs/path.h"
 #include "io/fs/remote_file_system.h"
-#include "util/runtime_profile.h"
+#include "runtime/runtime_profile.h"
 
 namespace doris {
 class THdfsParams;
@@ -88,7 +88,7 @@ private:
                    RuntimeProfile* profile, std::string root_path);
     const THdfsParams& _hdfs_params; // Only used in init, so we can use reference here
     std::string _fs_name;
-    std::shared_ptr<HdfsHandler> _fs_handle = nullptr;
+    std::shared_ptr<HdfsHandler> _fs_handler = nullptr;
     RuntimeProfile* _profile = nullptr;
 };
 } // namespace io

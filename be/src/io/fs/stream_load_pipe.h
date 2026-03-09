@@ -18,25 +18,24 @@
 #pragma once
 
 #include <gen_cpp/internal_service.pb.h>
-#include <stddef.h>
-#include <stdint.h>
 
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 
 #include "common/status.h"
+#include "core/custom_allocator.h"
 #include "io/fs/file_reader.h"
-#include "io/fs/file_system.h"
 #include "io/fs/path.h"
-#include "runtime/message_body_sink.h"
+#include "load/message_body_sink.h"
 #include "util/byte_buffer.h"
 #include "util/slice.h"
 
-namespace doris {
-namespace io {
+namespace doris::io {
 struct IOContext;
 
 static inline constexpr size_t kMaxPipeBufferedBytes = 4 * 1024 * 1024;
@@ -58,6 +57,8 @@ public:
 
     size_t size() const override { return 0; }
 
+    int64_t mtime() const override { return 0; }
+
     // called when consumer finished
     Status close() override {
         if (!(_finished || _cancelled)) {
@@ -74,7 +75,7 @@ public:
     // called when producer/consumer failed
     virtual void cancel(const std::string& reason) override;
 
-    Status read_one_message(std::unique_ptr<uint8_t[]>* data, size_t* length);
+    Status read_one_message(DorisUniqueBufferPtr<uint8_t>* data, size_t* length);
 
     size_t get_queue_size() { return _buf_queue.size(); }
 
@@ -85,13 +86,19 @@ public:
 
     size_t current_capacity();
 
+    bool is_chunked_transfer() const { return _is_chunked_transfer; }
+
+    void set_is_chunked_transfer(bool is_chunked_transfer) {
+        _is_chunked_transfer = is_chunked_transfer;
+    }
+
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override;
 
 private:
     // read the next buffer from _buf_queue
-    Status _read_next_buffer(std::unique_ptr<uint8_t[]>* data, size_t* length);
+    Status _read_next_buffer(DorisUniqueBufferPtr<uint8_t>* data, size_t* length);
 
     Status _append(const ByteBufferPtr& buf, size_t proto_byte_size = 0);
 
@@ -119,6 +126,9 @@ private:
 
     // no use, only for compatibility with the `Path` interface
     Path _path = "";
+
+    // When importing JSON data and using chunked transfer encoding,
+    // the data needs to be completely read before it can be parsed.
+    bool _is_chunked_transfer = false;
 };
-} // namespace io
-} // namespace doris
+} // namespace doris::io

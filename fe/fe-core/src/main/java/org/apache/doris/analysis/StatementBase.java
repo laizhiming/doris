@@ -20,45 +20,20 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.Type;
-import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.qe.OriginStatement;
-import org.apache.doris.rewrite.ExprRewriter;
-import org.apache.doris.thrift.TQueryOptions;
 
 import com.google.common.base.Preconditions;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 public abstract class StatementBase implements ParseNode {
-    private static final Logger LOG = LogManager.getLogger(StatementBase.class);
-    private String clusterName;
-
     // Set this variable if this QueryStmt is the top level query from an EXPLAIN <query>
     protected ExplainOptions explainOptions = null;
-
-    /////////////////////////////////////////
-    // BEGIN: Members that need to be reset()
-
-    // Analyzer that was used to analyze this statement.
-    protected Analyzer analyzer;
-
-    // END: Members that need to be reset()
-    /////////////////////////////////////////
-
     private OriginStatement origStmt;
-
     private UserIdentity userInfo;
-
     private boolean isPrepared = false;
-    // select * from tbl where a = ? and b = ?
-    // `?` is the placeholder
-    private ArrayList<PlaceHolderExpr> placeholders = new ArrayList<>();
 
     protected StatementBase() { }
 
@@ -66,7 +41,6 @@ public abstract class StatementBase implements ParseNode {
      * C'tor for cloning.
      */
     protected StatementBase(StatementBase other) {
-        analyzer = other.analyzer;
         explainOptions = other.explainOptions;
     }
 
@@ -79,42 +53,15 @@ public abstract class StatementBase implements ParseNode {
      * Should call the method firstly when override the method, the analyzer param should be
      * the one which statement would use.
      */
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
-        if (isAnalyzed()) {
-            return;
-        }
-        this.analyzer = analyzer;
-        if (analyzer.getRootStatementClazz() == null) {
-            analyzer.setRootStatementClazz(this.getClass());
-        }
-    }
-
-    public void checkPriv() throws AnalysisException {
-    }
-
-    public Analyzer getAnalyzer() {
-        return analyzer;
-    }
-
-    public boolean isAnalyzed() {
-        return analyzer != null;
+    public void analyze() throws UserException {
     }
 
     public void setIsExplain(ExplainOptions options) {
         this.explainOptions = options;
     }
 
-    public void setPlaceHolders(ArrayList<PlaceHolderExpr> placeholders) {
-        LOG.debug("setPlaceHolders {}", placeholders);
-        this.placeholders = new ArrayList<PlaceHolderExpr>(placeholders);
-    }
-
     public boolean isExplain() {
         return this.explainOptions != null;
-    }
-
-    public ArrayList<PlaceHolderExpr> getPlaceHolders() {
-        return this.placeholders;
     }
 
     public boolean isVerbose() {
@@ -123,10 +70,6 @@ public abstract class StatementBase implements ParseNode {
 
     public ExplainOptions getExplainOptions() {
         return explainOptions;
-    }
-
-    public void setIsPrepared() {
-        this.isPrepared = true;
     }
 
     public boolean isPrepared() {
@@ -143,7 +86,9 @@ public abstract class StatementBase implements ParseNode {
         return "";
     }
 
-    public abstract RedirectStatus getRedirectStatus();
+    public StmtType stmtType() {
+        return StmtType.OTHER;
+    }
 
     /**
      * Returns the output column labels of this statement, if applicable, or an empty list
@@ -155,78 +100,12 @@ public abstract class StatementBase implements ParseNode {
     }
 
     /**
-     * Sets the column labels of this statement, if applicable. No-op of the statement does
-     * not produce an output result set.
-     */
-    public void setColLabels(List<String> colLabels) {
-        List<String> oldLabels = getColLabels();
-        if (oldLabels == colLabels) {
-            return;
-        }
-        oldLabels.clear();
-        oldLabels.addAll(colLabels);
-    }
-
-    /**
      * Returns the unresolved result expressions of this statement, if applicable, or an
      * empty list if not applicable (not all statements produce an output result set).
      * Subclasses must override this as necessary.
      */
     public List<Expr> getResultExprs() {
         return Collections.<Expr>emptyList();
-    }
-
-    /**
-     * Casts the result expressions and derived members (e.g., destination column types for
-     * CTAS) to the given types. No-op if this statement does not have result expressions.
-     * Throws when casting fails. Subclasses may override this as necessary.
-     */
-    public void castResultExprs(List<Type> types) throws AnalysisException {
-        List<Expr> resultExprs = getResultExprs();
-        Preconditions.checkNotNull(resultExprs);
-        Preconditions.checkState(resultExprs.size() == types.size());
-        for (int i = 0; i < types.size(); ++i) {
-            //The specific type of the date type is determined by the
-            //actual type of the return value, not by the function return value type in FE Function
-            //such as the result of str_to_date may be either DATE or DATETIME
-            if (resultExprs.get(i).getType().isDateType() && types.get(i).isDateType()) {
-                continue;
-            }
-            if (!resultExprs.get(i).getType().equals(types.get(i))) {
-                resultExprs.set(i, resultExprs.get(i).castTo(types.get(i)));
-            }
-        }
-    }
-
-    /**
-     * Uses the given 'rewriter' to transform all Exprs in this statement according
-     * to the rules specified in the 'rewriter'. Replaces the original Exprs with the
-     * transformed ones in-place. Subclasses that have Exprs to be rewritten must
-     * override this method. Valid to call after analyze().
-     */
-    public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
-        throw new IllegalStateException(
-                "rewriteExprs() not implemented for this stmt: " + getClass().getSimpleName());
-    }
-
-    /**
-     * fold constant exprs in statement
-     * @throws AnalysisException
-     * @param rewriter
-     */
-    public void foldConstant(ExprRewriter rewriter, TQueryOptions tQueryOptions) throws AnalysisException {
-        throw new IllegalStateException(
-                "foldConstant() not implemented for this stmt: " + getClass().getSimpleName());
-    }
-
-    /**
-     * rewrite element_at to slot in statement
-     * @throws AnalysisException
-     * @param rewriter
-     */
-    public void rewriteElementAtToSlot(ExprRewriter rewriter, TQueryOptions tQueryOptions) throws AnalysisException {
-        throw new IllegalStateException(
-                "rewriteElementAtToSlot() not implemented for this stmt: " + getClass().getSimpleName());
     }
 
     public void setOrigStmt(OriginStatement origStmt) {
@@ -244,31 +123,6 @@ public abstract class StatementBase implements ParseNode {
 
     public void setUserInfo(UserIdentity userInfo) {
         this.userInfo = userInfo;
-    }
-
-    /**
-     * Resets the internal analysis state of this node.
-     * For easier maintenance, class members that need to be reset are grouped into
-     * a 'section' clearly indicated by comments as follows:
-     *
-     * class SomeStmt extends StatementBase {
-     *   ...
-     *   /////////////////////////////////////////
-     *   // BEGIN: Members that need to be reset()
-     *
-     *   <member declarations>
-     *
-     *   // END: Members that need to be reset()
-     *   /////////////////////////////////////////
-     *   ...
-     * }
-     *
-     * In general, members that are set or modified during analyze() must be reset().
-     * TODO: Introduce this same convention for Exprs, possibly by moving clone()/reset()
-     * into the ParseNode interface for clarity.
-     */
-    public void reset() {
-        analyzer = null;
     }
 
     // Override this method and return true

@@ -25,6 +25,7 @@
 #include <gen_cpp/Types_types.h>
 #include <glog/logging.h>
 
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -34,22 +35,24 @@
 #include "common/logging.h"
 #include "common/object_pool.h"
 #include "common/status.h"
+#include "core/value/vdatetime_value.h"
+#include "exec/operator/operator.h"
+#include "exec/pipeline/pipeline_task.h"
+#include "exec/runtime_filter/runtime_filter_mgr.h"
 #include "io/fs/s3_file_system.h"
-#include "olap/storage_engine.h"
-#include "pipeline/exec/operator.h"
-#include "pipeline/pipeline_task.h"
+#include "load/load_path_mgr.h"
 #include "runtime/exec_env.h"
-#include "runtime/load_path_mgr.h"
+#include "runtime/fragment_mgr.h"
 #include "runtime/memory/mem_tracker_limiter.h"
-#include "runtime/memory/thread_mem_tracker_mgr.h"
 #include "runtime/query_context.h"
-#include "runtime/runtime_filter_mgr.h"
 #include "runtime/thread_context.h"
+#include "storage/id_manager.h"
+#include "storage/storage_engine.h"
 #include "util/timezone_utils.h"
 #include "util/uid_util.h"
-#include "vec/runtime/vdatetime_value.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 using namespace ErrorCode;
 
 RuntimeState::RuntimeState(const TPlanFragmentExecParams& fragment_exec_params,
@@ -68,34 +71,12 @@ RuntimeState::RuntimeState(const TPlanFragmentExecParams& fragment_exec_params,
           _num_print_error_rows(0),
           _num_bytes_load_total(0),
           _num_finished_scan_range(0),
-          _normal_row_number(0),
-          _error_row_number(0),
-          _error_log_file(nullptr),
           _query_ctx(ctx) {
     Status status =
             init(fragment_exec_params.fragment_instance_id, query_options, query_globals, exec_env);
     DCHECK(status.ok());
-    if (query_mem_tracker != nullptr) {
-        _query_mem_tracker = query_mem_tracker;
-    } else {
-        DCHECK(ctx != nullptr);
-        _query_mem_tracker = ctx->query_mem_tracker;
-    }
-#ifdef BE_TEST
-    if (_query_mem_tracker == nullptr) {
-        init_mem_trackers();
-    }
-#endif
-    DCHECK(_query_mem_tracker != nullptr && _query_mem_tracker->label() != "Orphan");
-    if (ctx) {
-        _runtime_filter_mgr = std::make_unique<RuntimeFilterMgr>(
-                fragment_exec_params.query_id, RuntimeFilterParamsContext::create(this),
-                _query_mem_tracker);
-    }
-    if (fragment_exec_params.__isset.runtime_filter_params) {
-        _query_ctx->runtime_filter_mgr()->set_runtime_filter_params(
-                fragment_exec_params.runtime_filter_params);
-    }
+    _query_mem_tracker = query_mem_tracker;
+    DCHECK(_query_mem_tracker != nullptr);
 }
 
 RuntimeState::RuntimeState(const TUniqueId& instance_id, const TUniqueId& query_id,
@@ -115,55 +96,10 @@ RuntimeState::RuntimeState(const TUniqueId& instance_id, const TUniqueId& query_
           _num_print_error_rows(0),
           _num_bytes_load_total(0),
           _num_finished_scan_range(0),
-          _normal_row_number(0),
-          _error_row_number(0),
-          _error_log_file(nullptr),
           _query_ctx(ctx) {
     [[maybe_unused]] auto status = init(instance_id, query_options, query_globals, exec_env);
     DCHECK(status.ok());
-    _query_mem_tracker = ctx->query_mem_tracker;
-#ifdef BE_TEST
-    if (_query_mem_tracker == nullptr) {
-        init_mem_trackers();
-    }
-#endif
-    DCHECK(_query_mem_tracker != nullptr && _query_mem_tracker->label() != "Orphan");
-    _runtime_filter_mgr.reset(new RuntimeFilterMgr(
-            query_id, RuntimeFilterParamsContext::create(this), _query_mem_tracker));
-}
-
-RuntimeState::RuntimeState(pipeline::PipelineFragmentContext*, const TUniqueId& instance_id,
-                           const TUniqueId& query_id, int32_t fragment_id,
-                           const TQueryOptions& query_options, const TQueryGlobals& query_globals,
-                           ExecEnv* exec_env, QueryContext* ctx)
-        : _profile("Fragment " + print_id(instance_id)),
-          _load_channel_profile("<unnamed>"),
-          _obj_pool(new ObjectPool()),
-          _runtime_filter_mgr(nullptr),
-          _unreported_error_idx(0),
-          _query_id(query_id),
-          _fragment_id(fragment_id),
-          _per_fragment_instance_idx(0),
-          _num_rows_load_total(0),
-          _num_rows_load_filtered(0),
-          _num_rows_load_unselected(0),
-          _num_rows_filtered_in_strict_mode_partial_update(0),
-          _num_print_error_rows(0),
-          _num_bytes_load_total(0),
-          _num_finished_scan_range(0),
-          _normal_row_number(0),
-          _error_row_number(0),
-          _error_log_file(nullptr),
-          _query_ctx(ctx) {
-    [[maybe_unused]] auto status = init(instance_id, query_options, query_globals, exec_env);
-    _query_mem_tracker = ctx->query_mem_tracker;
-#ifdef BE_TEST
-    if (_query_mem_tracker == nullptr) {
-        init_mem_trackers();
-    }
-#endif
-    DCHECK(_query_mem_tracker != nullptr && _query_mem_tracker->label() != "Orphan");
-    DCHECK(status.ok());
+    _query_mem_tracker = ctx->query_mem_tracker();
 }
 
 RuntimeState::RuntimeState(const TUniqueId& query_id, int32_t fragment_id,
@@ -183,55 +119,47 @@ RuntimeState::RuntimeState(const TUniqueId& query_id, int32_t fragment_id,
           _num_print_error_rows(0),
           _num_bytes_load_total(0),
           _num_finished_scan_range(0),
-          _normal_row_number(0),
-          _error_row_number(0),
-          _error_log_file(nullptr),
           _query_ctx(ctx) {
     // TODO: do we really need instance id?
     Status status = init(TUniqueId(), query_options, query_globals, exec_env);
     DCHECK(status.ok());
-    _query_mem_tracker = ctx->query_mem_tracker;
-#ifdef BE_TEST
-    if (_query_mem_tracker == nullptr) {
-        init_mem_trackers();
-    }
-#endif
-    DCHECK(_query_mem_tracker != nullptr && _query_mem_tracker->label() != "Orphan");
-    _runtime_filter_mgr.reset(new RuntimeFilterMgr(
-            query_id, RuntimeFilterParamsContext::create(this), _query_mem_tracker));
+    _query_mem_tracker = ctx->query_mem_tracker();
 }
 
-RuntimeState::RuntimeState(const TQueryGlobals& query_globals)
+RuntimeState::RuntimeState(const TUniqueId& query_id, int32_t fragment_id,
+                           const TQueryOptions& query_options, const TQueryGlobals& query_globals,
+                           ExecEnv* exec_env,
+                           const std::shared_ptr<MemTrackerLimiter>& query_mem_tracker)
+        : _profile("PipelineX  " + std::to_string(fragment_id)),
+          _load_channel_profile("<unnamed>"),
+          _obj_pool(new ObjectPool()),
+          _unreported_error_idx(0),
+          _query_id(query_id),
+          _fragment_id(fragment_id),
+          _per_fragment_instance_idx(0),
+          _num_rows_load_total(0),
+          _num_rows_load_filtered(0),
+          _num_rows_load_unselected(0),
+          _num_rows_filtered_in_strict_mode_partial_update(0),
+          _num_print_error_rows(0),
+          _num_bytes_load_total(0),
+          _num_finished_scan_range(0) {
+    Status status = init(TUniqueId(), query_options, query_globals, exec_env);
+    DCHECK(status.ok());
+    _query_mem_tracker = query_mem_tracker;
+    DCHECK(_query_mem_tracker != nullptr);
+}
+
+RuntimeState::RuntimeState(const TQueryOptions& query_options, const TQueryGlobals& query_globals)
         : _profile("<unnamed>"),
           _load_channel_profile("<unnamed>"),
           _obj_pool(new ObjectPool()),
           _unreported_error_idx(0),
           _per_fragment_instance_idx(0) {
-    _query_options.batch_size = DEFAULT_BATCH_SIZE;
-    if (query_globals.__isset.time_zone && query_globals.__isset.nano_seconds) {
-        _timezone = query_globals.time_zone;
-        _timestamp_ms = query_globals.timestamp_ms;
-        _nano_seconds = query_globals.nano_seconds;
-    } else if (query_globals.__isset.time_zone) {
-        _timezone = query_globals.time_zone;
-        _timestamp_ms = query_globals.timestamp_ms;
-        _nano_seconds = 0;
-    } else if (!query_globals.now_string.empty()) {
-        _timezone = TimezoneUtils::default_time_zone;
-        VecDateTimeValue dt;
-        dt.from_date_str(query_globals.now_string.c_str(), query_globals.now_string.size());
-        int64_t timestamp;
-        dt.unix_timestamp(&timestamp, _timezone);
-        _timestamp_ms = timestamp * 1000;
-        _nano_seconds = 0;
-    } else {
-        //Unit test may set into here
-        _timezone = TimezoneUtils::default_time_zone;
-        _timestamp_ms = 0;
-        _nano_seconds = 0;
-    }
-    TimezoneUtils::find_cctz_time_zone(_timezone, _timezone_obj);
+    Status status = init(TUniqueId(), query_options, query_globals, nullptr);
+    _exec_env = ExecEnv::GetInstance();
     init_mem_trackers("<unnamed>");
+    DCHECK(status.ok());
 }
 
 RuntimeState::RuntimeState()
@@ -255,32 +183,16 @@ RuntimeState::~RuntimeState() {
     // close error log file
     if (_error_log_file != nullptr && _error_log_file->is_open()) {
         _error_log_file->close();
-        delete _error_log_file;
-        _error_log_file = nullptr;
-        if (_s3_error_fs) {
-            std::string error_log_absolute_path =
-                    _exec_env->load_path_mgr()->get_load_error_absolute_path(_error_log_file_path);
-            // upload error log file to s3
-            Status st = _s3_error_fs->upload(error_log_absolute_path, _s3_error_log_file_path);
-            if (st.ok()) {
-                // remove local error log file
-                std::filesystem::remove(error_log_absolute_path);
-            } else {
-                // remove local error log file later by clean_expired_temp_path thread
-                LOG(WARNING) << "Fail to upload error file to s3, error_log_file_path="
-                             << _error_log_file_path << ", error=" << st;
-            }
-        }
     }
 
     _obj_pool->clear();
-    _runtime_filter_mgr.reset();
 }
 
 Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
                           const TQueryGlobals& query_globals, ExecEnv* exec_env) {
     _fragment_instance_id = fragment_instance_id;
     _query_options = query_options;
+    _lc_time_names = query_globals.lc_time_names;
     if (query_globals.__isset.time_zone && query_globals.__isset.nano_seconds) {
         _timezone = query_globals.time_zone;
         _timestamp_ms = query_globals.timestamp_ms;
@@ -324,7 +236,13 @@ Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOpt
     _db_name = "insert_stmt";
     _import_label = print_id(fragment_instance_id);
 
+    _profile_level = query_options.__isset.profile_level ? query_options.profile_level : 2;
+
     return Status::OK();
+}
+
+std::weak_ptr<QueryContext> RuntimeState::get_query_ctx_weak() {
+    return _exec_env->fragment_mgr()->get_query_ctx(_query_ctx->query_id());
 }
 
 void RuntimeState::init_mem_trackers(const std::string& name, const TUniqueId& id) {
@@ -335,6 +253,10 @@ void RuntimeState::init_mem_trackers(const std::string& name, const TUniqueId& i
 std::shared_ptr<MemTrackerLimiter> RuntimeState::query_mem_tracker() const {
     CHECK(_query_mem_tracker != nullptr);
     return _query_mem_tracker;
+}
+
+WorkloadGroupPtr RuntimeState::workload_group() {
+    return _query_ctx->workload_group();
 }
 
 bool RuntimeState::log_error(const std::string& error) {
@@ -353,7 +275,7 @@ void RuntimeState::get_unreported_errors(std::vector<std::string>* new_errors) {
 
     if (_unreported_error_idx < _error_log.size()) {
         new_errors->assign(_error_log.begin() + _unreported_error_idx, _error_log.end());
-        _unreported_error_idx = _error_log.size();
+        _unreported_error_idx = (int)_error_log.size();
     }
 }
 
@@ -385,7 +307,7 @@ Status RuntimeState::create_error_log_file() {
             // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_err_packet.html
             // shorten the path as much as possible to prevent the length of the presigned URL from
             // exceeding the MySQL error packet size limit
-            ss << "error_log/" << _import_label << "_" << std::hex << _fragment_instance_id.hi;
+            ss << "error_log/" << std::hex << _fragment_instance_id.lo;
             _s3_error_log_file_path = ss.str();
         }
     }
@@ -394,22 +316,22 @@ Status RuntimeState::create_error_log_file() {
             _db_name, _import_label, _fragment_instance_id, &_error_log_file_path));
     std::string error_log_absolute_path =
             _exec_env->load_path_mgr()->get_load_error_absolute_path(_error_log_file_path);
-    _error_log_file = new std::ofstream(error_log_absolute_path, std::ifstream::out);
+    _error_log_file = std::make_unique<std::ofstream>(error_log_absolute_path, std::ifstream::out);
     if (!_error_log_file->is_open()) {
         std::stringstream error_msg;
         error_msg << "Fail to open error file: [" << _error_log_file_path << "].";
         LOG(WARNING) << error_msg.str();
         return Status::InternalError(error_msg.str());
     }
-    VLOG_FILE << "create error log file: " << _error_log_file_path;
+    LOG(INFO) << "create error log file: " << _error_log_file_path
+              << ", query id: " << print_id(_query_id)
+              << ", fragment instance id: " << print_id(_fragment_instance_id);
 
     return Status::OK();
 }
 
 Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
-                                              std::function<std::string()> error_msg,
-                                              bool* stop_processing, bool is_summary) {
-    *stop_processing = false;
+                                              std::function<std::string()> error_msg) {
     if (query_type() != TQueryType::LOAD) {
         return Status::OK();
     }
@@ -420,35 +342,28 @@ Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
             LOG(WARNING) << "Create error file log failed. because: " << status;
             if (_error_log_file != nullptr) {
                 _error_log_file->close();
-                delete _error_log_file;
-                _error_log_file = nullptr;
             }
             return status;
         }
+        // record the first error message if the file is just created
+        _first_error_msg = error_msg() + ". Src line: " + line();
+        LOG(INFO) << "The first error message: " << _first_error_msg;
     }
-
-    // if num of printed error row exceeds the limit, and this is not a summary message,
-    // if _load_zero_tolerance, return Error to stop the load process immediately.
-    if (_num_print_error_rows.fetch_add(1, std::memory_order_relaxed) > MAX_ERROR_NUM &&
-        !is_summary) {
+    // If num of printed error row exceeds the limit, don't add error messages to error log file any more
+    if (_num_print_error_rows.fetch_add(1, std::memory_order_relaxed) > MAX_ERROR_NUM) {
+        // if _load_zero_tolerance, return Error to stop the load process immediately.
         if (_load_zero_tolerance) {
-            *stop_processing = true;
+            return Status::DataQualityError(
+                    "Encountered unqualified data, stop processing. Please check if the source "
+                    "data matches the schema, and consider disabling strict mode or increasing "
+                    "max_filter_ratio.");
         }
         return Status::OK();
     }
 
     fmt::memory_buffer out;
-    if (is_summary) {
-        fmt::format_to(out, "Summary: {}", error_msg());
-    } else {
-        if (_error_row_number < MAX_ERROR_NUM) {
-            // Note: export reason first in case src line too long and be truncated.
-            fmt::format_to(out, "Reason: {}. src line [{}]; ", error_msg(), line());
-        } else if (_error_row_number == MAX_ERROR_NUM) {
-            fmt::format_to(out, "TOO MUCH ERROR! already reach {}. show no more next error.",
-                           MAX_ERROR_NUM);
-        }
-    }
+    // Note: export reason first in case src line too long and be truncated.
+    fmt::format_to(out, "Reason: {}. src line [{}]; ", error_msg(), line());
 
     size_t error_row_size = out.size();
     if (error_row_size > 0) {
@@ -461,27 +376,38 @@ Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
             (*_error_log_file) << fmt::to_string(out) << std::endl;
         }
     }
+
     return Status::OK();
 }
 
-std::string RuntimeState::get_error_log_file_path() const {
-    if (_s3_error_fs) {
+std::string RuntimeState::get_error_log_file_path() {
+    DBUG_EXECUTE_IF("RuntimeState::get_error_log_file_path.block", {
+        if (!_error_log_file_path.empty()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    std::lock_guard<std::mutex> l(_s3_error_log_file_lock);
+    if (_s3_error_fs && _error_log_file && _error_log_file->is_open()) {
+        // close error log file
+        _error_log_file->close();
+        std::string error_log_absolute_path =
+                _exec_env->load_path_mgr()->get_load_error_absolute_path(_error_log_file_path);
+        // upload error log file to s3
+        Status st = _s3_error_fs->upload(error_log_absolute_path, _s3_error_log_file_path);
+        if (!st.ok()) {
+            // upload failed and return local error log file path
+            LOG(WARNING) << "Fail to upload error file to s3, error_log_file_path="
+                         << _error_log_file_path << ", error=" << st;
+            return _error_log_file_path;
+        }
         // expiration must be less than a week (in seconds) for presigned url
         static const unsigned EXPIRATION_SECONDS = 7 * 24 * 60 * 60 - 1;
-        // We should return a public endpoint to user.
-        return _s3_error_fs->generate_presigned_url(_s3_error_log_file_path, EXPIRATION_SECONDS,
-                                                    true);
+        // Use public or private endpoint based on configuration
+        _error_log_file_path =
+                _s3_error_fs->generate_presigned_url(_s3_error_log_file_path, EXPIRATION_SECONDS,
+                                                     config::use_public_endpoint_for_error_log);
     }
     return _error_log_file_path;
-}
-
-int64_t RuntimeState::get_load_mem_limit() {
-    // TODO: the code is abandoned, it can be deleted after v1.3
-    if (_query_options.__isset.load_mem_limit && _query_options.load_mem_limit > 0) {
-        return _query_options.load_mem_limit;
-    } else {
-        return _query_mem_tracker->limit();
-    }
 }
 
 void RuntimeState::resize_op_id_to_local_state(int operator_size) {
@@ -491,14 +417,15 @@ void RuntimeState::resize_op_id_to_local_state(int operator_size) {
 void RuntimeState::emplace_local_state(
         int id, std::unique_ptr<doris::pipeline::PipelineXLocalStateBase> state) {
     id = -id;
-    DCHECK(id < _op_id_to_local_state.size());
+    DCHECK_LT(id, _op_id_to_local_state.size())
+            << state->parent()->get_name() << " node id = " << state->parent()->node_id();
     DCHECK(!_op_id_to_local_state[id]);
     _op_id_to_local_state[id] = std::move(state);
 }
 
 doris::pipeline::PipelineXLocalStateBase* RuntimeState::get_local_state(int id) {
-    id = -id;
-    return _op_id_to_local_state[id].get();
+    DCHECK_GT(_op_id_to_local_state.size(), -id);
+    return _op_id_to_local_state[-id].get();
 }
 
 Result<RuntimeState::LocalState*> RuntimeState::get_local_state_result(int id) {
@@ -539,29 +466,25 @@ RuntimeFilterMgr* RuntimeState::global_runtime_filter_mgr() {
     return _query_ctx->runtime_filter_mgr();
 }
 
-Status RuntimeState::register_producer_runtime_filter(const doris::TRuntimeFilterDesc& desc,
-                                                      bool need_local_merge,
-                                                      doris::IRuntimeFilter** producer_filter,
-                                                      bool build_bf_exactly) {
-    if (desc.has_remote_targets || need_local_merge) {
-        return global_runtime_filter_mgr()->register_local_merge_producer_filter(
-                desc, query_options(), producer_filter, build_bf_exactly);
-    } else {
-        return local_runtime_filter_mgr()->register_producer_filter(
-                desc, query_options(), producer_filter, build_bf_exactly);
-    }
+Status RuntimeState::register_producer_runtime_filter(
+        const TRuntimeFilterDesc& desc, std::shared_ptr<RuntimeFilterProducer>* producer_filter) {
+    _registered_runtime_filter_ids.insert(desc.filter_id);
+    // Producers are created by local runtime filter mgr and shared by global runtime filter manager.
+    // When RF is published, consumers in both global and local RF mgr will be found.
+    RETURN_IF_ERROR(local_runtime_filter_mgr()->register_producer_filter(_query_ctx, desc,
+                                                                         producer_filter));
+    RETURN_IF_ERROR(global_runtime_filter_mgr()->register_local_merger_producer_filter(
+            _query_ctx, desc, *producer_filter));
+    return Status::OK();
 }
 
-Status RuntimeState::register_consumer_runtime_filter(const doris::TRuntimeFilterDesc& desc,
-                                                      bool need_local_merge, int node_id,
-                                                      doris::IRuntimeFilter** consumer_filter) {
-    if (desc.has_remote_targets || need_local_merge) {
-        return global_runtime_filter_mgr()->register_consumer_filter(desc, query_options(), node_id,
-                                                                     consumer_filter, false, true);
-    } else {
-        return local_runtime_filter_mgr()->register_consumer_filter(desc, query_options(), node_id,
-                                                                    consumer_filter, false, false);
-    }
+Status RuntimeState::register_consumer_runtime_filter(
+        const TRuntimeFilterDesc& desc, bool need_local_merge, int node_id,
+        std::shared_ptr<RuntimeFilterConsumer>* consumer_filter) {
+    _registered_runtime_filter_ids.insert(desc.filter_id);
+    bool need_merge = desc.has_remote_targets || need_local_merge;
+    RuntimeFilterMgr* mgr = need_merge ? global_runtime_filter_mgr() : local_runtime_filter_mgr();
+    return mgr->register_consumer_filter(this, desc, node_id, consumer_filter);
 }
 
 bool RuntimeState::is_nereids() const {
@@ -573,12 +496,21 @@ std::vector<std::shared_ptr<RuntimeProfile>> RuntimeState::pipeline_id_to_profil
     return _pipeline_id_to_profile;
 }
 
+void RuntimeState::reset_to_rerun() {
+    if (local_runtime_filter_mgr()) {
+        local_runtime_filter_mgr()->remove_filters(_registered_runtime_filter_ids);
+        global_runtime_filter_mgr()->remove_filters(_registered_runtime_filter_ids);
+        _registered_runtime_filter_ids.clear();
+    }
+    std::unique_lock lc(_pipeline_profile_lock);
+    _pipeline_id_to_profile.clear();
+}
+
 std::vector<std::shared_ptr<RuntimeProfile>> RuntimeState::build_pipeline_profile(
         std::size_t pipeline_size) {
     std::unique_lock lc(_pipeline_profile_lock);
     if (!_pipeline_id_to_profile.empty()) {
-        throw Exception(ErrorCode::INTERNAL_ERROR,
-                        "build_pipeline_profile can only be called once.");
+        return _pipeline_id_to_profile;
     }
     _pipeline_id_to_profile.resize(pipeline_size);
     {
@@ -592,4 +524,17 @@ std::vector<std::shared_ptr<RuntimeProfile>> RuntimeState::build_pipeline_profil
     return _pipeline_id_to_profile;
 }
 
+bool RuntimeState::low_memory_mode() const {
+#ifdef BE_TEST
+    if (!_query_ctx) {
+        return false;
+    }
+#endif
+    return _query_ctx->low_memory_mode();
+}
+
+void RuntimeState::set_id_file_map() {
+    _id_file_map = _exec_env->get_id_manager()->add_id_file_map(_query_id, execution_timeout());
+}
+#include "common/compile_check_end.h"
 } // end namespace doris

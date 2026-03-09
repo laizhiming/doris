@@ -31,7 +31,6 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
-import java.util.BitSet;
 import java.util.Objects;
 
 class HyperGraphAggTest extends SqlTestBase {
@@ -89,11 +88,10 @@ class HyperGraphAggTest extends SqlTestBase {
     }
 
     LogicalCompatibilityContext constructContext(Plan p1, Plan p2) {
-        StructInfo st1 = MaterializedViewUtils.extractStructInfo(p1,
-                null, new BitSet()).get(0);
-        StructInfo st2 = MaterializedViewUtils.extractStructInfo(p2,
-                null, new BitSet()).get(0);
-        RelationMapping rm = RelationMapping.generate(st1.getRelations(), st2.getRelations()).get(0);
+        StructInfo st1 = StructInfo.of(p1, p1, null);
+        StructInfo st2 = StructInfo.of(p2, p2, null);
+        RelationMapping rm = RelationMapping.generate(st1.getRelations(), st2.getRelations(), 8)
+                .get(0);
         SlotMapping sm = SlotMapping.generate(rm);
         return LogicalCompatibilityContext.from(rm, sm, st1, st2);
     }

@@ -22,29 +22,42 @@ import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.common.Pair;
+import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.trees.plans.algebra.Intersect;
+import org.apache.doris.nereids.trees.plans.distribute.DistributeContext;
 import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorker;
 import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorkerManager;
 import org.apache.doris.nereids.trees.plans.distribute.worker.ScanWorkerSelector;
+import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.planner.ExchangeNode;
 import org.apache.doris.planner.HashJoinNode;
 import org.apache.doris.planner.OlapScanNode;
 import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.planner.ScanNode;
+import org.apache.doris.planner.SetOperationNode;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -58,10 +71,10 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
 
     /** UnassignedScanNativeTableJob */
     public UnassignedScanBucketOlapTableJob(
-            PlanFragment fragment, List<OlapScanNode> olapScanNodes,
+            StatementContext statementContext, PlanFragment fragment, List<OlapScanNode> olapScanNodes,
             ListMultimap<ExchangeNode, UnassignedJob> exchangeToChildJob,
             ScanWorkerSelector scanWorkerSelector) {
-        super(fragment, (List) olapScanNodes, exchangeToChildJob);
+        super(statementContext, fragment, (List) olapScanNodes, exchangeToChildJob);
         this.scanWorkerSelector = Objects.requireNonNull(
                 scanWorkerSelector, "scanWorkerSelector cat not be null");
 
@@ -75,7 +88,7 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
 
     @Override
     protected Map<DistributedPlanWorker, UninstancedScanSource> multipleMachinesParallelization(
-            DistributedPlanWorkerManager workerManager, ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
+            DistributeContext distributeContext, ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
         // for every bucket tablet, select its replica and worker.
         // for example, colocate join:
         // {
@@ -94,13 +107,15 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
         //       ...
         //    }
         // }
-        return scanWorkerSelector.selectReplicaAndWorkerWithBucket(this);
+        return scanWorkerSelector.selectReplicaAndWorkerWithBucket(
+                this, statementContext.getConnectContext()
+        );
     }
 
     @Override
     protected List<AssignedJob> insideMachineParallelization(
             Map<DistributedPlanWorker, UninstancedScanSource> workerToScanRanges,
-            ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
+            ListMultimap<ExchangeNode, AssignedJob> inputJobs, DistributeContext distributeContext) {
         // separate buckets to instanceNum groups, let one instance process some buckets.
         // for example, colocate join:
         // {
@@ -128,7 +143,8 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
         //    ],
         //    ...
         // }
-        List<AssignedJob> assignedJobs = super.insideMachineParallelization(workerToScanRanges, inputJobs);
+        List<AssignedJob> assignedJobs = super.insideMachineParallelization(
+                workerToScanRanges, inputJobs, distributeContext);
 
         // the case:
         // ```sql
@@ -139,27 +155,152 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
         // ON a.id = b.id;
         // ```
         // contains right outer join and missing instance in left side because of tablet pruner, for example
-        // left:  [bucket 1]
-        // right: [bucket 1, bucket 2]
+        // left:  [bucket 1, bucket 3]
         //
-        // we should join buckets corresponding:
+        // we should join buckets:
         // [
-        //   (left bucket 1) right outer join (right bucket 1)
-        //   (no any machine) right outer join (right bucket 2)
+        //   (left bucket 1) right outer join (exchange right data which should process by bucket 1)
+        //   (no any machine) right outer join (exchange right data which should process by bucket 2)
+        //   (left bucket 3) right outer join (exchange right data which should process by bucket 3)
         // ]
         // if missing the left bucket 2, it will compute an empty result
         // because right bucket 2 doesn't exist destination instance,
         // so we should fill up this instance
         List<HashJoinNode> hashJoinNodes = fragment.getPlanRoot()
                 .collectInCurrentFragment(HashJoinNode.class::isInstance);
-        if (shouldFillUpInstances(hashJoinNodes)) {
+        List<SetOperationNode> setOperationNodes = fragment.getPlanRoot()
+                .collectInCurrentFragment(SetOperationNode.class::isInstance);
+        if (shouldFillUpInstances(hashJoinNodes, setOperationNodes)) {
             return fillUpInstances(assignedJobs);
         }
 
         return assignedJobs;
     }
 
-    private boolean shouldFillUpInstances(List<HashJoinNode> hashJoinNodes) {
+    @Override
+    protected void assignLocalShuffleJobs(ScanSource scanSource, int instanceNum, List<AssignedJob> instances,
+            ConnectContext context, DistributedPlanWorker worker) {
+        /*
+         * Split scan ranges evenly into `parallelExecInstanceNum` instances.
+         *
+         * For a fragment contains co-located join,
+         *
+         *      scan (id = 0) -> join build (id = 2)
+         *                          |
+         *      scan (id = 1) -> join probe (id = 2)
+         *
+         * If both of `scan (id = 0)` and `scan (id = 1)` are serial operators, we will plan local exchanger
+         * after them:
+         *
+         *      scan (id = 0) -> local exchange -> join build (id = 2)
+         *                                               |
+         *      scan (id = 1) -> local exchange -> join probe (id = 2)
+         *
+         *
+         * And there is another more complicated scenario, for example, `scan (id = 0)` has 10 partitions and
+         * 3 buckets which means 3 * 10 tablets and `scan (id = 1)` has 3 buckets and no partition which means
+         * 3 tablets totally. If expected parallelism is 8, we will get a serial scan (id = 0) and a
+         * non-serial scan (id = 1). For this case, we will plan another plan with local exchange:
+         *
+         *      scan (id = 0) -> local exchange -> join build (id = 2)
+         *                                               |
+         *      scan (id = 1)          ->         join probe (id = 2)
+         */
+        Pair<BucketScanSource, BucketScanSource> split = splitSerialScanSource((BucketScanSource) scanSource);
+        BucketScanSource serialScanSource = split.key();
+        BucketScanSource nonSerialScanSource = split.value();
+
+        BucketScanSource shareScanSource = (BucketScanSource) scanSource;
+        ScanSource emptyShareScanSource = shareScanSource.newEmpty();
+        int shareScanId = shareScanIdGenerator.getAndIncrement();
+        int existsInstanceNum = instances.size();
+        if (nonSerialScanSource.isEmpty()) {
+            List<BucketScanSource> assignedJoinBuckets
+                    = (List) serialScanSource.parallelize(scanNodes, instanceNum);
+            for (int i = 0; i < assignedJoinBuckets.size(); i++) {
+                BucketScanSource assignedJoinBucket = assignedJoinBuckets.get(i);
+                LocalShuffleBucketJoinAssignedJob instance = new LocalShuffleBucketJoinAssignedJob(
+                        instances.size(), shareScanId, context.nextInstanceId(),
+                        this, worker,
+                        // only first instance to scan all data
+                        i == 0 ? serialScanSource : emptyShareScanSource,
+                        // but join can assign to multiple instances
+                        Utils.fastToImmutableSet(assignedJoinBucket.bucketIndexToScanNodeToTablets.keySet())
+                );
+                instances.add(instance);
+            }
+        } else {
+            List<BucketScanSource> parallelizedSources
+                    = (List) nonSerialScanSource.parallelize(scanNodes, instanceNum);
+            BucketScanSource firstInstanceScanSource
+                    = serialScanSource.newMergeBucketScanSource(parallelizedSources.get(0));
+            LocalShuffleBucketJoinAssignedJob firstInstance = new LocalShuffleBucketJoinAssignedJob(
+                    instances.size(), shareScanId, context.nextInstanceId(),
+                    this, worker,
+                    firstInstanceScanSource,
+                    Utils.fastToImmutableSet(parallelizedSources.get(0).bucketIndexToScanNodeToTablets.keySet())
+            );
+            instances.add(firstInstance);
+
+            for (int i = 1; i < parallelizedSources.size(); i++) {
+                BucketScanSource nonFirstInstanceScanSource = parallelizedSources.get(i);
+                LocalShuffleBucketJoinAssignedJob instance = new LocalShuffleBucketJoinAssignedJob(
+                        instances.size(), shareScanId, context.nextInstanceId(),
+                        this, worker,
+                        nonFirstInstanceScanSource,
+                        Utils.fastToImmutableSet(nonFirstInstanceScanSource.bucketIndexToScanNodeToTablets.keySet())
+                );
+                instances.add(instance);
+            }
+        }
+
+        int thisWorkerInstanceNum = instances.size() - existsInstanceNum;
+        for (int i = thisWorkerInstanceNum; i < instanceNum; ++i) {
+            LocalShuffleBucketJoinAssignedJob instance = new LocalShuffleBucketJoinAssignedJob(
+                    instances.size(), shareScanId, context.nextInstanceId(),
+                    this, worker, emptyShareScanSource,
+                    // these instance not need to join, because no any bucket assign to it
+                    ImmutableSet.of()
+            );
+            instances.add(instance);
+        }
+    }
+
+    private Pair<BucketScanSource, BucketScanSource> splitSerialScanSource(BucketScanSource totalScanSource) {
+        Map<Integer, Map<ScanNode, ScanRanges>> serialScanRanges = Maps.newLinkedHashMap();
+        Map<Integer, Map<ScanNode, ScanRanges>> nonSerialScanRanges = Maps.newLinkedHashMap();
+        for (ScanNode scanNode : scanNodes) {
+            if (scanNode.isSerialOperator()) {
+                collectScanRanges(totalScanSource, scanNode, serialScanRanges);
+            } else {
+                collectScanRanges(totalScanSource, scanNode, nonSerialScanRanges);
+            }
+        }
+        return Pair.of(new BucketScanSource(serialScanRanges), new BucketScanSource(nonSerialScanRanges));
+    }
+
+    private void collectScanRanges(
+            BucketScanSource totalScanSource, ScanNode findScanNode, Map<Integer, Map<ScanNode, ScanRanges>> result) {
+        Map<Integer, Map<ScanNode, ScanRanges>> bucketIndexToScanNodeToTablets
+                = totalScanSource.bucketIndexToScanNodeToTablets;
+        for (Entry<Integer, Map<ScanNode, ScanRanges>> kv : bucketIndexToScanNodeToTablets.entrySet()) {
+            Integer bucketIndex = kv.getKey();
+            Map<ScanNode, ScanRanges> scanNodeToRanges = kv.getValue();
+            ScanRanges scanRanges = scanNodeToRanges.get(findScanNode);
+            if (scanRanges != null) {
+                Map<ScanNode, ScanRanges> newScanNodeToRanges
+                        = result.computeIfAbsent(bucketIndex, k -> {
+                            LinkedHashMap<ScanNode, ScanRanges> mergedRanges = new LinkedHashMap<>();
+                            mergedRanges.put(findScanNode, new ScanRanges());
+                            return mergedRanges;
+                        });
+                newScanNodeToRanges.computeIfAbsent(findScanNode, scanNode -> new ScanRanges())
+                        .addScanRanges(scanRanges);
+            }
+        }
+    }
+
+    private boolean shouldFillUpInstances(List<HashJoinNode> hashJoinNodes, List<SetOperationNode> setOperationNodes) {
         for (HashJoinNode hashJoinNode : hashJoinNodes) {
             if (!hashJoinNode.isBucketShuffle()) {
                 continue;
@@ -173,6 +314,16 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
                     return true;
             }
         }
+
+        for (SetOperationNode setOperationNode : setOperationNodes) {
+            if (setOperationNode instanceof Intersect) {
+                continue;
+            }
+            if (setOperationNode.isBucketShuffle()) {
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -182,7 +333,7 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
             return instances;
         }
 
-        ConnectContext context = ConnectContext.get();
+        ConnectContext context = statementContext.getConnectContext();
 
         OlapScanNode olapScanNode = (OlapScanNode) scanNodes.get(0);
         MaterializedIndex randomPartition = randomPartition(olapScanNode);
@@ -190,7 +341,19 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
                 olapScanNode, randomPartition, missingBucketIndexes);
 
         boolean useLocalShuffle = instances.stream().anyMatch(LocalShuffleAssignedJob.class::isInstance);
+        Multimap<DistributedPlanWorker, AssignedJob> workerToAssignedJobs = ArrayListMultimap.create();
+        int maxNumInstancePerWorker = 1;
+        if (useLocalShuffle) {
+            for (AssignedJob instance : instances) {
+                workerToAssignedJobs.put(instance.getAssignedWorker(), instance);
+            }
+            for (Collection<AssignedJob> instanceList : workerToAssignedJobs.asMap().values()) {
+                maxNumInstancePerWorker = Math.max(maxNumInstancePerWorker, instanceList.size());
+            }
+        }
+
         List<AssignedJob> newInstances = new ArrayList<>(instances);
+
         for (Entry<DistributedPlanWorker, Collection<Integer>> workerToBuckets : missingBuckets.asMap().entrySet()) {
             Map<Integer, Map<ScanNode, ScanRanges>> scanEmptyBuckets = Maps.newLinkedHashMap();
             for (Integer bucketIndex : workerToBuckets.getValue()) {
@@ -201,34 +364,69 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
                 scanEmptyBuckets.put(bucketIndex, scanTableWithEmptyData);
             }
 
-            AssignedJob fillUpInstance = null;
             DistributedPlanWorker worker = workerToBuckets.getKey();
             BucketScanSource scanSource = new BucketScanSource(scanEmptyBuckets);
             if (useLocalShuffle) {
-                // when use local shuffle, we should ensure every backend only process one instance!
-                // so here we should try to merge the missing buckets into exist instances
-                boolean mergedBucketsInSameWorkerInstance = false;
-                for (AssignedJob newInstance : newInstances) {
-                    if (newInstance.getAssignedWorker().equals(worker)) {
-                        BucketScanSource bucketScanSource = (BucketScanSource) newInstance.getScanSource();
-                        bucketScanSource.bucketIndexToScanNodeToTablets.putAll(scanEmptyBuckets);
-                        mergedBucketsInSameWorkerInstance = true;
-                    }
+                List<AssignedJob> sameWorkerInstances = (List) workerToAssignedJobs.get(worker);
+                if (sameWorkerInstances.isEmpty()) {
+                    sameWorkerInstances = fillUpEmptyInstances(
+                            maxNumInstancePerWorker, scanSource, worker, newInstances, context);
                 }
-                if (!mergedBucketsInSameWorkerInstance) {
-                    fillUpInstance = new LocalShuffleAssignedJob(
-                            newInstances.size(), shareScanIdGenerator.getAndIncrement(),
-                            context.nextInstanceId(), this, worker, scanSource
-                    );
+
+                LocalShuffleBucketJoinAssignedJob firstInstance
+                        = (LocalShuffleBucketJoinAssignedJob ) sameWorkerInstances.get(0);
+                BucketScanSource firstInstanceScanSource
+                        = (BucketScanSource) firstInstance.getScanSource();
+                firstInstanceScanSource.bucketIndexToScanNodeToTablets.putAll(scanEmptyBuckets);
+
+                Comparator<Pair<Integer, Integer>> preferAssignToMinBucketNum
+                        = Comparator.comparing(Pair<Integer, Integer>::value).thenComparing(Pair::key);
+                PriorityQueue<Pair<Integer, Integer>> assignedBucketQueue = new PriorityQueue<>(
+                        preferAssignToMinBucketNum
+                );
+                for (int i = 0; i < sameWorkerInstances.size(); i++) {
+                    LocalShuffleBucketJoinAssignedJob assignedJob =
+                            (LocalShuffleBucketJoinAssignedJob) sameWorkerInstances.get(i);
+                    int assignedBucketsNum = assignedJob.getAssignedJoinBucketIndexes().size();
+                    assignedBucketQueue.add(Pair.of(i, assignedBucketsNum));
+                }
+
+                Iterator<Integer> assignedJoinBuckets = new LinkedHashSet<>(workerToBuckets.getValue()).iterator();
+                while (assignedJoinBuckets.hasNext()) {
+                    Integer bucketIndex = assignedJoinBuckets.next();
+                    assignedJoinBuckets.remove();
+
+                    Pair<Integer, Integer> assignedInstance = assignedBucketQueue.poll();
+                    Integer instanceIndex = assignedInstance.first;
+                    LocalShuffleBucketJoinAssignedJob instance
+                            = (LocalShuffleBucketJoinAssignedJob) sameWorkerInstances.get(instanceIndex);
+                    instance.addAssignedJoinBucketIndexes(ImmutableSet.of(bucketIndex));
+                    int assignedBucketNum = assignedInstance.second + 1;
+                    assignedBucketQueue.add(Pair.of(instanceIndex, assignedBucketNum));
                 }
             } else {
-                fillUpInstance = assignWorkerAndDataSources(
+                newInstances.add(assignWorkerAndDataSources(
                         newInstances.size(), context.nextInstanceId(), worker, scanSource
-                );
+                ));
             }
-            if (fillUpInstance != null) {
-                newInstances.add(fillUpInstance);
-            }
+        }
+        return newInstances;
+    }
+
+    private List<AssignedJob> fillUpEmptyInstances(
+            int maxNumInstancePerWorker, BucketScanSource scanSource, DistributedPlanWorker worker,
+            List<AssignedJob> existsInstances, ConnectContext context) {
+        int shareScanId = shareScanIdGenerator.getAndIncrement();
+        List<AssignedJob> newInstances = new ArrayList<>(maxNumInstancePerWorker);
+        for (int i = 0; i < maxNumInstancePerWorker; i++) {
+            LocalShuffleBucketJoinAssignedJob newInstance = new LocalShuffleBucketJoinAssignedJob(
+                    existsInstances.size(), shareScanId,
+                    context.nextInstanceId(), this, worker,
+                    scanSource.newEmpty(),
+                    ImmutableSet.of()
+            );
+            existsInstances.add(newInstance);
+            newInstances.add(newInstance);
         }
         return newInstances;
     }
@@ -284,7 +482,7 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
         for (Integer bucketIndex : selectBucketIndexes) {
             Long tabletIdInBucket = tabletIdsInOrder.get(bucketIndex);
             Tablet tabletInBucket = partition.getTablet(tabletIdInBucket);
-            List<DistributedPlanWorker> workers = getWorkersByReplicas(tabletInBucket);
+            List<DistributedPlanWorker> workers = getWorkersByReplicas(tabletInBucket, olapScanNode.getCatalogId());
             if (workers.isEmpty()) {
                 throw new IllegalStateException("Can not found available replica for bucket " + bucketIndex
                         + ", table: " + olapScanNode);
@@ -295,16 +493,52 @@ public class UnassignedScanBucketOlapTableJob extends AbstractUnassignedScanJob 
         return fillUpWorkerToBuckets;
     }
 
-    private List<DistributedPlanWorker> getWorkersByReplicas(Tablet tablet) {
+    private List<DistributedPlanWorker> getWorkersByReplicas(Tablet tablet, long catalogId) {
         DistributedPlanWorkerManager workerManager = scanWorkerSelector.getWorkerManager();
         List<Replica> replicas = tablet.getReplicas();
         List<DistributedPlanWorker> workers = Lists.newArrayListWithCapacity(replicas.size());
         for (Replica replica : replicas) {
-            DistributedPlanWorker worker = workerManager.getWorker(replica.getBackendId());
+            DistributedPlanWorker worker = workerManager.getWorker(catalogId, replica.getBackendIdWithoutException());
             if (worker.available()) {
                 workers.add(worker);
             }
         }
         return workers;
+    }
+
+    @Override
+    protected int degreeOfParallelism(int maxParallel, boolean useLocalShuffleToAddParallel) {
+        Preconditions.checkArgument(maxParallel > 0, "maxParallel must be positive");
+        if (!fragment.getDataPartition().isPartitioned()) {
+            return 1;
+        }
+        if (fragment.queryCacheParam != null) {
+            return maxParallel;
+        }
+        if (scanNodes.size() == 1 && scanNodes.get(0) instanceof OlapScanNode) {
+            OlapScanNode olapScanNode = (OlapScanNode) scanNodes.get(0);
+            ConnectContext connectContext = statementContext.getConnectContext();
+            if (connectContext != null && olapScanNode.shouldUseOneInstance(connectContext)) {
+                return 1;
+            }
+        }
+
+        long tabletNum = 0;
+        for (ScanNode scanNode : scanNodes) {
+            if (scanNode instanceof OlapScanNode) {
+                OlapScanNode olapScanNode = (OlapScanNode) scanNode;
+                tabletNum = olapScanNode.getTotalTabletsNum();
+                break;
+            }
+        }
+
+        ConnectContext connectContext = statementContext.getConnectContext();
+        int colocateMaxParallelNum = 128;
+        if (connectContext != null) {
+            colocateMaxParallelNum = connectContext.getSessionVariable().colocateMaxParallelNum;
+        }
+
+        int maxParallelism = (int) Math.max(tabletNum, fragment.getParallelExecNum());
+        return Math.min(maxParallelism, colocateMaxParallelNum);
     }
 }

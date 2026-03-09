@@ -33,10 +33,13 @@ public class MetricCalculator extends TimerTask {
     private long lastQueryCounter = -1;
     private long lastRequestCounter = -1;
     private long lastQueryErrCounter = -1;
+    private long lastQuerySlowCounter = -1;
+    private long lastMetaServiceRpcCounter = -1;
 
     private Map<String, Long> clusterLastRequestCounter = new HashMap<>();
     private Map<String, Long> clusterLastQueryCounter = new HashMap<>();
     private Map<String, Long> clusterLastQueryErrCounter = new HashMap<>();
+    private Map<String, Long> metaServiceLastRpcCounter = new HashMap<>();
 
     @Override
     public void run() {
@@ -50,6 +53,10 @@ public class MetricCalculator extends TimerTask {
             lastQueryCounter = MetricRepo.COUNTER_QUERY_ALL.getValue();
             lastRequestCounter = MetricRepo.COUNTER_REQUEST_ALL.getValue();
             lastQueryErrCounter = MetricRepo.COUNTER_QUERY_ERR.getValue();
+            lastQuerySlowCounter = MetricRepo.COUNTER_QUERY_SLOW.getValue();
+            if (Config.isCloudMode()) {
+                lastMetaServiceRpcCounter = CloudMetrics.META_SERVICE_RPC_ALL_TOTAL.getValue();
+            }
             initCloudMetrics();
             return;
         }
@@ -73,6 +80,20 @@ public class MetricCalculator extends TimerTask {
         double errRate = (double) (currentErrCounter - lastQueryErrCounter) / interval;
         MetricRepo.GAUGE_QUERY_ERR_RATE.setValue(errRate < 0 ? 0.0 : errRate);
         lastQueryErrCounter = currentErrCounter;
+
+        // slow rate
+        long currentSlowCounter = MetricRepo.COUNTER_QUERY_SLOW.getValue();
+        double slowRate = (double) (currentSlowCounter - lastQuerySlowCounter) / interval;
+        MetricRepo.GAUGE_QUERY_SLOW_RATE.setValue(slowRate < 0 ? 0.0 : slowRate);
+        lastQuerySlowCounter = currentSlowCounter;
+
+        // Calculate aggregate meta-service RPS
+        if (Config.isCloudMode()) {
+            long currentMetaServiceCounter = CloudMetrics.META_SERVICE_RPC_ALL_TOTAL.getValue();
+            double metaServiceRps = (double) (currentMetaServiceCounter - lastMetaServiceRpcCounter) / interval;
+            CloudMetrics.META_SERVICE_RPC_ALL_PER_SECOND.setValue(metaServiceRps < 0 ? 0.0 : metaServiceRps);
+            lastMetaServiceRpcCounter = currentMetaServiceCounter;
+        }
 
         updateCloudMetrics(interval);
         lastTs = currentTs;
@@ -115,6 +136,15 @@ public class MetricCalculator extends TimerTask {
                 MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
             });
         }
+
+        // Initialize meta-service RPC metrics
+        Map<String, LongCounterMetric> metaServiceRpcMetrics = CloudMetrics.META_SERVICE_RPC_TOTAL.getMetrics();
+        if (metaServiceRpcMetrics != null) {
+            metaServiceRpcMetrics.forEach((methodName, metric) -> {
+                metaServiceLastRpcCounter.put(methodName, metric.getValue());
+                MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
+            });
+        }
     }
 
     private void updateCloudMetrics(long interval) {
@@ -130,7 +160,7 @@ public class MetricCalculator extends TimerTask {
                 rps = Double.max(rps, 0);
                 MetricRepo.updateClusterRequestPerSecond(clusterId, rps,  metric.getLabels());
                 MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
-                clusterLastRequestCounter.replace(clusterId, metric.getValue());
+                clusterLastRequestCounter.put(clusterId, metric.getValue());
             });
         }
 
@@ -142,7 +172,7 @@ public class MetricCalculator extends TimerTask {
                 rps = Double.max(rps, 0);
                 MetricRepo.updateClusterQueryPerSecond(clusterId, rps,  metric.getLabels());
                 MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
-                clusterLastQueryCounter.replace(clusterId, metric.getValue());
+                clusterLastQueryCounter.put(clusterId, metric.getValue());
             });
         }
 
@@ -154,7 +184,20 @@ public class MetricCalculator extends TimerTask {
                 rps = Double.max(rps, 0);
                 MetricRepo.updateClusterQueryErrRate(clusterId, rps, metric.getLabels());
                 MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
-                clusterLastQueryCounter.replace(clusterId, metric.getValue());
+                clusterLastQueryErrCounter.put(clusterId, metric.getValue());
+            });
+        }
+
+        // Update meta-service per-method RPS
+        Map<String, LongCounterMetric> metaServiceRpcMetrics = CloudMetrics.META_SERVICE_RPC_TOTAL.getMetrics();
+        if (metaServiceRpcMetrics != null) {
+            metaServiceRpcMetrics.forEach((methodName, metric) -> {
+                double rps = (double) (metric.getValue() - metaServiceLastRpcCounter.getOrDefault(methodName, 0L))
+                        / interval;
+                rps = Double.max(rps, 0);
+                MetricRepo.updateMetaServiceRpcPerSecond(methodName, rps, metric.getLabels());
+                MetricRepo.DORIS_METRIC_REGISTER.addMetrics(metric);
+                metaServiceLastRpcCounter.put(methodName, metric.getValue());
             });
         }
     }

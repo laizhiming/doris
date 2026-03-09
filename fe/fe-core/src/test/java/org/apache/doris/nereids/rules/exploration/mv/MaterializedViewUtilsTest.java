@@ -20,13 +20,18 @@ package org.apache.doris.nereids.rules.exploration.mv;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.mtmv.BaseTableInfo;
-import org.apache.doris.nereids.rules.exploration.mv.MaterializedViewUtils.RelatedTableInfo;
+import org.apache.doris.nereids.properties.OrderKey;
+import org.apache.doris.nereids.rules.exploration.mv.RelatedTableInfo.RelatedTableColumnInfo;
+import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.util.PlanChecker;
 import org.apache.doris.utframe.TestWithFeService;
 
+import com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 /**
  * Test for materialized view util
@@ -234,8 +239,47 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                 + "       \"replication_num\" = \"1\"\n"
                 + ");\n"
         );
+        createTable("CREATE TABLE `test3` (\n"
+                + "  `id` VARCHAR(36) NOT NULL COMMENT 'id',\n"
+                + "  `created_time` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT ''\n"
+                + ") ENGINE=OLAP\n"
+                + "DUPLICATE KEY(`id`)\n"
+                + "COMMENT ''\n"
+                + "PARTITION BY RANGE(`created_time`)\n"
+                + "(PARTITION P_2024071713 VALUES [('2024-07-17 13:00:00'), ('2024-07-17 14:00:00')),\n"
+                + "PARTITION P_2024071714 VALUES [('2024-07-17 14:00:00'), ('2024-07-17 15:00:00')))\n"
+                + "DISTRIBUTED BY HASH(`id`) BUCKETS AUTO\n"
+                + "PROPERTIES (\n"
+                + "\"replication_allocation\" = \"tag.location.default: 1\"\n"
+                + ");\n");
         // Should not make scan to empty relation when the table used by materialized view has no data
-        connectContext.getSessionVariable().setDisableNereidsRules("OLAP_SCAN_PARTITION_PRUNE,PRUNE_EMPTY_PARTITION");
+        connectContext.getSessionVariable().setDisableNereidsRules(
+                "OLAP_SCAN_PARTITION_PRUNE"
+                + ",PRUNE_EMPTY_PARTITION"
+                + ",ELIMINATE_GROUP_BY_KEY_BY_UNIFORM"
+                + ",ELIMINATE_CONST_JOIN_CONDITION"
+                + ",CONSTANT_PROPAGATION"
+        );
+    }
+
+    // Test when join both side are all partition table and partition column name is same
+    @Test
+    public void joinPartitionNameSameTest() {
+        PlanChecker.from(connectContext)
+                .checkExplain("select t1.upgrade_day, t2.batch_no, count(*) "
+                                + "from test2 t2 join test1 t1 on "
+                                + "t1.vin_type1 = t2.vin_type2 "
+                                + "group by t1.upgrade_day, t2.batch_no;",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("upgrade_day", null,
+                                            rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "test1",
+                                    "upgrade_day",
+                                    true);
+                        });
     }
 
     @Test
@@ -273,7 +317,7 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                                 + "JOIN "
                                 + "(SELECT abs(sqrt(PS_SUPPLYCOST)) as c2_abs, PS_AVAILQTY, PS_PARTKEY, PS_SUPPKEY "
                                 + "FROM partsupp) as ps "
-                                + "ON l.L_PARTKEY = ps.PS_PARTKEY and l.L_SUPPKEY = ps.PS_SUPPKEY",
+                                + "ON l.L_PARTKEY = ps.PS_PARTKEY and l.L_SUPPKEY = ps.PS_SUPPKEY limit 1",
                         nereidsPlanner -> {
                             Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
                             RelatedTableInfo relatedTableInfo =
@@ -388,6 +432,26 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                         });
     }
 
+    // if select * used in partition table side, should get related table
+    @Test
+    public void getRelatedTableInfoLeftJoinSelectStarTest() {
+        PlanChecker.from(connectContext)
+                .checkExplain("        select l1.*, O_CUSTKEY \n"
+                                + "        from lineitem_list_partition l1\n"
+                                + "        left outer join orders_list_partition\n"
+                                + "        on l1.l_shipdate = o_orderdate\n",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("l_orderkey", null,
+                                            rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "lineitem_list_partition",
+                                    "l_orderkey",
+                                    true);
+                        });
+    }
+
     @Test
     public void getRelatedTableInfoSelfJoinTest() {
         PlanChecker.from(connectContext)
@@ -402,7 +466,7 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                                     MaterializedViewUtils.getRelatedTableInfo("l_orderkey", null,
                                             rewrittenPlan, nereidsPlanner.getCascadesContext());
                             Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
-                                    "self join doesn't support partition update"));
+                                    "partition column is in join invalid side, but is not in join condition"));
                             Assertions.assertFalse(relatedTableInfo.isPctPossible());
                         });
 
@@ -418,7 +482,7 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                                     MaterializedViewUtils.getRelatedTableInfo("l_orderkey", null,
                                             rewrittenPlan, nereidsPlanner.getCascadesContext());
                             Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
-                                    "self join doesn't support partition update"));
+                                    "partition column is in invalid catalog relation to check"));
                             Assertions.assertFalse(relatedTableInfo.isPctPossible());
                         });
 
@@ -515,7 +579,7 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                                     MaterializedViewUtils.getRelatedTableInfo("PS_SUPPLYCOST", null,
                                             rewrittenPlan, nereidsPlanner.getCascadesContext());
                             Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
-                                    "self join doesn't support partition update"));
+                                    "related base table is not partition table"));
                             Assertions.assertFalse(relatedTableInfo.isPctPossible());
                         });
     }
@@ -570,6 +634,24 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                             Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
                                     "window partition sets doesn't contain the target partition"));
                             Assertions.assertFalse(relatedTableInfo.isPctPossible());
+                        });
+    }
+
+    @Test
+    public void getRelatedTableInfoTestWithLimitTest() {
+        PlanChecker.from(connectContext)
+                .checkExplain("SELECT l.L_SHIPDATE, l.L_ORDERKEY "
+                               + "FROM "
+                               + "lineitem as l limit 1",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("l_shipdate", null,
+                                            rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "lineitem",
+                                    "L_SHIPDATE",
+                                    true);
                         });
     }
 
@@ -631,6 +713,37 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                             Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
                                     "partition column time unit level should be greater than sql select column"));
                             Assertions.assertFalse(relatedTableInfo.isPctPossible());
+                        });
+    }
+
+    @Test
+    public void testPartitionDateTruncShouldTrack1() {
+        PlanChecker.from(connectContext)
+                .checkExplain("SELECT date_trunc(t1.L_SHIPDATE, 'day') as date_alias, t2.O_ORDERDATE, t1.L_QUANTITY, t2.O_ORDERSTATUS, "
+                                + "count(distinct case when t1.L_SUPPKEY > 0 then t2.O_ORDERSTATUS else null end) as cnt_1 "
+                                + "from "
+                                + "  (select * from "
+                                + "  lineitem "
+                                + "  where L_SHIPDATE in ('2017-01-30')) t1 "
+                                + "left join "
+                                + "  (select * from "
+                                + "  orders "
+                                + "  where O_ORDERDATE in ('2017-01-30')) t2 "
+                                + "on t1.L_ORDERKEY = t2.O_ORDERKEY "
+                                + "group by "
+                                + "t1.L_SHIPDATE, "
+                                + "t2.O_ORDERDATE, "
+                                + "t1.L_QUANTITY, "
+                                + "t2.O_ORDERSTATUS;",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("date_alias", null,
+                                            rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "lineitem",
+                                    "L_SHIPDATE",
+                                    true);
                         });
     }
 
@@ -762,10 +875,9 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                             RelatedTableInfo relatedTableInfo =
                                     MaterializedViewUtils.getRelatedTableInfo("upgrade_day", null,
                                             rewrittenPlan, nereidsPlanner.getCascadesContext());
-                            checkRelatedTableInfo(relatedTableInfo,
-                                    "test1",
-                                    "upgrade_day",
-                                    true);
+                            Assertions.assertTrue(relatedTableInfo.getFailReason().contains(
+                                    "partition column is not in group by or window partition by"));
+                            Assertions.assertFalse(relatedTableInfo.isPctPossible());
                         });
     }
 
@@ -809,12 +921,121 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
                         });
     }
 
+    @Test
+    public void getRelatedTableInfoWhenMultiPartitionExprs() {
+        PlanChecker.from(connectContext)
+                .checkExplain("select  id, date_trunc(created_time, 'minute') as created_time_minute,"
+                                + "        min(created_time) as start_time,"
+                                + "        if(count(id) > 0, 1, 0) as status\n"
+                                + "        from test3 \n"
+                                + "        group by id, date_trunc(created_time, 'minute')",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("created_time_minute",
+                                            "day", rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "test3",
+                                    "created_time",
+                                    true);
+                        });
+        PlanChecker.from(connectContext)
+                .checkExplain("select  id, date_trunc(created_time, 'hour') as created_time_hour,"
+                                + "        min(created_time) as start_time\n"
+                                + "        from test3 \n"
+                                + "        group by id, date_trunc(created_time, 'minute'),"
+                                + "        date_trunc(created_time, 'hour');",
+                        nereidsPlanner -> {
+                            Plan rewrittenPlan = nereidsPlanner.getRewrittenPlan();
+                            RelatedTableInfo relatedTableInfo =
+                                    MaterializedViewUtils.getRelatedTableInfo("created_time_hour",
+                                            "day", rewrittenPlan, nereidsPlanner.getCascadesContext());
+                            checkRelatedTableInfo(relatedTableInfo,
+                                    "test3",
+                                    "created_time",
+                                    true);
+                        });
+    }
+
+    // java
+    @Test
+    public void isPrefixSameFromStartNullAndEmptyTests() {
+        // both null
+        Assertions.assertFalse(MaterializedViewUtils.isPrefixSameFromStart(null, null));
+        // query null
+        List<OrderKey> view = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false)
+        );
+        Assertions.assertFalse(MaterializedViewUtils.isPrefixSameFromStart(null, view));
+        // view null
+        List<OrderKey> query = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false)
+        );
+        Assertions.assertFalse(MaterializedViewUtils.isPrefixSameFromStart(query, null));
+        List<OrderKey> emptyQuery = ImmutableList.of();
+        List<OrderKey> emptyView = ImmutableList.of();
+        Assertions.assertTrue(MaterializedViewUtils.isPrefixSameFromStart(emptyQuery, emptyView));
+    }
+
+    @Test
+    public void isPrefixSameFromStart_queryLongerThanView() {
+        List<OrderKey> query = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false),
+                new OrderKey(new VarcharLiteral("b"), true, false)
+        );
+        List<OrderKey> view = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false)
+        );
+        Assertions.assertFalse(MaterializedViewUtils.isPrefixSameFromStart(query, view));
+    }
+
+    @Test
+    public void isPrefixSameFromStart_emptyQueryIsPrefix() {
+        List<OrderKey> emptyQuery = ImmutableList.of();
+        List<OrderKey> view = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("x"), true, false),
+                new OrderKey(new VarcharLiteral("y"), true, false)
+        );
+        Assertions.assertTrue(MaterializedViewUtils.isPrefixSameFromStart(emptyQuery, view));
+    }
+
+    @Test
+    public void isPrefixSameFromStart_prefixEqualReturnsTrue() {
+        List<OrderKey> query = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false),
+                new OrderKey(new VarcharLiteral("b"), true, false)
+        );
+        List<OrderKey> view = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false),
+                new OrderKey(new VarcharLiteral("b"), true, false),
+                new OrderKey(new VarcharLiteral("c"), true, false)
+        );
+        Assertions.assertTrue(MaterializedViewUtils.isPrefixSameFromStart(query, view));
+    }
+
+    @Test
+    public void isPrefixSameFromStart_prefixNotEqualReturnsFalse() {
+        List<OrderKey> query = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false),
+                new OrderKey(new VarcharLiteral("x"), true, false)
+        );
+        List<OrderKey> view = ImmutableList.of(
+                new OrderKey(new VarcharLiteral("a"), true, false),
+                new OrderKey(new VarcharLiteral("b"), true, false),
+                new OrderKey(new VarcharLiteral("c"), true, false)
+        );
+        Assertions.assertFalse(MaterializedViewUtils.isPrefixSameFromStart(query, view));
+    }
+
     private void checkRelatedTableInfo(RelatedTableInfo relatedTableInfo,
             String expectTableName,
             String expectColumnName,
             boolean pctPossible) {
         Assertions.assertNotNull(relatedTableInfo);
-        BaseTableInfo relatedBaseTableInfo = relatedTableInfo.getTableInfo();
+        Assertions.assertTrue(pctPossible);
+
+        RelatedTableColumnInfo columnInfo = relatedTableInfo.getTableColumnInfos().get(0);
+        BaseTableInfo relatedBaseTableInfo = columnInfo.getTableInfo();
         try {
             TableIf tableIf = Env.getCurrentEnv().getCatalogMgr()
                     .getCatalogOrAnalysisException(relatedBaseTableInfo.getCtlId())
@@ -824,7 +1045,6 @@ public class MaterializedViewUtilsTest extends TestWithFeService {
         } catch (Exception exception) {
             Assertions.fail();
         }
-        Assertions.assertEquals(relatedTableInfo.getColumn().toLowerCase(), expectColumnName.toLowerCase());
-        Assertions.assertTrue(pctPossible);
+        Assertions.assertEquals(columnInfo.getColumnStr().toLowerCase(), expectColumnName.toLowerCase());
     }
 }

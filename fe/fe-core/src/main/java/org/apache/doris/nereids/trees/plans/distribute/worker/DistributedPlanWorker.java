@@ -21,6 +21,8 @@ package org.apache.doris.nereids.trees.plans.distribute.worker;
  * DistributedPlanWorker: a worker who can execute the assigned job(instance) of the DistributedPlan
  */
 public interface DistributedPlanWorker extends Comparable<DistributedPlanWorker> {
+    long getCatalogId();
+
     long id();
 
     // ipv4/ipv6 address
@@ -29,6 +31,10 @@ public interface DistributedPlanWorker extends Comparable<DistributedPlanWorker>
     String host();
 
     int port();
+
+    String brpcAddress();
+
+    int brpcPort();
 
     // whether is this worker alive?
     boolean available();

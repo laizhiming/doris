@@ -18,7 +18,9 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.StmtType;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.mysql.FieldInfo;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -44,6 +46,7 @@ import java.util.Optional;
 public class LogicalSqlCache extends LogicalLeaf implements SqlCache, TreeStringPlan, BlockFuncDepsPropagation {
     private final TUniqueId queryId;
     private final List<String> columnLabels;
+    private final List<FieldInfo> fieldInfos;
     private final List<Expr> resultExprs;
     private final Optional<ResultSet> resultSetInFe;
     private final List<InternalService.PCacheValue> cacheValues;
@@ -52,12 +55,13 @@ public class LogicalSqlCache extends LogicalLeaf implements SqlCache, TreeString
 
     /** LogicalSqlCache */
     public LogicalSqlCache(TUniqueId queryId,
-            List<String> columnLabels, List<Expr> resultExprs,
+            List<String> columnLabels, List<FieldInfo> fieldInfos, List<Expr> resultExprs,
             Optional<ResultSet> resultSetInFe, List<InternalService.PCacheValue> cacheValues,
             String backendAddress, String planBody) {
         super(PlanType.LOGICAL_SQL_CACHE, Optional.empty(), Optional.empty());
         this.queryId = Objects.requireNonNull(queryId, "queryId can not be null");
         this.columnLabels = Objects.requireNonNull(columnLabels, "columnLabels can not be null");
+        this.fieldInfos = Objects.requireNonNull(fieldInfos, "fieldInfos can not be null");
         this.resultExprs = Objects.requireNonNull(resultExprs, "resultExprs can not be null");
         this.resultSetInFe = Objects.requireNonNull(resultSetInFe, "resultSetInFe can not be null");
         this.cacheValues = Objects.requireNonNull(cacheValues, "cacheValues can not be null");
@@ -83,6 +87,10 @@ public class LogicalSqlCache extends LogicalLeaf implements SqlCache, TreeString
 
     public List<String> getColumnLabels() {
         return columnLabels;
+    }
+
+    public List<FieldInfo> getFieldInfos() {
+        return fieldInfos;
     }
 
     public List<Expr> getResultExprs() {
@@ -134,5 +142,10 @@ public class LogicalSqlCache extends LogicalLeaf implements SqlCache, TreeString
     @Override
     public String getChildrenTreeString() {
         return planBody;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.SELECT;
     }
 }

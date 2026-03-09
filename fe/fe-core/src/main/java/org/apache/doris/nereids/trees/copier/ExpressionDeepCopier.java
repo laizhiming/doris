@@ -23,18 +23,12 @@ import org.apache.doris.nereids.trees.expressions.Exists;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.InSubquery;
-import org.apache.doris.nereids.trees.expressions.ListQuery;
 import org.apache.doris.nereids.trees.expressions.ScalarSubquery;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
-import org.apache.doris.nereids.trees.expressions.VirtualSlotReference;
-import org.apache.doris.nereids.trees.expressions.functions.scalar.GroupingScalarFunction;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
-import org.apache.doris.nereids.trees.plans.algebra.Repeat.GroupingSetShapes;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
-
-import com.google.common.base.Function;
 
 import java.util.List;
 import java.util.Map;
@@ -82,30 +76,6 @@ public class ExpressionDeepCopier extends DefaultExpressionRewriter<DeepCopierCo
     }
 
     @Override
-    public Expression visitVirtualReference(VirtualSlotReference virtualSlotReference, DeepCopierContext context) {
-        Map<ExprId, ExprId> exprIdReplaceMap = context.exprIdReplaceMap;
-        ExprId newExprId;
-        if (exprIdReplaceMap.containsKey(virtualSlotReference.getExprId())) {
-            newExprId = exprIdReplaceMap.get(virtualSlotReference.getExprId());
-        } else {
-            newExprId = StatementScopeIdGenerator.newExprId();
-        }
-        // according to VirtualReference generating logic in Repeat.java
-        // generateVirtualGroupingIdSlot and generateVirtualSlotByFunction
-        Optional<GroupingScalarFunction> newOriginExpression = virtualSlotReference.getOriginExpression()
-                .map(func -> (GroupingScalarFunction) func.accept(this, context));
-        Function<GroupingSetShapes, List<Long>> newFunction = newOriginExpression
-                .<Function<GroupingSetShapes, List<Long>>>map(f -> f::computeVirtualSlotValue)
-                .orElseGet(() -> GroupingSetShapes::computeVirtualGroupingIdValue);
-        VirtualSlotReference newOne = new VirtualSlotReference(newExprId,
-                virtualSlotReference.getName(), virtualSlotReference.getDataType(),
-                virtualSlotReference.nullable(), virtualSlotReference.getQualifier(),
-                newOriginExpression, newFunction);
-        exprIdReplaceMap.put(virtualSlotReference.getExprId(), newOne.getExprId());
-        return newOne;
-    }
-
-    @Override
     public Expression visitArrayItemReference(ArrayItemReference arrayItemSlot, DeepCopierContext context) {
         Expression arrayExpression = arrayItemSlot.getArrayExpression().accept(this, context);
         Map<ExprId, ExprId> exprIdReplaceMap = context.exprIdReplaceMap;
@@ -132,26 +102,15 @@ public class ExpressionDeepCopier extends DefaultExpressionRewriter<DeepCopierCo
     }
 
     @Override
-    public Expression visitListQuery(ListQuery listQuery, DeepCopierContext context) {
-        LogicalPlan logicalPlan = LogicalPlanDeepCopier.INSTANCE.deepCopy(listQuery.getQueryPlan(), context);
-        List<Slot> correlateSlots = listQuery.getCorrelateSlots().stream()
-                .map(s -> (Slot) s.accept(this, context))
-                .collect(Collectors.toList());
-        Optional<Expression> typeCoercionExpr = listQuery.getTypeCoercionExpr()
-                .map(c -> c.accept(this, context));
-        return new ListQuery(logicalPlan, correlateSlots, typeCoercionExpr);
-    }
-
-    @Override
     public Expression visitInSubquery(InSubquery in, DeepCopierContext context) {
+        LogicalPlan logicalPlan = LogicalPlanDeepCopier.INSTANCE.deepCopy(in.getQueryPlan(), context);
         Expression compareExpr = in.getCompareExpr().accept(this, context);
         List<Slot> correlateSlots = in.getCorrelateSlots().stream()
                 .map(s -> (Slot) s.accept(this, context))
                 .collect(Collectors.toList());
         Optional<Expression> typeCoercionExpr = in.getTypeCoercionExpr()
                 .map(c -> c.accept(this, context));
-        ListQuery listQuery = (ListQuery) in.getListQuery().accept(this, context);
-        return new InSubquery(compareExpr, listQuery, correlateSlots, typeCoercionExpr, in.isNot());
+        return new InSubquery(compareExpr, logicalPlan, correlateSlots, typeCoercionExpr, in.isNot());
     }
 
     @Override
@@ -162,6 +121,6 @@ public class ExpressionDeepCopier extends DefaultExpressionRewriter<DeepCopierCo
                 .collect(Collectors.toList());
         Optional<Expression> typeCoercionExpr = scalar.getTypeCoercionExpr()
                 .map(c -> c.accept(this, context));
-        return new ScalarSubquery(logicalPlan, correlateSlots, typeCoercionExpr);
+        return new ScalarSubquery(logicalPlan, correlateSlots, typeCoercionExpr, scalar.limitOneIsEliminated());
     }
 }

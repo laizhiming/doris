@@ -29,7 +29,11 @@ namespace doris::cloud {
 
 class HdfsVaultInfo;
 
+#ifdef USE_HADOOP_HDFS
 using HdfsSPtr = std::shared_ptr<struct hdfs_internal>;
+#else
+using HdfsSPtr = std::shared_ptr<struct HdfsFileSystemInternalWrapper>;
+#endif
 
 class HdfsAccessor final : public StorageVaultAccessor {
 public:
@@ -57,6 +61,8 @@ public:
     int put_file(const std::string& path, const std::string& content) override;
 
     int exists(const std::string& path) override;
+
+    int abort_multipart_upload(const std::string& path, const std::string& upload_id) override;
 
 private:
     int delete_directory_impl(const std::string& dir_path);

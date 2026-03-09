@@ -23,25 +23,16 @@ suite("one_level_nestedtypes_with_s3data") {
     String s3_endpoint = getS3Endpoint()
     String bucket = context.config.otherConfigs.get("s3BucketName");
 
+    sql """ set enable_nereids_timeout=false; """
+    sql """ set max_scan_key_num = 48 """
+    sql """ set max_pushdown_conditions_per_column=1024 """
 
     def dataFilePath = "https://"+"${bucket}"+"."+"${s3_endpoint}"+"/regression/datalake"
-//    def dataFilePath = "/mnt/disk1/wangqiannan/export/ol"
     def table_names = ["test_array_one_level", "test_map_one_level", "test_struct_one_level"]
 
     def colNameArr = ["c_bool", "c_tinyint", "c_smallint", "c_int", "c_bigint", "c_largeint", "c_float",
                       "c_double", "c_decimal", "c_decimalv3", "c_date", "c_datetime", "c_datev2", "c_datetimev2",
                       "c_char", "c_varchar", "c_string"]
-
-    def groupby_or_orderby_exception = {is_groupby, table_name, col_name ->
-        test {
-            if (is_groupby) {
-                sql "select ${col_name} from ${table_name} group by ${col_name};"
-            } else {
-                sql "select ${col_name} from ${table_name} order by ${col_name};"
-            }
-            exception("errCode = 2, detailMessage = Doris hll, bitmap, array, map, struct, jsonb, variant column must use with specific function, and don't support filter, group by or order by")
-        }
-    }
 
     def groupby_or_orderby_element_at = {is_groupby, table_name, agg_expr ->
         if (is_groupby) {
@@ -51,7 +42,10 @@ suite("one_level_nestedtypes_with_s3data") {
         }
     }
 
-    def be_id = 10139
+    List<List<Object>> backends =  sql """ show backends """
+    assertTrue(backends.size() > 0)
+    def be_id = backends[0][0]
+
     def load_from_tvf = {table_name, uri_file, format ->
         if (format == "csv") {
             order_qt_sql_tvf """select * from local(
@@ -80,49 +74,125 @@ suite("one_level_nestedtypes_with_s3data") {
             "column_separator"="|",
             "format" = "${format}"); """
         }
-        // where to filter different format data
-        qt_select_doris """ select * from ${table_name} where k1 IS NOT NULL order by k1 limit 10; """
     }
-    def load_from_s3 = {table_name, uri_file, format ->
-        if (format == "csv") {
-            order_qt_sql_s3 """select * from s3(
-                "uri" = "${uri_file}",
-                    "s3.access_key"= "${ak}",
-                    "s3.secret_key" = "${sk}",
-                    "format" = "${format}",
-                    "provider" = "${getS3Provider()}",
-                    "column_separator"="|",
-                    "read_json_by_line"="true") order by c1 limit 10; """
+    def load_from_s3 = {table_name, uri_file, format, is_map ->
+        sql "set enable_insert_strict = false;"
+        if (is_map) {
+            if (format == "csv") {
+                order_qt_sql_s3 """select *
+                from s3(
+                    "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "column_separator"="|",
+                        "read_json_by_line"="true") where c1 is not null order by c1 limit 10; """
 
-            sql """
-            insert into ${table_name} select * from s3(
-            "uri" = "${uri_file}",
-                    "s3.access_key"= "${ak}",
-                    "s3.secret_key" = "${sk}",
-                    "format" = "${format}",
-                    "column_separator"="|",
-                    "provider" = "${getS3Provider()}",
-                    "read_json_by_line"="true"); """
+                sql """
+                insert into ${table_name} select *
+                from s3(
+                "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "column_separator"="|",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true"); """
+            } else {
+                order_qt_sql_s3 """select k1
+                    , deduplicate_map(c_bool)
+                    , deduplicate_map(c_tinyint)
+                    , deduplicate_map(c_smallint)
+                    , deduplicate_map(c_int)
+                    , deduplicate_map(c_bigint)
+                    , deduplicate_map(c_largeint)
+                    , deduplicate_map(c_float)
+                    , deduplicate_map(c_double)
+                    , deduplicate_map(c_decimal)
+                    , deduplicate_map(c_decimalv3)
+                    , deduplicate_map(c_date)
+                    , deduplicate_map(c_datetime)
+                    , deduplicate_map(c_datev2)
+                    , deduplicate_map(c_datetimev2)
+                    , deduplicate_map(c_char)
+                    , deduplicate_map(c_varchar)
+                    , deduplicate_map(c_string)
+                from s3(
+                    "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true") where k1 is not null order by k1 limit 10; """
+
+                sql """
+                insert into ${table_name} select k1
+                    , deduplicate_map(c_bool)
+                    , deduplicate_map(c_tinyint)
+                    , deduplicate_map(c_smallint)
+                    , deduplicate_map(c_int)
+                    , deduplicate_map(c_bigint)
+                    , deduplicate_map(c_largeint)
+                    , deduplicate_map(c_float)
+                    , deduplicate_map(c_double)
+                    , deduplicate_map(c_decimal)
+                    , deduplicate_map(c_decimalv3)
+                    , deduplicate_map(c_date)
+                    , deduplicate_map(c_datetime)
+                    , deduplicate_map(c_datev2)
+                    , deduplicate_map(c_datetimev2)
+                    , deduplicate_map(c_char)
+                    , deduplicate_map(c_varchar)
+                    , deduplicate_map(c_string)
+                from s3(
+                "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true"); """
+            }
         } else {
-            order_qt_sql_s3 """select * from s3(
-                "uri" = "${uri_file}",
-                    "s3.access_key"= "${ak}",
-                    "s3.secret_key" = "${sk}",
-                    "format" = "${format}",
-                    "provider" = "${getS3Provider()}",
-                    "read_json_by_line"="true") order by k1 limit 10; """
+            if (format == "csv") {
+                order_qt_sql_s3 """select * from s3(
+                    "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "column_separator"="|",
+                        "read_json_by_line"="true") where c1 is not null order by c1 limit 10; """
 
-            sql """
-            insert into ${table_name} select * from s3(
-            "uri" = "${uri_file}",
-                    "s3.access_key"= "${ak}",
-                    "s3.secret_key" = "${sk}",
-                    "format" = "${format}",
-                    "provider" = "${getS3Provider()}",
-                    "read_json_by_line"="true"); """
+                sql """
+                insert into ${table_name} select * from s3(
+                "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "column_separator"="|",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true"); """
+            } else {
+                order_qt_sql_s3 """select * from s3(
+                    "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true") where k1 is not null order by k1 limit 10; """
+
+                sql """
+                insert into ${table_name} select * from s3(
+                "uri" = "${uri_file}",
+                        "s3.access_key"= "${ak}",
+                        "s3.secret_key" = "${sk}",
+                        "format" = "${format}",
+                        "provider" = "${getS3Provider()}",
+                        "read_json_by_line"="true"); """
+            }
         }
-        // where to filter different format data
-        qt_select_doris """ select * from ${table_name} where k1 IS NOT NULL order by k1 limit 10; """
+        sql "set enable_insert_strict = true;"
     }
 
     // step1. create table
@@ -157,15 +227,15 @@ suite("one_level_nestedtypes_with_s3data") {
     for (String f : array_files) {
         sql "truncate table ${table_names[0]};"
 //        load_from_tvf(table_names[0], f, format_order[fi])
-        load_from_s3(table_names[0], f, format_order[fi])
+        load_from_s3(table_names[0], f, format_order[fi], false)
         ++ fi
     }
     // select element_at(column)
     for (String col : colNameArr) {
         // first
-        order_qt_select_arr "select ${col}[1] from ${table_names[0]} where k1 IS NOT NULL order by k1 limit 10;"
+        order_qt_select_arr "select ${col}[1], k1 from ${table_names[0]} where k1 IS NOT NULL order by k1 limit 10;"
         // last
-        order_qt_select_arr "select ${col}[-1] from ${table_names[0]} where k1 IS NOT NULL order by k1 limit 10;"
+        order_qt_select_arr "select ${col}[-1], k1 from ${table_names[0]} where k1 IS NOT NULL order by k1 limit 10;"
         // null
         order_qt_select_arr_null "select ${col}[0] from ${table_names[0]} where k1 IS NOT NULL order by k1 limit 10;"
         // null
@@ -173,12 +243,7 @@ suite("one_level_nestedtypes_with_s3data") {
     }
     // select * from table where element_at(column) with equal expr
     for (String col : colNameArr) {
-        order_qt_select_arr "select ${col}[1], ${col}[-1] from ${table_names[0]} where k1 IS NOT NULL AND ${col}[1]<${col}[-1] order by k1 limit 10;"
-    }
-    // select * from table where groupby|orderby column will meet exception
-    for (String col : colNameArr) {
-        groupby_or_orderby_exception(true, table_names[0], col)
-        groupby_or_orderby_exception(false, table_names[0], col)
+        order_qt_select_arr "select ${col}[1], ${col}[-1], k1 from ${table_names[0]} where k1 IS NOT NULL AND ${col}[1]<${col}[-1] order by k1 limit 10;"
     }
     // select * from table where groupby|orderby element_at(column)
     for (String col : colNameArr) {
@@ -199,7 +264,7 @@ suite("one_level_nestedtypes_with_s3data") {
     for (String f : map_files) {
         sql "truncate table ${table_names[1]};"
 //        load_from_tvf(table_names[1], f, format_order[fi])
-        load_from_s3(table_names[1], f, format_order[fi])
+        load_from_s3(table_names[1], f, format_order[fi], true)
         ++ fi
     }
     // select element_at(column)
@@ -216,11 +281,6 @@ suite("one_level_nestedtypes_with_s3data") {
     // select * from table where element_at(column) with equal expr
     for (String col : colNameArr) {
         order_qt_select_map "select ${col}[map_keys(${col})[1]], ${col}[map_keys(${col})[-1]] from ${table_names[1]} where ${col}[map_keys(${col})[1]]<${col}[map_keys(${col})[-1]] AND k1 IS NOT NULL order by k1 limit 10;"
-    }
-    // select * from table where groupby|orderby column will meet exception
-    for (String col : colNameArr) {
-        groupby_or_orderby_exception(true, table_names[1], col)
-        groupby_or_orderby_exception(false, table_names[1], col)
     }
     // select * from table where groupby|orderby element_at(column)
     for (String col : colNameArr) {
@@ -241,7 +301,7 @@ suite("one_level_nestedtypes_with_s3data") {
     for (String f : struct_files) {
         sql "truncate table ${table_names[2]};"
 //        load_from_tvf(table_names[2], f, format_order[fi])
-        load_from_s3(table_names[2], f, format_order[fi])
+        load_from_s3(table_names[2], f, format_order[fi], false)
         ++ fi
     }
     // select element_at(column)
@@ -270,9 +330,6 @@ suite("one_level_nestedtypes_with_s3data") {
     order_qt_select_struct "select * from ${table_names[2]} where struct_element(${colNameArr[0]}, 'col17') = '${res}' AND k1 IS NOT NULL order by k1 limit 10;"
 
     // select * from table where groupby|orderby column will meet exception
-
-    groupby_or_orderby_exception(true, table_names[2], colNameArr[0])
-    groupby_or_orderby_exception(false, table_names[2], colNameArr[0])
 
     // select * from table where groupby|orderby element_at(column)
     String agg_expr = "struct_element(${colNameArr[0]}, 1)"

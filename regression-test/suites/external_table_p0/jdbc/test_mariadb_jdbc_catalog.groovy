@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_mariadb_jdbc_catalog", "p0,external,mariadb,external_docker,external_docker_mariadb") {
+suite("test_mariadb_jdbc_catalog", "p0,external") {
     qt_sql """select current_catalog()"""
 
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String catalog_name = "mariadb_jdbc_catalog";
         String internal_db_name = "regression_test_jdbc_catalog_p0";
@@ -68,7 +68,7 @@ suite("test_mariadb_jdbc_catalog", "p0,external,mariadb,external_docker,external
         sql  """ insert into internal.${internal_db_name}.${inDorisTable} select id, name from ${ex_tb0}; """
         order_qt_in_tb  """ select id, name from internal.${internal_db_name}.${inDorisTable} order by id; """
 
-        order_qt_information_schema """ show tables from information_schema; """
+        order_qt_information_schema """ show tables from information_schema like "processlist"; """
         order_qt_auto_default_t """insert into ${auto_default_t}(name) values('a'); """
         order_qt_dt """select * from ${dt}; """
 

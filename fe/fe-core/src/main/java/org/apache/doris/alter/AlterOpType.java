@@ -42,6 +42,12 @@ public enum AlterOpType {
     MODIFY_TABLE_COMMENT,
     MODIFY_COLUMN_COMMENT,
     MODIFY_ENGINE,
+    ALTER_BRANCH,
+    ALTER_TAG,
+    // partition evolution of iceberg table
+    ADD_PARTITION_FIELD,
+    DROP_PARTITION_FIELD,
+    REPLACE_PARTITION_FIELD,
     INVALID_OP; // INVALID_OP must be the last one
 
     // true means 2 operations have no conflict.

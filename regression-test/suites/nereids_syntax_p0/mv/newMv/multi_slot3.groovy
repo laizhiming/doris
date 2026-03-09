@@ -18,6 +18,10 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("multi_slot3") {
+    String db = context.config.getDbNameByFile(context.file)
+    sql "use ${db}"
+    // this mv rewrite would not be rewritten in RBO, so set NOT_IN_RBO explicitly
+    sql "set pre_materialized_view_rewrite_strategy = NOT_IN_RBO"
     sql """ DROP TABLE IF EXISTS multi_slot3; """
 
     sql """
@@ -36,28 +40,17 @@ suite ("multi_slot3") {
     sql "insert into multi_slot3 select 2,2,2,'b';"
     sql "insert into multi_slot3 select 3,-3,null,'c';"
 
-    createMV ("create materialized view k1p2ap3p as select k1+1,abs(k2+2)+k3+3 from multi_slot3;")
-
-    sleep(3000)
+    create_sync_mv(db, "multi_slot3", "k1p2ap3p", "select k1+1,abs(k2+2)+k3+3 from multi_slot3;")
 
     sql "insert into multi_slot3 select -4,-4,-4,'d';"
     sql "SET experimental_enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
 
     sql "analyze table multi_slot3 with sync;"
-    sql """set enable_stats=false;"""
+    sql """alter table multi_slot3 modify column k1 set stats ('row_count'='4');"""
 
     order_qt_select_star "select * from multi_slot3 order by k1;"
 
-    explain {
-        sql("select k1+1,abs(k2+2)+k3+3 from multi_slot3 order by k1+1;")
-        contains "(k1p2ap3p)"
-    }
+    mv_rewrite_success("select k1+1,abs(k2+2)+k3+3 from multi_slot3 order by k1+1;", "k1p2ap3p")
     order_qt_select_mv "select k1+1,abs(k2+2)+k3+3 from multi_slot3 order by k1+1;"
-
-    sql """set enable_stats=true;"""
-    explain {
-        sql("select k1+1,abs(k2+2)+k3+3 from multi_slot3 order by k1+1;")
-        contains "(k1p2ap3p)"
-    }
 }

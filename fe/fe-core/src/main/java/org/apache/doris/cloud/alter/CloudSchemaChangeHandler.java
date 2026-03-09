@@ -20,10 +20,12 @@ package org.apache.doris.cloud.alter;
 import org.apache.doris.alter.SchemaChangeHandler;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.cloud.proto.Cloud;
@@ -32,7 +34,9 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
+import org.apache.doris.service.FrontendOptions;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -40,8 +44,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class CloudSchemaChangeHandler extends SchemaChangeHandler {
     private static final Logger LOG = LogManager.getLogger(CloudSchemaChangeHandler.class);
@@ -87,19 +94,32 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
         }
     }
 
+    //TODO: extract the common code with SchemaChangeHandler
     @Override
     public void updateTableProperties(Database db, String tableName, Map<String, String> properties)
             throws UserException {
-        Preconditions.checkState(properties.containsKey(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_INTERVAL_MS)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_COMPACTION_POLICY)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_LEVEL_THRESHOLD)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_DISABLE_AUTO_COMPACTION));
+        final Set<String> allowedProps = new HashSet<String>() {
+            {
+                add(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_INTERVAL_MS);
+                add(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES);
+                add(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS);
+                add(PropertyAnalyzer.PROPERTIES_COMPACTION_POLICY);
+                add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES);
+                add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD);
+                add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS);
+                add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD);
+                add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_LEVEL_THRESHOLD);
+                add(PropertyAnalyzer.PROPERTIES_DISABLE_AUTO_COMPACTION);
+                add(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE);
+                add(PropertyAnalyzer.PROPERTIES_AUTO_ANALYZE_POLICY);
+                add(PropertyAnalyzer.PROPERTIES_PARTITION_RETENTION_COUNT);
+            }
+        };
+        List<String> notAllowedProps = properties.keySet().stream().filter(s -> !allowedProps.contains(s))
+                .collect(Collectors.toList());
+        if (!notAllowedProps.isEmpty()) {
+            throw new UserException("modifying property " + notAllowedProps + " is forbidden");
+        }
 
         if (properties.size() != 1) {
             throw new UserException("Can only set one table property at a time");
@@ -108,6 +128,13 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
         List<Partition> partitions = Lists.newArrayList();
         OlapTable olapTable = (OlapTable) db.getTableOrMetaException(tableName, Table.TableType.OLAP);
         UpdatePartitionMetaParam param = new UpdatePartitionMetaParam();
+
+        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_PARTITION_RETENTION_COUNT)
+                && !(olapTable.getPartitionInfo().enableAutomaticPartition()
+                        && olapTable.getPartitionInfo().getType() == PartitionType.RANGE)) {
+            throw new UserException("Only AUTO RANGE PARTITION table could set "
+                    + PropertyAnalyzer.PROPERTIES_PARTITION_RETENTION_COUNT);
+        }
 
         if (properties.containsKey(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS)) {
             long ttlSeconds = PropertyAnalyzer.analyzeTTL(properties);
@@ -164,6 +191,10 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
                 throw new UserException("Table compaction policy only support for "
                         + PropertyAnalyzer.TIME_SERIES_COMPACTION_POLICY
                         + " or " + PropertyAnalyzer.SIZE_BASED_COMPACTION_POLICY);
+            }
+            if (compactionPolicy != null && compactionPolicy.equals(PropertyAnalyzer.TIME_SERIES_COMPACTION_POLICY)
+                    && olapTable.getKeysType() == KeysType.UNIQUE_KEYS) {
+                throw new UserException("Time series compaction policy is not supported for unique key table");
             }
             olapTable.readLock();
             try {
@@ -292,6 +323,31 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
             }
             param.disableAutoCompaction = disableAutoCompaction;
             param.type = UpdatePartitionMetaParam.TabletMetaType.DISABLE_AUTO_COMPACTION;
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE)) {
+            boolean enableMowLightDelete = Boolean.parseBoolean(properties.get(PropertyAnalyzer
+                    .PROPERTIES_ENABLE_MOW_LIGHT_DELETE));
+            olapTable.readLock();
+            try {
+                if (enableMowLightDelete
+                        == olapTable.getEnableMowLightDelete()) {
+                    LOG.info("enableMowLightDelete:{} is equal with"
+                                    + " olapTable.getEnableMowLightDelete():{}",
+                            enableMowLightDelete,
+                            olapTable.getEnableMowLightDelete());
+                    return;
+                }
+                if (!olapTable.getEnableUniqueKeyMergeOnWrite()) {
+                    throw new UserException("enable_mow_light_delete property is "
+                            + "not supported for unique merge-on-read table");
+                }
+                partitions.addAll(olapTable.getPartitions());
+            } finally {
+                olapTable.readUnlock();
+            }
+            param.enableMowLightDelete = enableMowLightDelete;
+            param.type = UpdatePartitionMetaParam.TabletMetaType.ENABLE_MOW_LIGHT_DELETE;
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_AUTO_ANALYZE_POLICY)) {
+            // Do nothing.
         } else {
             LOG.warn("invalid properties:{}", properties);
             throw new UserException("invalid properties");
@@ -307,6 +363,9 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
         } finally {
             olapTable.writeUnlock();
         }
+
+        // after modifyTableProperties, buildPartitionRetentionCount has been done.
+        DynamicPartitionUtil.registerOrRemoveDynamicPartitionTable(db.getId(), olapTable, false);
     }
 
     private static class UpdatePartitionMetaParam {
@@ -323,6 +382,7 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
             TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD,
             TIME_SERIES_COMPACTION_LEVEL_THRESHOLD,
             DISABLE_AUTO_COMPACTION,
+            ENABLE_MOW_LIGHT_DELETE,
         }
 
         TabletMetaType type;
@@ -338,6 +398,7 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
         long timeSeriesCompactionEmptyRowsetsThreshold = 0;
         long timeSeriesCompactionLevelThreshold = 0;
         boolean disableAutoCompaction = false;
+        boolean enableMowLightDelete = false;
     }
 
     public void updateCloudPartitionMeta(Database db,
@@ -365,7 +426,8 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
             int nextIndex = tabletIds.size() - index > Config.cloud_txn_tablet_batch_size
                     ? index + Config.cloud_txn_tablet_batch_size
                     : tabletIds.size();
-            Cloud.UpdateTabletRequest.Builder requestBuilder = Cloud.UpdateTabletRequest.newBuilder();
+            Cloud.UpdateTabletRequest.Builder requestBuilder = Cloud.UpdateTabletRequest.newBuilder()
+                    .setRequestIp(FrontendOptions.getLocalHostAddressCached());
             while (index < nextIndex) {
                 Cloud.TabletMetaInfoPB.Builder infoBuilder = Cloud.TabletMetaInfoPB.newBuilder();
                 infoBuilder.setTabletId(tabletIds.get(index));
@@ -411,6 +473,11 @@ public class CloudSchemaChangeHandler extends SchemaChangeHandler {
                     case DISABLE_AUTO_COMPACTION:
                         infoBuilder.setDisableAutoCompaction(
                                 param.disableAutoCompaction);
+                        break;
+                    case ENABLE_MOW_LIGHT_DELETE:
+                        infoBuilder.setEnableMowLightDelete(
+                                param.enableMowLightDelete
+                        );
                         break;
                     default:
                         throw new UserException("Unknown TabletMetaType");

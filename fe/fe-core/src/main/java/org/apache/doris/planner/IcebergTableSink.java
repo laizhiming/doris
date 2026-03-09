@@ -17,21 +17,25 @@
 
 package org.apache.doris.planner;
 
+import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.SortInfo;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.util.LocationPath;
+import org.apache.doris.datasource.credentials.VendedCredentialsFactory;
+import org.apache.doris.datasource.iceberg.IcebergExternalCatalog;
 import org.apache.doris.datasource.iceberg.IcebergExternalTable;
 import org.apache.doris.datasource.iceberg.IcebergUtils;
-import org.apache.doris.nereids.trees.plans.commands.insert.BaseExternalTableInsertCommandContext;
+import org.apache.doris.datasource.property.storage.StorageProperties;
+import org.apache.doris.nereids.trees.plans.commands.insert.IcebergInsertCommandContext;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertCommandContext;
 import org.apache.doris.thrift.TDataSink;
 import org.apache.doris.thrift.TDataSinkType;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TFileFormatType;
+import org.apache.doris.thrift.TFileType;
 import org.apache.doris.thrift.TIcebergTableSink;
-import org.apache.doris.thrift.TSortField;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.PartitionSpecParser;
@@ -40,30 +44,49 @@ import org.apache.iceberg.SortDirection;
 import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.types.Types;
+import org.apache.iceberg.types.Types.NestedField;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
 public class IcebergTableSink extends BaseExternalTableDataSink {
 
+    private List<Expr> outputExprs;
     private final IcebergExternalTable targetTable;
     private static final HashSet<TFileFormatType> supportedTypes = new HashSet<TFileFormatType>() {{
             add(TFileFormatType.FORMAT_ORC);
             add(TFileFormatType.FORMAT_PARQUET);
         }};
 
+    // Store PropertiesMap, including vended credentials or static credentials
+    // get them in doInitialize() to ensure internal consistency of ScanNode
+    private Map<StorageProperties.Type, StorageProperties> storagePropertiesMap;
+
     public IcebergTableSink(IcebergExternalTable targetTable) {
         super();
+        if (targetTable.isView()) {
+            throw new UnsupportedOperationException("Write data to iceberg view is not supported");
+        }
         this.targetTable = targetTable;
+        IcebergExternalCatalog catalog = (IcebergExternalCatalog) targetTable.getCatalog();
+        storagePropertiesMap = VendedCredentialsFactory.getStoragePropertiesMapWithVendedCredentials(
+                catalog.getCatalogProperty().getMetastoreProperties(),
+                catalog.getCatalogProperty().getStoragePropertiesMap(),
+                targetTable.getIcebergTable());
     }
 
     @Override
     protected Set<TFileFormatType> supportedFileFormatTypes() {
         return supportedTypes;
+    }
+
+    public void setOutputExprs(List<Expr> outputExprs) {
+        this.outputExprs = outputExprs;
     }
 
     @Override
@@ -73,6 +96,12 @@ public class IcebergTableSink extends BaseExternalTableDataSink {
         if (explainLevel == TExplainLevel.BRIEF) {
             return strBuilder.toString();
         }
+        Table icebergTable = targetTable.getIcebergTable();
+        strBuilder.append(prefix).append("Table: ").append(icebergTable.name()).append("\n");
+        if (icebergTable.sortOrder().isSorted()) {
+            strBuilder.append(prefix).append(targetTable.getSortOrderSql()).append("\n");
+        }
+
         // TODO: explain partitions
         return strBuilder.toString();
     }
@@ -100,24 +129,25 @@ public class IcebergTableSink extends BaseExternalTableDataSink {
         // sort order
         if (icebergTable.sortOrder().isSorted()) {
             SortOrder sortOrder = icebergTable.sortOrder();
-            Set<Integer> baseColumnFieldIds = icebergTable.schema().columns().stream()
-                    .map(Types.NestedField::fieldId)
-                    .collect(ImmutableSet.toImmutableSet());
-            ImmutableList.Builder<TSortField> sortFields = ImmutableList.builder();
+            ArrayList<Expr> orderingExprs = Lists.newArrayList();
+            ArrayList<Boolean> isAscOrder = Lists.newArrayList();
+            ArrayList<Boolean> isNullsFirst = Lists.newArrayList();
             for (SortField sortField : sortOrder.fields()) {
                 if (!sortField.transform().isIdentity()) {
                     continue;
                 }
-                if (!baseColumnFieldIds.contains(sortField.sourceId())) {
-                    continue;
+                for (int i = 0; i < icebergTable.schema().columns().size(); ++i) {
+                    NestedField column  = icebergTable.schema().columns().get(i);
+                    if (column.fieldId() == sortField.sourceId()) {
+                        orderingExprs.add(outputExprs.get(i));
+                        isAscOrder.add(sortField.direction().equals(SortDirection.ASC));
+                        isNullsFirst.add(sortField.nullOrder().equals(NullOrder.NULLS_FIRST));
+                        break;
+                    }
                 }
-                TSortField tSortField = new TSortField();
-                tSortField.setSourceColumnId(sortField.sourceId());
-                tSortField.setAscending(sortField.direction().equals(SortDirection.ASC));
-                tSortField.setNullFirst(sortField.nullOrder().equals(NullOrder.NULLS_FIRST));
-                sortFields.add(tSortField);
             }
-            tSink.setSortFields(sortFields.build());
+            SortInfo sortInfo = new SortInfo(orderingExprs, isAscOrder, isNullsFirst, null);
+            tSink.setSortInfo(sortInfo.toThrift());
         }
 
         // file info
@@ -125,20 +155,34 @@ public class IcebergTableSink extends BaseExternalTableDataSink {
         tSink.setCompressionType(getTFileCompressType(IcebergUtils.getFileCompress(icebergTable)));
 
         // hadoop config
-        HashMap<String, String> props = new HashMap<>(icebergTable.properties());
-        Map<String, String> catalogProps = targetTable.getCatalog().getProperties();
-        props.putAll(catalogProps);
+        Map<String, String> props = new HashMap<>();
+        for (StorageProperties storageProperties : storagePropertiesMap.values()) {
+            props.putAll(storageProperties.getBackendConfigProperties());
+        }
         tSink.setHadoopConfig(props);
 
         // location
-        LocationPath locationPath = new LocationPath(IcebergUtils.dataLocation(icebergTable), catalogProps);
+        String originalLocation = IcebergUtils.dataLocation(icebergTable);
+        LocationPath locationPath = LocationPath.of(originalLocation, storagePropertiesMap);
         tSink.setOutputPath(locationPath.toStorageLocation().toString());
-        tSink.setOriginalOutputPath(locationPath.toString());
-        tSink.setFileType(locationPath.getTFileTypeForBE());
+        tSink.setOriginalOutputPath(originalLocation);
+        TFileType fileType = locationPath.getTFileTypeForBE();
+        tSink.setFileType(fileType);
+        if (fileType.equals(TFileType.FILE_BROKER)) {
+            tSink.setBrokerAddresses(getBrokerAddresses(targetTable.getCatalog().bindBrokerName()));
+        }
 
         if (insertCtx.isPresent()) {
-            BaseExternalTableInsertCommandContext context = (BaseExternalTableInsertCommandContext) insertCtx.get();
+            IcebergInsertCommandContext context = (IcebergInsertCommandContext) insertCtx.get();
             tSink.setOverwrite(context.isOverwrite());
+
+            // Pass static partition values to BE for static partition overwrite
+            if (context.isStaticPartitionOverwrite()) {
+                Map<String, String> staticPartitionValues = context.getStaticPartitionValues();
+                if (staticPartitionValues != null && !staticPartitionValues.isEmpty()) {
+                    tSink.setStaticPartitionValues(staticPartitionValues);
+                }
+            }
         }
         tDataSink = new TDataSink(TDataSinkType.ICEBERG_TABLE_SINK);
         tDataSink.setIcebergTableSink(tSink);

@@ -18,8 +18,14 @@
 package org.apache.doris.tablefunction;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.InfoSchemaDb;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TFrontendsMetadataParams;
 import org.apache.doris.thrift.TMetaScanRange;
 import org.apache.doris.thrift.TMetadataType;
@@ -50,13 +56,17 @@ public class FrontendsDisksTableValuedFunction extends MetadataTableValuedFuncti
             new Column("MountOn", ScalarType.createStringType()));
 
     private static final ImmutableMap<String, Integer> COLUMN_TO_INDEX;
+    private static final ImmutableList<String> TITLE_NAMES;
 
     static {
         ImmutableMap.Builder<String, Integer> builder = new ImmutableMap.Builder();
+        ImmutableList.Builder<String> immutableListBuilder = ImmutableList.builder();
         for (int i = 0; i < SCHEMA.size(); i++) {
             builder.put(SCHEMA.get(i).getName().toLowerCase(), i);
+            immutableListBuilder.add(SCHEMA.get(i).getName());
         }
         COLUMN_TO_INDEX = builder.build();
+        TITLE_NAMES = immutableListBuilder.build();
     }
 
     public static Integer getColumnIndexFromColumnName(String columnName) {
@@ -67,6 +77,12 @@ public class FrontendsDisksTableValuedFunction extends MetadataTableValuedFuncti
         if (params.size() != 0) {
             throw new AnalysisException("frontends_disks table-valued-function does not support any params");
         }
+        if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                InternalCatalog.INTERNAL_CATALOG_NAME, InfoSchemaDb.DATABASE_NAME, PrivPredicate.SELECT)) {
+            String message = ErrorCode.ERR_DB_ACCESS_DENIED_ERROR.formatErrorMsg(
+                    PrivPredicate.SELECT.getPrivs().toString(), InfoSchemaDb.DATABASE_NAME);
+            throw new AnalysisException(message);
+        }
     }
 
     @Override
@@ -75,7 +91,7 @@ public class FrontendsDisksTableValuedFunction extends MetadataTableValuedFuncti
     }
 
     @Override
-    public TMetaScanRange getMetaScanRange() {
+    public TMetaScanRange getMetaScanRange(List<String> requiredFileds) {
         TMetaScanRange metaScanRange = new TMetaScanRange();
         metaScanRange.setMetadataType(TMetadataType.FRONTENDS_DISKS);
         TFrontendsMetadataParams frontendsMetadataParams = new TFrontendsMetadataParams();
@@ -92,5 +108,12 @@ public class FrontendsDisksTableValuedFunction extends MetadataTableValuedFuncti
     @Override
     public List<Column> getTableColumns() throws AnalysisException {
         return SCHEMA;
+    }
+
+    /**
+     * unify title names for frontends_disks function and show frontends disks command
+     */
+    public static ImmutableList<String> getFrontendsDisksTitleNames() {
+        return TITLE_NAMES;
     }
 }

@@ -110,7 +110,7 @@ public class DorisTypeToIcebergType extends DorisTypeVisitor<Type> {
             return Types.FloatType.get();
         } else if (primitiveType.equals(PrimitiveType.DOUBLE)) {
             return Types.DoubleType.get();
-        } else if (primitiveType.equals(PrimitiveType.STRING)) {
+        } else if (primitiveType.isCharFamily()) {
             return Types.StringType.get();
         } else if (primitiveType.equals(PrimitiveType.DATE)
                 || primitiveType.equals(PrimitiveType.DATEV2)) {
@@ -123,6 +123,8 @@ public class DorisTypeToIcebergType extends DorisTypeVisitor<Type> {
         } else if (primitiveType.equals(PrimitiveType.DATETIME)
                 || primitiveType.equals(PrimitiveType.DATETIMEV2)) {
             return Types.TimestampType.withoutZone();
+        } else if (primitiveType.equals(PrimitiveType.TIMESTAMPTZ)) {
+            return Types.TimestampType.withZone();
         }
         // unsupported type: PrimitiveType.HLL BITMAP BINARY
 

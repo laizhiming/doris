@@ -1,4 +1,3 @@
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -22,14 +21,14 @@
 #include <butil/iobuf.h>
 #include <fmt/format.h>
 #include <glog/logging.h>
-#include <stdint.h>
 
 #include <algorithm>
 #include <climits> // IWYU pragma: keep
 #include <cmath>   // IWYU pragma: keep
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 
 #include "common/status.h"
 #include "exprs/block_bloom_filter.hpp"
@@ -37,6 +36,7 @@
 #include "util/sse_util.hpp"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 constexpr uint32_t BlockBloomFilter::kRehash[8] __attribute__((aligned(32)));
 // constexpr data member requires initialization in the class declaration.
@@ -66,7 +66,7 @@ Status BlockBloomFilter::init_internal(const int log_space_bytes, uint32_t hash_
     }
     // Don't use _log_num_buckets if it will lead to undefined behavior by a shift
     // that is too large.
-    _directory_mask = (1ULL << _log_num_buckets) - 1;
+    _directory_mask = (1 << _log_num_buckets) - 1;
 
     const size_t alloc_size = directory_size();
     close(); // Ensure that any previously allocated memory for directory_ is released.
@@ -119,6 +119,28 @@ void BlockBloomFilter::close() {
     }
 }
 
+#ifdef __ARM_NEON
+void BlockBloomFilter::bucket_insert(const uint32_t bucket_idx, const uint32_t hash) noexcept {
+    const uint32x4x2_t mask = make_mask(hash);
+    uint32x4x2_t data = vld1q_u32_x2(&_directory[bucket_idx][0]);
+    data.val[0] = vorrq_u32(data.val[0], mask.val[0]);
+    data.val[1] = vorrq_u32(data.val[1], mask.val[1]);
+    vst1q_u32_x2(&_directory[bucket_idx][0], data);
+}
+
+bool BlockBloomFilter::bucket_find(const uint32_t bucket_idx, const uint32_t hash) const noexcept {
+    const uint32x4x2_t mask = make_mask(hash);
+    uint32x4x2_t data = vld1q_u32_x2(&_directory[bucket_idx][0]);
+    // The condition for returning true is that all the bits in _directory[bucket_idx][i] specified by masks[i] are 1.
+    // This can be equivalently expressed as all the bits in not( _directory[bucket_idx][i]) specified by masks[i] are 0.
+    // vbicq_u32(vec1, vec2) : Result of (vec1 AND NOT vec2)
+    // If true is returned, out_1 and out_2 should be all zeros.
+    uint32x4_t miss0 = vbicq_u32(mask.val[0], data.val[0]);
+    uint32x4_t miss1 = vbicq_u32(mask.val[1], data.val[1]);
+    uint32x4_t miss = vorrq_u32(miss0, miss1);
+    return vmaxvq_u32(miss) == 0U;
+}
+#else
 void BlockBloomFilter::bucket_insert(const uint32_t bucket_idx, const uint32_t hash) noexcept {
     // new_bucket will be all zeros except for eight 1-bits, one in each 32-bit word. It is
     // 16-byte aligned so it can be read as a __m128i using aligned SIMD loads in the second
@@ -138,21 +160,16 @@ void BlockBloomFilter::bucket_insert(const uint32_t bucket_idx, const uint32_t h
 }
 
 bool BlockBloomFilter::bucket_find(const uint32_t bucket_idx, const uint32_t hash) const noexcept {
+    uint32_t masks[kBucketWords];
+    make_mask(hash, masks);
     for (int i = 0; i < kBucketWords; ++i) {
-        BucketWord hval = (kRehash[i] * hash) >> ((1 << kLogBucketWordBits) - kLogBucketWordBits);
-        hval = 1U << hval;
-        if (!(DCHECK_NOTNULL(_directory)[bucket_idx][i] & hval)) {
+        if ((DCHECK_NOTNULL(_directory)[bucket_idx][i] & masks[i]) == 0) {
             return false;
         }
     }
     return true;
 }
-
-void BlockBloomFilter::insert_no_avx2(const uint32_t hash) noexcept {
-    _always_false = false;
-    const uint32_t bucket_idx = rehash32to32(hash) & _directory_mask;
-    bucket_insert(bucket_idx, hash);
-}
+#endif
 
 // To set 8 bits in an 32-byte Bloom filter, we set one bit in each 32-bit uint32_t. This
 // is a "split Bloom filter", and it has approximately the same false positive probability
@@ -246,3 +263,4 @@ Status BlockBloomFilter::merge(const BlockBloomFilter& other) {
 }
 
 } // namespace doris
+#include "common/compile_check_end.h"

@@ -18,9 +18,9 @@
 package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
-import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
+import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 
 import java.util.List;
 
@@ -36,14 +36,25 @@ public class ArrayLast extends ElementAt
      */
     public ArrayLast(Expression arg) {
         super(new ArrayFilter(arg), new BigIntLiteral(-1));
-        if (!(arg instanceof Lambda)) {
-            throw new AnalysisException(
-                    String.format("The 1st arg of %s must be lambda but is %s", getName(), arg));
-        }
+    }
+
+    /** constructor for withChildren and reuse signature */
+    private ArrayLast(ScalarFunctionParams functionParams) {
+        super(functionParams);
     }
 
     @Override
     public List<FunctionSignature> getImplSignature() {
         return SIGNATURES;
+    }
+
+    @Override
+    public ElementAt withChildren(List<Expression> children) {
+        return new ArrayLast(getFunctionParams(children));
+    }
+
+    @Override
+    public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
+        return visitor.visitArrayLast(this, context);
     }
 }

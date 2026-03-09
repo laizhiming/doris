@@ -28,6 +28,8 @@ import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJso
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayJsonOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayString;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayStringOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObject;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObjectOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMap;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMapOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNumbers;
@@ -35,10 +37,17 @@ import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNum
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplit;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplitOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeVariantArray;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplode;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplodeOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.Unnest;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedSet;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * Builtin table generating functions.
@@ -52,6 +61,8 @@ public class BuiltinTableGeneratingFunctions implements FunctionHelper {
             tableGenerating(ExplodeOuter.class, "explode_outer"),
             tableGenerating(ExplodeMap.class, "explode_map"),
             tableGenerating(ExplodeMapOuter.class, "explode_map_outer"),
+            tableGenerating(ExplodeJsonObject.class, "explode_json_object"),
+            tableGenerating(ExplodeJsonObjectOuter.class, "explode_json_object_outer"),
             tableGenerating(ExplodeNumbers.class, "explode_numbers"),
             tableGenerating(ExplodeNumbersOuter.class, "explode_numbers_outer"),
             tableGenerating(ExplodeBitmap.class, "explode_bitmap"),
@@ -65,8 +76,24 @@ public class BuiltinTableGeneratingFunctions implements FunctionHelper {
             tableGenerating(ExplodeJsonArrayString.class, "explode_json_array_string"),
             tableGenerating(ExplodeJsonArrayStringOuter.class, "explode_json_array_string_outer"),
             tableGenerating(ExplodeJsonArrayJson.class, "explode_json_array_json"),
-            tableGenerating(ExplodeJsonArrayJsonOuter.class, "explode_json_array_json_outer")
+            tableGenerating(ExplodeJsonArrayJsonOuter.class, "explode_json_array_json_outer"),
+            tableGenerating(ExplodeVariantArray.class, "explode_variant_array"),
+            tableGenerating(PosExplode.class, "posexplode"),
+            tableGenerating(PosExplodeOuter.class, "posexplode_outer"),
+            tableGenerating(Unnest.class, "unnest")
     );
+
+    public static final ImmutableSet<String> RETURN_MULTI_COLUMNS_FUNCTIONS = new ImmutableSortedSet.Builder<String>(
+            String.CASE_INSENSITIVE_ORDER).add("explode").add("explode_outer").add("explode_variant_array")
+            .add("explode_variant_array_outer").add("explode_json_array_int").add("explode_json_array_double")
+            .add("explode_json_array_string").add("explode_json_array_json").add("explode_json_array_int_outer")
+            .add("explode_json_array_double_outer").add("explode_json_array_string_outer")
+            .add("explode_json_array_json_outer").add("explode_split").add("explode_split_outer")
+            .add("posexplode").add("posexplode_outer").build();
+
+    public Set<String> getReturnManyColumnFunctions() {
+        return RETURN_MULTI_COLUMNS_FUNCTIONS;
+    }
 
     public static final BuiltinTableGeneratingFunctions INSTANCE = new BuiltinTableGeneratingFunctions();
 

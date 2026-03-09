@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <gen_cpp/internal_service.pb.h>
 #include <gen_cpp/types.pb.h>
 #include <glog/logging.h>
 #include <gtest/gtest-message.h>
@@ -24,11 +25,9 @@
 #include <ostream>
 
 #include "common/config.h"
-#include "gen_cpp/internal_service.pb.h"
 #include "gtest/gtest_pred_impl.h"
-#include "gutil/integral_types.h"
-#include "olap/olap_define.h"
 #include "runtime/cache/result_cache.h"
+#include "storage/olap_define.h"
 #include "testutil/test_util.h"
 
 namespace doris {
@@ -83,7 +82,7 @@ void PartitionCacheTest::clear() {
     SAFE_DELETE(_clear_response);
 }
 
-void set_sql_key(PUniqueId* sql_key, int64 hi, int64 lo) {
+void set_sql_key(PUniqueId* sql_key, int64_t hi, int64_t lo) {
     sql_key->set_hi(hi);
     sql_key->set_lo(lo);
 }

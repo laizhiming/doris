@@ -23,7 +23,6 @@ import org.apache.doris.catalog.MaterializedIndex.IndexState;
 import org.apache.doris.cloud.catalog.CloudPartition;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
-import org.apache.doris.common.io.Text;
 import org.apache.doris.rpc.RpcException;
 
 import com.google.common.base.Preconditions;
@@ -33,8 +32,6 @@ import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -60,24 +57,24 @@ public class Partition extends MetaObject {
 
     @SerializedName(value = "id")
     private long id;
-    @SerializedName(value = "name")
+    @SerializedName(value = "nm", alternate = {"name"})
     private String name;
-    @SerializedName(value = "state")
+    @SerializedName(value = "st", alternate = {"state"})
     private PartitionState state;
-    @SerializedName(value = "baseIndex")
+    @SerializedName(value = "bi", alternate = {"baseIndex"})
     private MaterializedIndex baseIndex;
     /**
      * Visible rollup indexes are indexes which are visible to user.
      * User can do query on them, show them in related 'show' stmt.
      */
-    @SerializedName(value = "idToVisibleRollupIndex")
+    @SerializedName(value = "ivr", alternate = {"idToVisibleRollupIndex"})
     private Map<Long, MaterializedIndex> idToVisibleRollupIndex = Maps.newHashMap();
     /**
      * Shadow indexes are indexes which are not visible to user.
      * Query will not run on these shadow indexes, and user can not see them neither.
      * But load process will load data into these shadow indexes.
      */
-    @SerializedName(value = "idToShadowIndex")
+    @SerializedName(value = "isi", alternate = {"idToShadowIndex"})
     private Map<Long, MaterializedIndex> idToShadowIndex = Maps.newHashMap();
 
     /**
@@ -86,23 +83,13 @@ public class Partition extends MetaObject {
      * next version(hash): next version is set after finished committing, it should equals to committed version + 1
      */
 
-    // not have committedVersion because committedVersion = nextVersion - 1
-    @Deprecated
-    @SerializedName(value = "committedVersionHash")
-    private long committedVersionHash;
-    @SerializedName(value = "visibleVersion")
+    @SerializedName(value = "vv", alternate = {"visibleVersion"})
     private long visibleVersion;
-    @SerializedName(value = "visibleVersionTime")
+    @SerializedName(value = "vvt", alternate = {"visibleVersionTime"})
     private long visibleVersionTime;
-    @Deprecated
-    @SerializedName(value = "visibleVersionHash")
-    private long visibleVersionHash;
-    @SerializedName(value = "nextVersion")
+    @SerializedName(value = "nv", alternate = {"nextVersion"})
     protected long nextVersion;
-    @Deprecated
-    @SerializedName(value = "nextVersionHash")
-    private long nextVersionHash;
-    @SerializedName(value = "distributionInfo")
+    @SerializedName(value = "di", alternate = {"distributionInfo"})
     private DistributionInfo distributionInfo;
 
     protected Partition() {
@@ -151,8 +138,8 @@ public class Partition extends MetaObject {
     public void updateVersionForRestore(long visibleVersion) {
         this.setVisibleVersion(visibleVersion);
         this.nextVersion = this.visibleVersion + 1;
-        LOG.info("update partition {} version for restore: visible: {}, next: {}",
-                name, visibleVersion, nextVersion);
+        LOG.info("update partition {}({}) version for restore: visible: {}, next: {}",
+                name, id, visibleVersion, nextVersion);
     }
 
     public void updateVisibleVersion(long visibleVersion) {
@@ -166,7 +153,7 @@ public class Partition extends MetaObject {
     /* fromCache is only used in CloudPartition
      * make it overrided here to avoid rewrite all the usages with ugly Config.isCloudConfig() branches
      */
-    public long getVisibleVersion(Boolean fromCache) {
+    public long getCachedVisibleVersion() {
         return visibleVersion;
     }
 
@@ -184,18 +171,6 @@ public class Partition extends MetaObject {
         } else {
             return partitions.stream().map(Partition::getVisibleVersion).collect(Collectors.toList());
         }
-    }
-
-    /**
-     * if visibleVersion is 1, do not return creation time but 0
-     *
-     * @return
-     */
-    public long getVisibleVersionTimeIgnoreInit() {
-        if (visibleVersion == 1) {
-            return 0L;
-        }
-        return visibleVersionTime;
     }
 
     // The method updateVisibleVersionAndVersionHash is called when fe restart, the visibleVersionTime is updated
@@ -291,7 +266,7 @@ public class Partition extends MetaObject {
     public long getDataSize(boolean singleReplica) {
         long dataSize = 0;
         for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
-            dataSize += mIndex.getDataSize(singleReplica);
+            dataSize += mIndex.getDataSize(singleReplica, false);
         }
         return dataSize;
     }
@@ -348,52 +323,6 @@ public class Partition extends MetaObject {
         return true;
     }
 
-    @Deprecated
-    public static Partition read(DataInput in) throws IOException {
-        Partition partition = EnvFactory.getInstance().createPartition();
-        partition.readFields(in);
-        return partition;
-    }
-
-    @Deprecated
-    @Override
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-
-        id = in.readLong();
-        name = Text.readString(in);
-        state = PartitionState.valueOf(Text.readString(in));
-
-        baseIndex = MaterializedIndex.read(in);
-
-        int rollupCount = in.readInt();
-        for (int i = 0; i < rollupCount; ++i) {
-            MaterializedIndex rollupTable = MaterializedIndex.read(in);
-            idToVisibleRollupIndex.put(rollupTable.getId(), rollupTable);
-        }
-
-        int shadowIndexCount = in.readInt();
-        for (int i = 0; i < shadowIndexCount; i++) {
-            MaterializedIndex shadowIndex = MaterializedIndex.read(in);
-            idToShadowIndex.put(shadowIndex.getId(), shadowIndex);
-        }
-
-        visibleVersion = in.readLong();
-        visibleVersionTime = in.readLong();
-        visibleVersionHash = in.readLong();
-        nextVersion = in.readLong();
-        nextVersionHash = in.readLong();
-        committedVersionHash = in.readLong();
-        DistributionInfoType distriType = DistributionInfoType.valueOf(Text.readString(in));
-        if (distriType == DistributionInfoType.HASH) {
-            distributionInfo = HashDistributionInfo.read(in);
-        } else if (distriType == DistributionInfoType.RANDOM) {
-            distributionInfo = RandomDistributionInfo.read(in);
-        } else {
-            throw new IOException("invalid distribution type: " + distriType);
-        }
-    }
-
     @Override
     public boolean equals(Object obj) {
         if (this == obj) {
@@ -445,5 +374,36 @@ public class Partition extends MetaObject {
         if (distributionInfo.getType() == DistributionInfoType.HASH) {
             distributionInfo = ((HashDistributionInfo) distributionInfo).toRandomDistributionInfo();
         }
+    }
+
+    public boolean isRollupIndex(long id) {
+        return idToVisibleRollupIndex.containsKey(id);
+    }
+
+
+    public long getRowCount() {
+        return getBaseIndex().getRowCount();
+    }
+
+    public long getAvgRowLength() {
+        long rowCount = getBaseIndex().getRowCount();
+        long dataSize = getBaseIndex().getDataSize(false, false);
+        if (rowCount > 0) {
+            return dataSize / rowCount;
+        } else {
+            return 0;
+        }
+    }
+
+    public long getDataLength() {
+        return getBaseIndex().getDataSize(false, false);
+    }
+
+    public long getDataSizeExcludeEmptyReplica(boolean singleReplica) {
+        long dataSize = 0;
+        for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
+            dataSize += mIndex.getDataSize(singleReplica, true);
+        }
+        return dataSize + getRemoteDataSize();
     }
 }

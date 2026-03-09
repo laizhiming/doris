@@ -18,12 +18,14 @@
 package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullable;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.ArrayType;
+import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
 
 import com.google.common.base.Preconditions;
@@ -48,13 +50,34 @@ public class ArrayReverseSort extends ScalarFunction
         super("array_reverse_sort", arg);
     }
 
+    /** constructor for withChildren and reuse signature */
+    private ArrayReverseSort(ScalarFunctionParams functionParams) {
+        super(functionParams);
+    }
+
+    @Override
+    public void checkLegalityBeforeTypeCoercion() {
+        if (children.get(0).getDataType() instanceof ArrayType) {
+            DataType argType = child(0).getDataType();
+            // Find the innermost element type for nested arrays
+            DataType itemType = ((ArrayType) argType).getItemType();
+            while (itemType.isArrayType()) {
+                itemType = ((ArrayType) itemType).getItemType();
+            }
+            if (itemType.isMapType() || itemType.isStructType()
+                    || itemType.isVariantType() || itemType.isJsonType()) {
+                throw new AnalysisException("array_reverse_sort does not support types: " + argType.toSql());
+            }
+        }
+    }
+
     /**
      * withChildren.
      */
     @Override
     public ArrayReverseSort withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new ArrayReverseSort(children.get(0));
+        return new ArrayReverseSort(getFunctionParams(children));
     }
 
     @Override

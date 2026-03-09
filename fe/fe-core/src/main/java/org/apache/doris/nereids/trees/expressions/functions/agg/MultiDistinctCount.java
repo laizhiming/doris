@@ -18,26 +18,24 @@
 package org.apache.doris.nereids.trees.expressions.functions.agg;
 
 import org.apache.doris.catalog.FunctionSignature;
-import org.apache.doris.nereids.analyzer.Unbound;
-import org.apache.doris.nereids.trees.expressions.Cast;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.functions.AlwaysNotNullable;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
+import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
-import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 
 /** MultiDistinctCount */
-public class MultiDistinctCount extends AggregateFunction
-        implements AlwaysNotNullable, ExplicitlyCastableSignature, MultiDistinction {
-
+public class MultiDistinctCount extends NotNullableAggregateFunction
+        implements ExplicitlyCastableSignature, MultiDistinction {
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(BigIntType.INSTANCE).varArgs(AnyDataType.INSTANCE_WITHOUT_INDEX)
     );
@@ -46,29 +44,30 @@ public class MultiDistinctCount extends AggregateFunction
     // can't change getSignatures to use type coercion rule to add a cast expr
     // because AggregateStrategies phase is after type coercion
     public MultiDistinctCount(Expression arg0, Expression... varArgs) {
-        super("multi_distinct_count", true, ExpressionUtils.mergeArguments(arg0, varArgs).stream()
-                .map(arg -> !(arg instanceof Unbound) && arg.getDataType() instanceof DateLikeType
-                        ? new Cast(arg, BigIntType.INSTANCE) : arg)
-                .collect(ImmutableList.toImmutableList()));
+        this(false, arg0, varArgs);
     }
 
     public MultiDistinctCount(boolean distinct, Expression arg0, Expression... varArgs) {
-        super("multi_distinct_count", distinct, ExpressionUtils.mergeArguments(arg0, varArgs)
-                .stream()
-                .map(arg -> !(arg instanceof Unbound) && arg.getDataType() instanceof DateLikeType
-                        ? new Cast(arg, BigIntType.INSTANCE) : arg)
-                .collect(ImmutableList.toImmutableList()));
+        this(false, ExpressionUtils.mergeArguments(arg0, varArgs));
+    }
+
+    private MultiDistinctCount(boolean distinct, List<Expression> children) {
+        super("multi_distinct_count", false, new LinkedHashSet<>(children)
+                .stream().collect(ImmutableList.toImmutableList()));
+        if (super.children().size() > 1) {
+            throw new AnalysisException("MultiDistinctCount's children size must be 1");
+        }
+    }
+
+    /** constructor for withChildren and reuse signature */
+    protected MultiDistinctCount(AggregateFunctionParams functionParams) {
+        super(functionParams);
     }
 
     @Override
     public MultiDistinctCount withDistinctAndChildren(boolean distinct, List<Expression> children) {
-        Preconditions.checkArgument(children.size() > 0);
-        if (children.size() > 1) {
-            return new MultiDistinctCount(distinct, children.get(0),
-                    children.subList(1, children.size()).toArray(new Expression[0]));
-        } else {
-            return new MultiDistinctCount(distinct, children.get(0));
-        }
+        Preconditions.checkArgument(children.size() == 1, "MultiDistinctCount's children size must be 1");
+        return new MultiDistinctCount(getFunctionParams(false, children));
     }
 
     @Override
@@ -79,5 +78,10 @@ public class MultiDistinctCount extends AggregateFunction
     @Override
     public List<FunctionSignature> getSignatures() {
         return SIGNATURES;
+    }
+
+    @Override
+    public Expression resultForEmptyInput() {
+        return new BigIntLiteral(0);
     }
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_s3_tvf_with_resource", "p0") {
+suite("test_s3_tvf_with_resource", "p0,external") {
     // open nereids
     sql """ set enable_nereids_planner=true """
     sql """ set enable_fallback_to_original_planner=false """
@@ -27,6 +27,7 @@ suite("test_s3_tvf_with_resource", "p0") {
     String bucket = context.config.otherConfigs.get("s3BucketName");
 
 
+    def db = "test_s3_tvf_with_resource";
     def export_table_name = "test_s3_tvf_with_resource_export_test"
     def outFilePath = "${bucket}/est_s3_tvf/export_test/exp_"
     def resource_name = "test_s3_tvf_resource"
@@ -77,6 +78,9 @@ suite("test_s3_tvf_with_resource", "p0") {
         return res[0][3]
     }
 
+    sql """drop database if exists ${db}"""
+    sql """create database ${db}"""
+    sql """use ${db}"""
     // create table to export data
     create_table(export_table_name)
 
@@ -95,7 +99,6 @@ suite("test_s3_tvf_with_resource", "p0") {
 
     // test outfile to s3
     def outfile_url = outfile_to_S3()
-    // outfile_url like: s3://doris-build-hk-1308700295/est_s3_tvf/export_test/exp_f2cb650bbb94431a-ab0bc3e6f3e89f04_*
 
     // 1. normal
     try {
@@ -177,13 +180,13 @@ suite("test_s3_tvf_with_resource", "p0") {
     }
 
     // test auth
+    def tokens = context.config.jdbcUrl.split('/')
+    def url=tokens[0] + "//" + tokens[2] + "/" + "${db}" + "?"
     String user = 'test_s3_tvf_with_resource_user'
     String pwd = 'C123_567p'
     String viewName = "test_s3_tvf_with_resource_view"
     try_sql("DROP USER ${user}")
     sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
-    String dbName = context.config.getDbNameByFile(context.file)
-    sql """grant select_priv on ${dbName}.${viewName} to ${user}"""
     sql "drop view if exists ${viewName}"
     sql """
         create view ${viewName} as
@@ -194,16 +197,16 @@ suite("test_s3_tvf_with_resource", "p0") {
                            "resource" = "${resource_name}"
                        )  where k1 > 100  order by k3,k2,k1;
         """
-
+    sql """grant select_priv on ${db}.${viewName} to ${user}"""
     //cloud-mode
     if (isCloudMode()) {
         def clusters = sql " SHOW CLUSTERS; "
         assertTrue(!clusters.isEmpty())
         def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
     }
     // not have usage priv, can not select tvf with resource
-    connect(user=user, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user, "${pwd}", url) {
         test {
                 sql """
                     SELECT * FROM S3 (
@@ -218,7 +221,7 @@ suite("test_s3_tvf_with_resource", "p0") {
     }
 
     // only have select_priv of view,can select view with resource
-    connect(user=user, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user, "${pwd}", url) {
             sql """SELECT * FROM ${viewName};"""
     }
 

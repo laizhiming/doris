@@ -18,16 +18,14 @@
 package org.apache.doris.job.executor;
 
 import org.apache.doris.job.base.AbstractJob;
-import org.apache.doris.job.common.JobStatus;
 import org.apache.doris.job.common.JobType;
 import org.apache.doris.job.common.TaskType;
-import org.apache.doris.job.disruptor.TaskDisruptor;
 import org.apache.doris.job.disruptor.TimerJobEvent;
 import org.apache.doris.job.task.AbstractTask;
 
 import com.lmax.disruptor.WorkHandler;
 import lombok.extern.log4j.Log4j2;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 import java.util.List;
 import java.util.Map;
@@ -40,9 +38,9 @@ import java.util.Map;
 @Log4j2
 public class DispatchTaskHandler<T extends AbstractJob> implements WorkHandler<TimerJobEvent<T>> {
 
-    private final Map<JobType, TaskDisruptor<T>> disruptorMap;
+    private final Map<JobType, TaskProcessor> disruptorMap;
 
-    public DispatchTaskHandler(Map<JobType, TaskDisruptor<T>> disruptorMap) {
+    public DispatchTaskHandler(Map<JobType, TaskProcessor> disruptorMap) {
         this.disruptorMap = disruptorMap;
     }
 
@@ -56,7 +54,7 @@ public class DispatchTaskHandler<T extends AbstractJob> implements WorkHandler<T
                 log.info("job is null,may be job is deleted, ignore");
                 return;
             }
-            if (event.getJob().isReadyForScheduling(null) && event.getJob().getJobStatus() == JobStatus.RUNNING) {
+            if (event.getJob().isReadyForScheduling(null) && event.getJob().isJobRunning()) {
                 List<? extends AbstractTask> tasks = event.getJob().commonCreateTasks(TaskType.SCHEDULED, null);
                 if (CollectionUtils.isEmpty(tasks)) {
                     log.warn("job is ready for scheduling, but create task is empty, skip scheduler,"
@@ -66,7 +64,10 @@ public class DispatchTaskHandler<T extends AbstractJob> implements WorkHandler<T
                 }
                 JobType jobType = event.getJob().getJobType();
                 for (AbstractTask task : tasks) {
-                    disruptorMap.get(jobType).publishEvent(task, event.getJob().getJobConfig());
+                    if (!disruptorMap.get(jobType).addTask(task)) {
+                        task.cancel(true);
+                        continue;
+                    }
                     log.info("dispatch timer job success, job id is {},  task id is {}",
                             event.getJob().getJobId(), task.getTaskId());
                 }

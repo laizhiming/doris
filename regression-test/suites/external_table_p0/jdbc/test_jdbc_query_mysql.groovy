@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docker_mysql") {
+suite("test_jdbc_query_mysql", "p0,external") {
 
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "http://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "http://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
 
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String mysql_57_port = context.config.otherConfigs.get("mysql_57_port")
@@ -233,17 +233,17 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
         """
         sql  """ 
               INSERT INTO ${inDorisTable1} (game_code,plat_code,sid,name,`day`,merged_to,merge_count,merge_path,merge_time,merge_history_time,open_time,open_day,time_zone,state) VALUES
-                ('mus','plat_code',310132,'aa','2020-05-25',310200,NULL,NULL,1609726391000,1609726391000,1590406370000,606,'GMT+8',2),
-                ('mus','plat_code',310078,'aa','2020-05-05',310140,NULL,NULL,1620008473000,1604284571000,1588690010001,626,'GMT+8',2),
-                ('mus','plat_code',310118,'aa','2020-05-19',310016,NULL,NULL,1641178695000,1614565485000,1589871140001,612,'GMT+8',2),
-                ('mus','plat_code',421110,'aa','2020-05-24',421116,NULL,NULL,1641178695000,1635732967000,1590285600000,607,'GMT+8',2),
-                ('mus','plat_code',300417,'aa','2019-08-31',300499,NULL,NULL,1617590476000,1617590476000,1567243760000,874,'GMT+8',2),
-                ('mus','plat_code',310030,'aa','2020-04-25',310140,NULL,NULL,1620008473000,1604284571000,1587780830000,636,'GMT+8',2),
-                ('mus','plat_code',310129,'aa','2020-05-24',310033,NULL,NULL,1641178695000,1604284571000,1590274340000,607,'GMT+8',2),
-                ('mus','plat_code',310131,'aa','2020-05-25',310016,NULL,NULL,1604284571000,1604284571000,1590378830000,606,'GMT+8',2),
-                ('mus','plat_code',410083,'aa','2020-02-04',410114,NULL,NULL,1627872240000,1627872240000,1580749850000,717,'GMT+8',2),
-                ('mus','plat_code',310128,'aa','2020-05-23',310128,2,'310180,310114,310112,310107,310080,310076,310065,310066,310054,310038,310036,310018,310011,310012,310032,310031',1630895172000,NULL,1590226280000,608,'GMT+8',1),
-                ('mus','plat_code',410052,'aa','2019-12-17',410111,2,'410038,410028',1641178752000,1641178752000,1576517330000, 766,'GMT+8',2);
+                ('mus','plat_code',310132,'aa','2020-05-25',310200,NULL,NULL,1609726391000,1609726391000,1590406370000,606,'+08:00',2),
+                ('mus','plat_code',310078,'aa','2020-05-05',310140,NULL,NULL,1620008473000,1604284571000,1588690010001,626,'+08:00',2),
+                ('mus','plat_code',310118,'aa','2020-05-19',310016,NULL,NULL,1641178695000,1614565485000,1589871140001,612,'+08:00',2),
+                ('mus','plat_code',421110,'aa','2020-05-24',421116,NULL,NULL,1641178695000,1635732967000,1590285600000,607,'+08:00',2),
+                ('mus','plat_code',300417,'aa','2019-08-31',300499,NULL,NULL,1617590476000,1617590476000,1567243760000,874,'+08:00',2),
+                ('mus','plat_code',310030,'aa','2020-04-25',310140,NULL,NULL,1620008473000,1604284571000,1587780830000,636,'+08:00',2),
+                ('mus','plat_code',310129,'aa','2020-05-24',310033,NULL,NULL,1641178695000,1604284571000,1590274340000,607,'+08:00',2),
+                ('mus','plat_code',310131,'aa','2020-05-25',310016,NULL,NULL,1604284571000,1604284571000,1590378830000,606,'+08:00',2),
+                ('mus','plat_code',410083,'aa','2020-02-04',410114,NULL,NULL,1627872240000,1627872240000,1580749850000,717,'+08:00',2),
+                ('mus','plat_code',310128,'aa','2020-05-23',310128,2,'310180,310114,310112,310107,310080,310076,310065,310066,310054,310038,310036,310018,310011,310012,310032,310031',1630895172000,NULL,1590226280000,608,'+08:00',1),
+                ('mus','plat_code',410052,'aa','2019-12-17',410111,2,'410038,410028',1641178752000,1641178752000,1576517330000, 766,'+08:00',2);
         """
         order_qt_sql  """
                 select l.game_code, l.plat_code, l.org_sid, l.account, l.playerid, l.gid gid_code, l.pid pid_code, 
@@ -662,32 +662,32 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
         """
         order_qt_sql """ 
         with tmp_media_purchase as (
-            select media_order_id, supplier_id, agent_policy_type, agent_policy, capital_type, petty_cash_type, 
+            select media_order_id, supplier_id, cast(agent_policy_type as string) as agent_policy_type, agent_policy, capital_type, petty_cash_type, 
                 recharge_amount, need_actual_amount, voucher_url, m.`ctime`, m.`mtime`, m.`is_delete`, media_remark, 
                 account_number, currency_type, order_source, `name`
         from ${exMysqlTable2} m left join ${exMysqlTable1} s on s.id = m.supplier_id where m.is_delete = 0),
         t1 as (select media_order_id, from_unixtime(MIN(ctime), '%Y-%m-%d') AS first_payment_date,
               from_unixtime(max(ctime), '%Y-%m-%d') AS last_payment_date,
               sum(IFNULL(recharge_amount, 0.00)) recharge_total_amount,
-              sum(case when capital_type = '2' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_amount,
-              sum(case when capital_type = '2' and petty_cash_type = '1' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_change_amount,
-              sum(case when capital_type = '2' and petty_cash_type = '2' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_recharge_amount,
-              sum(case when capital_type = '2' and petty_cash_type = '3' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_return_amount,
-              sum(case when capital_type = '3' then IFNULL(need_actual_amount, 0.00) else 0.00 end) as return_goods_amount,
+              sum(case when capital_type = 2 then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_amount,
+              sum(case when capital_type = 2 and petty_cash_type = '1' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_change_amount,
+              sum(case when capital_type = 2 and petty_cash_type = '2' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_recharge_amount,
+              sum(case when capital_type = 2 and petty_cash_type = '3' then IFNULL(recharge_amount, 0.00) else 0.00 end) as petty_return_amount,
+              sum(case when capital_type = 3 then IFNULL(need_actual_amount, 0.00) else 0.00 end) as return_goods_amount,
               GROUP_CONCAT(cast(supplier_id as varchar (12)) order by supplier_id) supplier_id_list
        from tmp_media_purchase group by media_order_id),
-        t2 as (select media_order_id, GROUP_CONCAT((case agent_policy_type 
+        t2 as (select media_order_id, GROUP_CONCAT((case cast(agent_policy_type as string)
         when '1' then 'A' when '2' then 'B' when '3' then 'C' when '4' then 'D' when '5' then 'E' when '6' then 'F'
         when '7' then 'G' when '8' then 'H' when '9' then 'I' when '10' then 'J' when '11' then 'K' when '12' then 'L'
-        when '13' then 'M'  else agent_policy_type end) order by agent_policy_type) agent_policy_type_list
+        when '13' then 'M'  else cast(agent_policy_type as string) end) order by agent_policy_type) agent_policy_type_list
        from tmp_media_purchase group by media_order_id),
        t3 as (select media_order_id, GROUP_CONCAT(cast(agent_policy as varchar (12)) order by agent_policy) agent_policy_list
        from tmp_media_purchase group by media_order_id),
-       t4 as (select media_order_id, GROUP_CONCAT((case capital_type
-        when '1' then 'A' when '2' then 'B' when '3' then 'C' else capital_type end) order by capital_type) capital_type_list
+       t4 as (select media_order_id, GROUP_CONCAT((case cast(capital_type as string)
+        when '1' then 'A' when '2' then 'B' when '3' then 'C' else cast(capital_type as string) end) order by capital_type) capital_type_list
        from tmp_media_purchase group by media_order_id),
-       t5 as (select media_order_id, GROUP_CONCAT((case petty_cash_type
-        when '1' then 'A' when '2' then 'B' when '3' then 'C' else petty_cash_type end) order by petty_cash_type) petty_cash_type_list
+       t5 as (select media_order_id, GROUP_CONCAT((case cast(petty_cash_type as string)
+        when '1' then 'A' when '2' then 'B' when '3' then 'C' else cast(petty_cash_type as string) end) order by petty_cash_type) petty_cash_type_list
        from tmp_media_purchase group by media_order_id),
        t6 as (select media_order_id, GROUP_CONCAT(`name` order by `name`) company_name_list
             from tmp_media_purchase group by media_order_id)
@@ -785,8 +785,9 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
 
         // test for distribute queries
         order_qt_sql38 """ SELECT count(*) FROM ${exMysqlTable} WHERE id IN (SELECT k8 FROM $jdbcMysql57Table1 WHERE k8 > 111); """
-        sql """ create view if not exists aview as select k7, k8 from $jdbcMysql57Table1; """
-        order_qt_sql39 """ SELECT * FROM aview a JOIN aview b on a.k8 = b.k8 order by a.k8 desc limit 5 """
+        sql """ drop view if exists aview_mysql """
+        sql """ create view if not exists aview_mysql as select k7, k8 from $jdbcMysql57Table1; """
+        order_qt_sql39 """ SELECT * FROM aview_mysql a JOIN aview_mysql b on a.k8 = b.k8 order by a.k8 desc limit 5 """
         order_qt_sql42 """ SELECT * FROM (SELECT * FROM $jdbcMysql57Table1 WHERE k8 % 8 = 0) l JOIN ${exMysqlTable} o ON l.k8 = o.id """
         order_qt_sql43 """ SELECT * FROM (SELECT * FROM $jdbcMysql57Table1 WHERE k8 % 8 = 0) l LEFT JOIN ${exMysqlTable} o ON l.k8 = o.id order by k8 limit 5"""
         order_qt_sql44 """ SELECT * FROM (SELECT * FROM $jdbcMysql57Table1 WHERE k8 % 8 = 0) l RIGHT JOIN ${exMysqlTable} o ON l.k8 = o.id"""
@@ -806,8 +807,9 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
         order_qt_sql49 """ SELECT * FROM (SELECT * FROM $jdbcMysql57Table1 WHERE k8 % 120 > 110) l
                             JOIN (SELECT *, COUNT(1) OVER (PARTITION BY id ORDER BY id) FROM ${exMysqlTable}) o ON l.k8 = o.id """
         order_qt_sql50 """ SELECT COUNT(*) FROM $jdbcMysql57Table1 as a LEFT OUTER JOIN ${exMysqlTable} as b ON a.k8 = b.id AND a.k8 > 111 WHERE a.k8 < 114 """
-        order_qt_sql51 """ SELECT count(*) > 0 FROM $jdbcMysql57Table1 JOIN ${exMysqlTable} ON (cast(1.2 AS FLOAT) = CAST(1.2 AS decimal(2,1))) """
-        order_qt_sql52 """ SELECT count(*) > 0 FROM $jdbcMysql57Table1 JOIN ${exMysqlTable} ON CAST((CASE WHEN (TRUE IS NOT NULL) THEN '1.2' ELSE '1.2' END) AS FLOAT) = CAST(1.2 AS decimal(2,1)) """
+        // float/double compare is not accurate, should not depend on it
+        // order_qt_sql51 """ SELECT count(*) > 0 FROM $jdbcMysql57Table1 JOIN ${exMysqlTable} ON (cast(1.2 AS FLOAT) = CAST(1.2 AS decimal(2,1))) """
+        // order_qt_sql52 """ SELECT count(*) > 0 FROM $jdbcMysql57Table1 JOIN ${exMysqlTable} ON CAST((CASE WHEN (TRUE IS NOT NULL) THEN '1.2' ELSE '1.2' END) AS FLOAT) = CAST(1.2 AS decimal(2,1)) """
         order_qt_sql53 """ SELECT SUM(k8) FROM $jdbcMysql57Table1 as a JOIN ${exMysqlTable} as b ON a.k8 = CASE WHEN b.id % 2 = 0 and b.name = 'abc' THEN b.id ELSE NULL END """
         order_qt_sql54 """ SELECT COUNT(*) FROM $jdbcMysql57Table1 a JOIN ${exMysqlTable} b on not (a.k8 <> b.id) """
         order_qt_sql55 """ SELECT COUNT(*) FROM $jdbcMysql57Table1 a JOIN ${exMysqlTable} b on not not not (a.k8 = b.id)  """
@@ -887,7 +889,7 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
         order_qt_sql84 """ SELECT NULL, NULL INTERSECT SELECT NULL, NULL FROM $jdbcMysql57Table1 """
         order_qt_sql85 """ SELECT COUNT(*) FROM $jdbcMysql57Table1 INTERSECT SELECT COUNT(k8) FROM $jdbcMysql57Table1 HAVING SUM(k7) IS NOT NULL """
         order_qt_sql86 """ SELECT k8 FROM $jdbcMysql57Table1 WHERE k8 < 7 EXCEPT SELECT k8 FROM $jdbcMysql57Table1 WHERE k8 > 21 """
-        order_qt_sql87 """ SELECT row_number() OVER (PARTITION BY k7) rn, k8 FROM $jdbcMysql57Table1 LIMIT 3 """
+        order_qt_sql87 """ SELECT row_number() OVER (PARTITION BY k7 ORDER BY k8) rn, k8 FROM $jdbcMysql57Table1 LIMIT 3 """
         order_qt_sql88 """ SELECT row_number() OVER (PARTITION BY k7 ORDER BY k8) rn FROM $jdbcMysql57Table1 LIMIT 3 """
         order_qt_sql89 """ SELECT row_number() OVER (ORDER BY k8) rn FROM $jdbcMysql57Table1 LIMIT 3 """
         order_qt_sql90 """ SELECT row_number() OVER () FROM $jdbcMysql57Table1 as a JOIN ${exMysqlTable} as b ON a.k8 = b.id WHERE a.k8 > 111 LIMIT 2 """
@@ -940,35 +942,131 @@ suite("test_jdbc_query_mysql", "p0,external,mysql,external_docker,external_docke
         order_qt_sql111 """ SELECT rank() OVER () FROM (SELECT k8 FROM $jdbcMysql57Table1 LIMIT 10) as t LIMIT 3 """
         order_qt_sql112 """ SELECT k7, count(DISTINCT k8) FROM $jdbcMysql57Table1 WHERE k8 > 110 GROUP BY GROUPING SETS ((), (k7)) """
 
+        // test function rules
+        sql  """ drop table if exists jdbc_table_function_rule """
+        test {
+            sql  """ 
+                    CREATE EXTERNAL TABLE `jdbc_table_function_rule` (
+                       `products_id` int(11) NOT NULL,
+                       `orders_id` int(11) NOT NULL,
+                       `sales_add_time` datetime NOT NULL,
+                       `sales_update_time` datetime NOT NULL,
+                       `finance_admin` int(11) NOT NULL
+                    ) ENGINE=JDBC
+                    COMMENT "JDBC Mysql 外部表"
+                    PROPERTIES (
+                    "resource" = "$jdbcResourceMysql57",
+                    "table" = "ex_tb4",
+                    "table_type"="mysql",
+                    "function_rules" = '{"pushdown" : {"supported" : [null]}}'
+                    ); 
+            """
+
+            exception """Failed to parse push down rules: {"pushdown" : {"supported" : [null]}}"""
+        }
+
+        sql  """ 
+                CREATE EXTERNAL TABLE `jdbc_table_function_rule` (
+                   `products_id` int(11) NOT NULL,
+                   `orders_id` int(11) NOT NULL,
+                   `sales_add_time` datetime NOT NULL,
+                   `sales_update_time` datetime NOT NULL,
+                   `finance_admin` int(11) NOT NULL
+                ) ENGINE=JDBC
+                COMMENT "JDBC Mysql 外部表"
+                PROPERTIES (
+                "resource" = "$jdbcResourceMysql57",
+                "table" = "ex_tb4",
+                "table_type"="mysql",
+                "function_rules" = '{"pushdown" : {"supported" : ["date_trunc"]}}'
+                ); 
+        """
+        explain {
+            sql """select products_id from jdbc_table_function_rule where abs(products_id) > 0 and date_trunc(`sales_add_time`, "month") = "2013-10-01 00:00:00";"""
+            contains """QUERY: SELECT `products_id`, `sales_add_time` FROM `ex_tb4` WHERE (date_trunc(`sales_add_time`, 'month') = '2013-10-01 00:00:00')"""
+            contains """PREDICATES: ((abs(products_id[#0]) > 0) AND (date_trunc(sales_add_time[#2], 'month') = '2013-10-01 00:00:00'))"""
+        }
+
+        sql """drop table jdbc_table_function_rule"""
+        sql  """ 
+                CREATE EXTERNAL TABLE `jdbc_table_function_rule` (
+                   `products_id` int(11) NOT NULL,
+                   `orders_id` int(11) NOT NULL,
+                   `sales_add_time` datetime NOT NULL,
+                   `sales_update_time` datetime NOT NULL,
+                   `finance_admin` int(11) NOT NULL
+                ) ENGINE=JDBC
+                COMMENT "JDBC Mysql 外部表"
+                PROPERTIES (
+                "resource" = "$jdbcResourceMysql57",
+                "table" = "ex_tb4",
+                "table_type"="mysql",
+                "function_rules" = ''
+                ); 
+        """
+        explain {
+            sql """select products_id from jdbc_table_function_rule where abs(products_id) > 0 and date_trunc(`sales_add_time`, "month") = "2013-10-01 00:00:00";"""
+            contains """QUERY: SELECT `products_id`, `sales_add_time` FROM `ex_tb4` WHERE ((abs(`products_id`) > 0))"""
+            contains """PREDICATES: ((abs(products_id[#0]) > 0) AND (date_trunc(sales_add_time[#2], 'month') = '2013-10-01 00:00:00'))"""
+        }
+
+        sql """drop table jdbc_table_function_rule"""
+        sql  """ 
+                CREATE EXTERNAL TABLE `jdbc_table_function_rule` (
+                   `products_id` int(11) NOT NULL,
+                   `orders_id` int(11) NOT NULL,
+                   `sales_add_time` datetime NOT NULL,
+                   `sales_update_time` datetime NOT NULL,
+                   `finance_admin` int(11) NOT NULL
+                ) ENGINE=JDBC
+                COMMENT "JDBC Mysql 外部表"
+                PROPERTIES (
+                "resource" = "$jdbcResourceMysql57",
+                "table" = "ex_tb4",
+                "table_type"="mysql",
+                "function_rules" = '{"pushdown" : {"supported": ["date_trunc"], "unsupported" : ["abs"]}}'
+                ); 
+        """
+        explain {
+            sql """select products_id from jdbc_table_function_rule where abs(products_id) > 0 and date_trunc(`sales_add_time`, "month") = "2013-10-01 00:00:00";"""
+            contains """QUERY: SELECT `products_id`, `sales_add_time` FROM `ex_tb4` WHERE (date_trunc(`sales_add_time`, 'month') = '2013-10-01 00:00:00')"""
+            contains """PREDICATES: ((abs(products_id[#0]) > 0) AND (date_trunc(sales_add_time[#2], 'month') = '2013-10-01 00:00:00'))"""
+        }
+
+        // test rewrite
+        sql """drop table jdbc_table_function_rule"""
+        sql  """ 
+                CREATE EXTERNAL TABLE `jdbc_table_function_rule` (
+                   `products_id` int(11) NOT NULL,
+                   `orders_id` int(11) NOT NULL,
+                   `sales_add_time` datetime NOT NULL,
+                   `sales_update_time` datetime NOT NULL,
+                   `finance_admin` int(11) NOT NULL
+                ) ENGINE=JDBC
+                COMMENT "JDBC Mysql 外部表"
+                PROPERTIES (
+                "resource" = "$jdbcResourceMysql57",
+                "table" = "ex_tb4",
+                "table_type"="mysql",
+                "function_rules" = '{"pushdown" : {"supported": ["to_date"], "unsupported" : ["abs"]}, "rewrite" : {"to_date" : "date2"}}'
+                ); 
+        """
+        explain {
+            sql """select products_id from jdbc_table_function_rule where to_date(sales_add_time) = "2013-10-01" and  abs(products_id) > 0 and date_trunc(`sales_add_time`, "month") = "2013-10-01 00:00:00";"""
+            contains """QUERY: SELECT `products_id`, `sales_add_time` FROM `ex_tb4` WHERE (date2(`sales_add_time`) = '2013-10-01')"""
+            contains """PREDICATES: (((to_date(sales_add_time[#2]) = '2013-10-01') AND (abs(products_id[#0]) > 0)) AND (date_trunc(sales_add_time[#2], 'month') = '2013-10-01 00:00:00'))"""
+        }
+
         // TODO: check this, maybe caused by datasource in JDBC
         // test alter resource
-        sql """alter resource $jdbcResourceMysql57 properties("password" = "1234567")"""
-        test {
-            sql """select count(*) from $jdbcMysql57Table1"""
-            exception "Access denied for user"
+        if (!isCloudMode()) {
+            sql """alter resource $jdbcResourceMysql57 properties("password" = "1234567")"""
+            test {
+                sql """select count(*) from $jdbcMysql57Table1"""
+                exception "Access denied for user"
+            }
+            sql """alter resource $jdbcResourceMysql57 properties("password" = "123456")"""
         }
-        sql """alter resource $jdbcResourceMysql57 properties("password" = "123456")"""
-
-//         // test for type check
-//         sql  """ drop table if exists ${exMysqlTypeTable} """
-//         sql  """
-//                CREATE EXTERNAL TABLE ${exMysqlTypeTable} (
-//                `id` bigint NOT NULL,
-//                `count_value` varchar(100) NULL
-//                ) ENGINE=JDBC
-//                COMMENT "JDBC Mysql 外部表"
-//                PROPERTIES (
-//                 "resource" = "$jdbcResourceMysql57",
-//                 "table" = "ex_tb2",
-//                 "table_type"="mysql"
-//                );
-//         """
-//
-//         test {
-//             sql """select * from ${exMysqlTypeTable} order by id"""
-//             exception "Fail to convert jdbc type of java.lang.Integer to doris type BIGINT on column: id"
-//         }
-
     }
 }
 

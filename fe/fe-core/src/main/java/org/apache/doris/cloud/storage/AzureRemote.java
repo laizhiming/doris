@@ -17,7 +17,10 @@
 
 package org.apache.doris.cloud.storage;
 
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.Pair;
+import org.apache.doris.datasource.property.storage.AzureProperties;
 
 import com.azure.core.credential.AccessToken;
 import com.azure.core.credential.TokenCredential;
@@ -36,8 +39,11 @@ import com.azure.storage.blob.batch.BlobBatchClientBuilder;
 import com.azure.storage.blob.models.BlobItem;
 import com.azure.storage.blob.models.BlobProperties;
 import com.azure.storage.blob.models.BlobStorageException;
+import com.azure.storage.blob.models.BlockBlobItem;
 import com.azure.storage.blob.models.ListBlobsOptions;
+import com.azure.storage.blob.models.ParallelTransferOptions;
 import com.azure.storage.blob.models.UserDelegationKey;
+import com.azure.storage.blob.options.BlobUploadFromFileOptions;
 import com.azure.storage.blob.sas.BlobContainerSasPermission;
 import com.azure.storage.blob.sas.BlobSasPermission;
 import com.azure.storage.blob.sas.BlobServiceSasSignatureValues;
@@ -50,15 +56,16 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import reactor.core.publisher.Mono;
 
+import java.io.File;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 public class AzureRemote extends RemoteBase {
 
     private static final Logger LOG = LogManager.getLogger(AzureRemote.class);
-
-    private static final String URI_TEMPLATE = "https://%s.blob.core.windows.net/%s";
 
     private BlobContainerClient client;
 
@@ -72,8 +79,8 @@ public class AzureRemote extends RemoteBase {
             BlobContainerClientBuilder builder = new BlobContainerClientBuilder();
             builder.credential(new StorageSharedKeyCredential(obj.getAk(), obj.getSk()));
             String containerName = obj.getBucket();
-            String uri = String.format(URI_TEMPLATE, obj.getAk(),
-                    containerName);
+            String endpoint = AzureProperties.formatAzureEndpoint(obj.getEndpoint(), obj.getAk());
+            String uri = endpoint + "/" + containerName;
             builder.endpoint(uri);
             BlobContainerClient containerClient = builder.buildClient();
 
@@ -134,8 +141,8 @@ public class AzureRemote extends RemoteBase {
             BlobContainerClientBuilder builder = new BlobContainerClientBuilder();
             builder.credential(new StorageSharedKeyCredential(obj.getAk(), obj.getSk()));
             String containerName = obj.getBucket();
-            String uri = String.format(URI_TEMPLATE, obj.getAk(),
-                    containerName);
+            String endpoint = AzureProperties.formatAzureEndpoint(obj.getEndpoint(), obj.getAk());
+            String uri = endpoint + "/" + containerName;
             builder.endpoint(uri);
             BlobContainerClient containerClient = builder.buildClient();
             BlobServiceClient blobServiceClient = containerClient.getServiceClient();
@@ -191,6 +198,80 @@ public class AzureRemote extends RemoteBase {
     }
 
     @Override
+    public void putObject(File file, String key) throws DdlException {
+        initClient();
+        try {
+            BlobClient blobClient = client.getBlobClient(key);
+            blobClient.uploadFromFile(file.getAbsolutePath());
+        } catch (BlobStorageException e) {
+            LOG.warn("Failed to put object for Azure", e);
+            throw new DdlException("Failed to put object for Azure, Error message=" + e.getMessage());
+        }
+    }
+
+    @Override
+    public void multipartUploadObject(File file, String key, Function<String, Pair<Boolean, String>> function)
+            throws DdlException {
+        long fileSize = file.length();
+        if (fileSize <= Config.multi_part_upload_part_size_in_bytes) {
+            putObject(file, key);
+            return;
+        }
+
+        if (function != null) {
+            Pair<Boolean, String> result = function.apply("azure");
+            if (!result.first) {
+                LOG.warn("Failed to multipart upload object, file: {}, key: {}, reason: {}",
+                        file.getAbsolutePath(), key, result.second == null ? "" : result.second);
+                throw new DdlException("Failed to multi part upload object, reason: "
+                        + (result.second == null ? "" : result.second));
+            }
+        }
+
+        long start = System.currentTimeMillis();
+        initClient();
+        // https://docs.azure.cn/zh-cn/storage/blobs/storage-blob-upload-java
+        // https://learn.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
+        ParallelTransferOptions parallelTransferOptions = new ParallelTransferOptions()
+                .setBlockSizeLong(Config.multi_part_upload_part_size_in_bytes)
+                .setMaxConcurrency(Config.multi_part_upload_pool_size)
+                .setMaxSingleUploadSizeLong(Config.multi_part_upload_part_size_in_bytes);
+        BlobUploadFromFileOptions options = new BlobUploadFromFileOptions(file.getAbsolutePath());
+        options.setParallelTransferOptions(parallelTransferOptions);
+        try {
+            BlobClient blobClient = client.getBlobClient(key);
+            Response<BlockBlobItem> blockBlob = blobClient.uploadFromFileWithResponse(options,
+                    Duration.ofSeconds(Config.multi_part_upload_max_seconds), null);
+            LOG.info("Finish multipart upload file: {}, size: {}, key: {}, etag: {}, cost {} ms",
+                    file.getAbsolutePath(), fileSize, key, blockBlob.getValue().getETag(),
+                    System.currentTimeMillis() - start);
+        } catch (Exception e) {
+            LOG.warn("Failed to put object for Azure", e);
+            try {
+                // delete uncommitted blobs
+                // https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob?tabs=microsoft-entra-id#remarks
+                BlobClient blobClient = client.getBlobClient(key);
+                blobClient.deleteIfExists();
+            } catch (Exception ex) {
+                LOG.warn("Failed to delete object after multipart upload failed, key={}", key, ex);
+            }
+            throw new DdlException("Failed to put object for Azure, Error message=" + e.getMessage());
+        }
+    }
+
+    @Override
+    public void getObject(String key, String file) throws DdlException {
+        initClient();
+        try {
+            BlobClient blobClient = client.getBlobClient(key);
+            blobClient.downloadToFile(file);
+        } catch (BlobStorageException e) {
+            LOG.warn("Failed to get object for Azure", e);
+            throw new DdlException("Failed to get object for Azure, Error message=" + e.getMessage());
+        }
+    }
+
+    @Override
     public void close() {
         client = null;
     }
@@ -212,10 +293,10 @@ public class AzureRemote extends RemoteBase {
                 objectFiles.add(new ObjectFile(blobItem.getName(), getRelativePath(blobItem.getName()),
                         blobItem.getProperties().getETag(), blobItem.getProperties().getContentLength()));
             }
-            return new ListObjectsResult(objectFiles, pagedResponse.getContinuationToken() == null,
+            return new ListObjectsResult(objectFiles, pagedResponse.getContinuationToken() != null,
                     pagedResponse.getContinuationToken());
         } catch (BlobStorageException e) {
-            LOG.warn("Failed to list objects for Azure", e);
+            LOG.warn("Failed to list objects for Azure prefix {}", prefix, e);
             throw new DdlException("Failed to list objects for Azure, Error message=" + e.getMessage());
         }
     }
@@ -229,8 +310,8 @@ public class AzureRemote extends RemoteBase {
                 builder.credential(new StorageSharedKeyCredential(obj.getAk(), obj.getSk()));
             }
             String containerName = obj.getBucket();
-            String uri = String.format(URI_TEMPLATE, obj.getAk(),
-                    containerName);
+            String endpoint = AzureProperties.formatAzureEndpoint(obj.getEndpoint(), obj.getAk());
+            String uri = endpoint + "/" + containerName;
             builder.endpoint(uri);
             client = builder.buildClient();
         }

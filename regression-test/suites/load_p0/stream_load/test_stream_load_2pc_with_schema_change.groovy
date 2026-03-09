@@ -27,11 +27,14 @@ suite("test_stream_load_2pc_with_schema_change", "p0") {
                 " -H txn_id:${txnId}" +
                 " -H txn_operation:commit" +
                 " http://${context.config.feHttpAddress}/api/${db}/${tableName}/_stream_load_2pc"
+        if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+            command = command.replace("http://", "https://") + " --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey")
+        }
         log.info("http_stream execute 2pc: ${command}")
 
         def process = command.execute()
-        code = process.waitFor()
-        out = process.text
+        def code = process.waitFor()
+        def out = process.text
         log.info("http_stream 2pc result: ${out}".toString())
         def json2pc = parseJson(out)
         return json2pc
@@ -84,7 +87,7 @@ suite("test_stream_load_2pc_with_schema_change", "p0") {
 
     Thread.sleep(5000) // 5s
 
-    json2pc = do_streamload_2pc_commit_by_txn_id.call(txnId)
+    def json2pc = do_streamload_2pc_commit_by_txn_id.call(txnId)
     assertEquals("success", json2pc.status.toLowerCase())
 
     waitForSchemaChangeDone {

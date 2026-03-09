@@ -59,16 +59,6 @@ public class ScheduleRule {
                 && jobRoutine.pauseReason.getCode() != InternalErrorCode.MANUAL_PAUSE_ERR
                 && jobRoutine.pauseReason.getCode() != InternalErrorCode.TOO_MANY_FAILURE_ROWS_ERR
                 && jobRoutine.pauseReason.getCode() != InternalErrorCode.CANNOT_RESUME_ERR) {
-            int dead = deadBeCount();
-            if (dead > Config.max_tolerable_backend_down_num) {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("dead backend num {} is larger than config {}, "
-                                    + "routine load job {} can not be auto rescheduled",
-                            dead, Config.max_tolerable_backend_down_num, jobRoutine.id);
-                }
-                return false;
-            }
-
             if (jobRoutine.latestResumeTimestamp == 0) { //the first resume
                 jobRoutine.latestResumeTimestamp = System.currentTimeMillis();
                 jobRoutine.autoResumeCount = 1;
@@ -76,16 +66,16 @@ public class ScheduleRule {
             } else {
                 long current = System.currentTimeMillis();
                 if (current - jobRoutine.latestResumeTimestamp < Config.period_of_auto_resume_min * 60000L) {
-                    long autoResumeIntervalTimeSec =
-                            Math.min((long) Math.pow(2, jobRoutine.autoResumeCount) * BACK_OFF_BASIC_TIME_SEC,
-                                    MAX_BACK_OFF_TIME_SEC);
+                    long autoResumeIntervalTimeSec = calAutoResumeInterval(jobRoutine);
                     if (current - jobRoutine.latestResumeTimestamp > autoResumeIntervalTimeSec * 1000L) {
                         LOG.info("try to auto reschedule routine load {}, latestResumeTimestamp: {},"
                                 + "  autoResumeCount: {}, pause reason: {}",
                                 jobRoutine.id, jobRoutine.latestResumeTimestamp, jobRoutine.autoResumeCount,
                                 jobRoutine.pauseReason == null ? "null" : jobRoutine.pauseReason.getCode().name());
                         jobRoutine.latestResumeTimestamp = System.currentTimeMillis();
-                        jobRoutine.autoResumeCount++;
+                        if (jobRoutine.autoResumeCount < Long.MAX_VALUE) {
+                            jobRoutine.autoResumeCount++;
+                        }
                         return true;
                     }
                 } else {
@@ -103,5 +93,11 @@ public class ScheduleRule {
             }
         }
         return false;
+    }
+
+    public static long calAutoResumeInterval(RoutineLoadJob jobRoutine) {
+        return jobRoutine.autoResumeCount < 5
+                    ? Math.min((long) Math.pow(2, jobRoutine.autoResumeCount) * BACK_OFF_BASIC_TIME_SEC,
+                            MAX_BACK_OFF_TIME_SEC) : MAX_BACK_OFF_TIME_SEC;
     }
 }

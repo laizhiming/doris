@@ -17,17 +17,14 @@
 
 package org.apache.doris.load.routineload;
 
-import org.apache.doris.analysis.CreateRoutineLoadStmt;
 import org.apache.doris.analysis.ImportSequenceStmt;
-import org.apache.doris.analysis.LabelName;
-import org.apache.doris.analysis.ParseNode;
-import org.apache.doris.analysis.PartitionNames;
 import org.apache.doris.analysis.Separator;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.info.PartitionNamesInfo;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.LabelAlreadyUsedException;
@@ -41,6 +38,11 @@ import org.apache.doris.load.RoutineLoadDesc;
 import org.apache.doris.load.loadv2.LoadTask;
 import org.apache.doris.load.routineload.kafka.KafkaConfiguration;
 import org.apache.doris.load.routineload.kafka.KafkaDataSourceProperties;
+import org.apache.doris.mysql.privilege.MockedAuth;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateRoutineLoadInfo;
+import org.apache.doris.nereids.trees.plans.commands.info.LabelNameInfo;
+import org.apache.doris.nereids.trees.plans.commands.load.LoadProperty;
+import org.apache.doris.nereids.trees.plans.commands.load.LoadSeparator;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TResourceInfo;
@@ -65,6 +67,7 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -74,13 +77,13 @@ public class KafkaRoutineLoadJobTest {
 
     private String jobName = "job1";
     private String dbName = "db1";
-    private LabelName labelName = new LabelName(dbName, jobName);
+    private LabelNameInfo labelNameInfo = new LabelNameInfo(dbName, jobName);
     private String tableNameString = "table1";
     private String topicName = "topic1";
     private String serverAddress = "http://127.0.0.1:8080";
     private String kafkaPartitionString = "1,2,3";
 
-    private PartitionNames partitionNames;
+    private PartitionNamesInfo partitionNames;
 
     private Separator columnSeparator = new Separator(",");
 
@@ -93,9 +96,11 @@ public class KafkaRoutineLoadJobTest {
 
     @Before
     public void init() {
+        MockedAuth.mockedConnectContext(connectContext, "root", "192.168.1.1");
+
         List<String> partitionNameList = Lists.newArrayList();
         partitionNameList.add("p1");
-        partitionNames = new PartitionNames(false, partitionNameList);
+        partitionNames = new PartitionNamesInfo(false, partitionNameList);
     }
 
     @Test
@@ -222,7 +227,7 @@ public class KafkaRoutineLoadJobTest {
         Map<Integer, Long> partitionIdsToOffset = Maps.newHashMap();
         partitionIdsToOffset.put(100, 0L);
         KafkaTaskInfo kafkaTaskInfo = new KafkaTaskInfo(new UUID(1, 1), 1L,
-                maxBatchIntervalS * 2 * 1000, 0, partitionIdsToOffset, false);
+                maxBatchIntervalS * 2 * 1000, partitionIdsToOffset, false, -1, false);
         kafkaTaskInfo.setExecuteStartTimeMs(System.currentTimeMillis() - maxBatchIntervalS * 2 * 1000 - 1);
         routineLoadTaskInfoList.add(kafkaTaskInfo);
 
@@ -243,10 +248,11 @@ public class KafkaRoutineLoadJobTest {
     public void testFromCreateStmt(@Mocked Env env,
                                    @Injectable Database database,
             @Injectable OlapTable table) throws UserException {
-        CreateRoutineLoadStmt createRoutineLoadStmt = initCreateRoutineLoadStmt();
+        CreateRoutineLoadInfo createRoutineLoadInfo = initCreateRoutineLoadInfo();
+        createRoutineLoadInfo.validate(connectContext);
         RoutineLoadDesc routineLoadDesc = new RoutineLoadDesc(columnSeparator, null, null, null, null, partitionNames, null,
                 LoadTask.MergeType.APPEND, sequenceStmt.getSequenceColName());
-        Deencapsulation.setField(createRoutineLoadStmt, "routineLoadDesc", routineLoadDesc);
+        Deencapsulation.setField(createRoutineLoadInfo, "routineLoadDesc", routineLoadDesc);
         List<Pair<Integer, Long>> partitionIdToOffset = Lists.newArrayList();
         List<PartitionInfo> kafkaPartitionInfoList = Lists.newArrayList();
         for (String s : kafkaPartitionString.split(",")) {
@@ -258,7 +264,7 @@ public class KafkaRoutineLoadJobTest {
         dsProperties.setKafkaPartitionOffsets(partitionIdToOffset);
         Deencapsulation.setField(dsProperties, "brokerList", serverAddress);
         Deencapsulation.setField(dsProperties, "topic", topicName);
-        Deencapsulation.setField(createRoutineLoadStmt, "dataSourceProperties", dsProperties);
+        Deencapsulation.setField(createRoutineLoadInfo, "dataSourceProperties", dsProperties);
 
         long dbId = 1L;
         long tableId = 2L;
@@ -302,7 +308,7 @@ public class KafkaRoutineLoadJobTest {
             }
         };
 
-        KafkaRoutineLoadJob kafkaRoutineLoadJob = KafkaRoutineLoadJob.fromCreateStmt(createRoutineLoadStmt);
+        KafkaRoutineLoadJob kafkaRoutineLoadJob = KafkaRoutineLoadJob.fromCreateInfo(createRoutineLoadInfo, connectContext);
         Assert.assertEquals(jobName, kafkaRoutineLoadJob.getName());
         Assert.assertEquals(dbId, kafkaRoutineLoadJob.getDbId());
         Assert.assertEquals(tableId, kafkaRoutineLoadJob.getTableId());
@@ -313,12 +319,9 @@ public class KafkaRoutineLoadJobTest {
         Assert.assertEquals(sequenceStmt.getSequenceColName(), kafkaRoutineLoadJob.getSequenceCol());
     }
 
-    private CreateRoutineLoadStmt initCreateRoutineLoadStmt() {
-        List<ParseNode> loadPropertyList = new ArrayList<>();
-        loadPropertyList.add(columnSeparator);
-        loadPropertyList.add(partitionNames);
+    private CreateRoutineLoadInfo initCreateRoutineLoadInfo() {
         Map<String, String> properties = Maps.newHashMap();
-        properties.put(CreateRoutineLoadStmt.DESIRED_CONCURRENT_NUMBER_PROPERTY, "2");
+        properties.put(CreateRoutineLoadInfo.DESIRED_CONCURRENT_NUMBER_PROPERTY, "2");
         String typeName = LoadDataSourceType.KAFKA.name();
         Map<String, String> customProperties = Maps.newHashMap();
 
@@ -326,11 +329,11 @@ public class KafkaRoutineLoadJobTest {
         customProperties.put(KafkaConfiguration.KAFKA_BROKER_LIST.getName(), serverAddress);
         customProperties.put(KafkaConfiguration.KAFKA_PARTITIONS.getName(), kafkaPartitionString);
 
-        CreateRoutineLoadStmt createRoutineLoadStmt = new CreateRoutineLoadStmt(labelName, tableNameString,
-                                                                                loadPropertyList, properties,
-                                                                                typeName, customProperties,
-                                                                                LoadTask.MergeType.APPEND, "");
-        Deencapsulation.setField(createRoutineLoadStmt, "name", jobName);
-        return createRoutineLoadStmt;
+        LoadSeparator loadSeparator = new LoadSeparator(",");
+        Map<String, LoadProperty> loadPropertyMap = new HashMap<>();
+        loadPropertyMap.put(loadSeparator.getClass().getName(), loadSeparator);
+        CreateRoutineLoadInfo createRoutineLoadInfo = new CreateRoutineLoadInfo(labelNameInfo, tableNameString,
+                loadPropertyMap, properties, typeName, customProperties, LoadTask.MergeType.APPEND, "");
+        return createRoutineLoadInfo;
     }
 }

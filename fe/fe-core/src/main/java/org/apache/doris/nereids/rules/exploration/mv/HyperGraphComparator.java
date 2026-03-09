@@ -19,12 +19,14 @@ package org.apache.doris.nereids.rules.exploration.mv;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.ConflictRulesMaker;
+import org.apache.doris.nereids.jobs.joinorder.hypergraph.HyperElement;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.HyperGraph;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.bitmap.LongBitmap;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.edge.Edge;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.edge.FilterEdge;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.edge.JoinEdge;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.node.StructInfoNode;
+import org.apache.doris.nereids.rules.exploration.mv.StructInfo.ExpressionPosition;
 import org.apache.doris.nereids.rules.rewrite.PushDownFilterThroughJoin;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -35,18 +37,23 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.JoinUtils;
 
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -75,13 +82,14 @@ public class HyperGraphComparator {
     private final Map<Edge, List<? extends Expression>> pullUpViewExprWithEdge = new HashMap<>();
     private final LogicalCompatibilityContext logicalCompatibilityContext;
     // this records the slots which needs to reject null
-    // the key is the target join which should reject null, the value is a pair, the first value of the pair is the
-    // join type, the second value is also a pair which left represents the slots in the left of join that should
-    // reject null, right represents the slots in the right of join that should reject null.
+    // the key is the view join edge which should reject null, the value is a pair, the first value of the pair is the
+    // query join type, the second value is also a pair which left represents the slots in the left of view join that
+    // should reject null, right represents the slots in the right of view join that should reject null.
     private final Map<JoinEdge, Pair<JoinType, Pair<Set<Slot>, Set<Slot>>>> inferredViewEdgeWithCond = new HashMap<>();
     private List<JoinEdge> viewJoinEdgesAfterInferring;
     private List<FilterEdge> viewFilterEdgesAfterInferring;
-    private final long eliminateViewNodesMap;
+    private final long shouldEliminateViewNodesMap;
+    private long reservedShouldEliminatedViewNodes;
 
     /**
      * constructor
@@ -91,9 +99,10 @@ public class HyperGraphComparator {
         this.queryHyperGraph = queryHyperGraph;
         this.viewHyperGraph = viewHyperGraph;
         this.logicalCompatibilityContext = logicalCompatibilityContext;
-        this.eliminateViewNodesMap = LongBitmap.newBitmapDiff(
+        this.shouldEliminateViewNodesMap = LongBitmap.newBitmapDiff(
                 viewHyperGraph.getNodesMap(),
                 LongBitmap.newBitmap(logicalCompatibilityContext.getQueryToViewNodeIDMapping().values()));
+        this.reservedShouldEliminatedViewNodes = this.shouldEliminateViewNodesMap;
     }
 
     /**
@@ -149,11 +158,11 @@ public class HyperGraphComparator {
                 .forEach(e -> pullUpQueryExprWithEdge.put(e, e.getExpressions()));
         Sets.difference(getViewJoinEdgeSet(), Sets.newHashSet(queryToViewJoinEdge.values()))
                 .stream()
-                .filter(e -> !LongBitmap.isOverlap(e.getReferenceNodes(), eliminateViewNodesMap))
+                .filter(e -> !LongBitmap.isOverlap(e.getReferenceNodes(), shouldEliminateViewNodesMap))
                 .forEach(e -> pullUpViewExprWithEdge.put(e, e.getExpressions()));
         Sets.difference(getViewFilterEdgeSet(), Sets.newHashSet(queryToViewFilterEdge.values()))
                 .stream()
-                .filter(e -> !LongBitmap.isOverlap(e.getReferenceNodes(), eliminateViewNodesMap))
+                .filter(e -> !LongBitmap.isOverlap(e.getReferenceNodes(), shouldEliminateViewNodesMap))
                 .forEach(e -> pullUpViewExprWithEdge.put(e, e.getExpressions()));
 
         return buildComparisonRes();
@@ -189,7 +198,7 @@ public class HyperGraphComparator {
         // eliminate by unique
         if (joinEdge.getJoinType().isLeftOuterJoin() && joinEdge.isRightSimple()) {
             long eliminatedRight =
-                    LongBitmap.newBitmapIntersect(joinEdge.getRightExtendedNodes(), eliminateViewNodesMap);
+                    LongBitmap.newBitmapIntersect(joinEdge.getRightExtendedNodes(), reservedShouldEliminatedViewNodes);
             if (LongBitmap.getCardinality(eliminatedRight) != 1) {
                 return false;
             }
@@ -197,8 +206,14 @@ public class HyperGraphComparator {
             if (rigthPlan == null) {
                 return false;
             }
-            return JoinUtils.canEliminateByLeft(joinEdge.getJoin(),
+            boolean couldEliminateByLeft = JoinUtils.canEliminateByLeft(joinEdge.getJoin(),
                     rigthPlan.getLogicalProperties().getTrait());
+            // if eliminated successfully, should refresh the eliminateViewNodesMap
+            if (couldEliminateByLeft) {
+                this.reservedShouldEliminatedViewNodes =
+                        LongBitmap.newBitmapDiff(reservedShouldEliminatedViewNodes, eliminatedRight);
+            }
+            return couldEliminateByLeft;
         }
         // eliminate by pk fk
         if (joinEdge.getJoinType().isInnerJoin()) {
@@ -206,17 +221,30 @@ public class HyperGraphComparator {
                 return false;
             }
             long eliminatedLeft =
-                    LongBitmap.newBitmapIntersect(joinEdge.getLeftExtendedNodes(), eliminateViewNodesMap);
+                    LongBitmap.newBitmapIntersect(joinEdge.getLeftExtendedNodes(), reservedShouldEliminatedViewNodes);
             long eliminatedRight =
-                    LongBitmap.newBitmapIntersect(joinEdge.getRightExtendedNodes(), eliminateViewNodesMap);
+                    LongBitmap.newBitmapIntersect(joinEdge.getRightExtendedNodes(), reservedShouldEliminatedViewNodes);
+            // Only eliminate the node which is in eliminateViewNodesMap
             if (LongBitmap.getCardinality(eliminatedLeft) == 0
                     && LongBitmap.getCardinality(eliminatedRight) == 1) {
-                return canEliminatePrimaryByForeign(joinEdge.getRightExtendedNodes(), joinEdge.getLeftExtendedNodes(),
+                boolean canEliminated = canEliminatePrimaryByForeign(joinEdge.getRightExtendedNodes(),
+                        joinEdge.getLeftExtendedNodes(),
                         joinEdge.getRightInputSlots(), joinEdge.getLeftInputSlots(), joinEdge);
+                if (canEliminated) {
+                    this.reservedShouldEliminatedViewNodes = LongBitmap.newBitmapDiff(
+                            reservedShouldEliminatedViewNodes, joinEdge.getRightExtendedNodes());
+                }
+                return canEliminated;
             } else if (LongBitmap.getCardinality(eliminatedLeft) == 1
                     && LongBitmap.getCardinality(eliminatedRight) == 0) {
-                return canEliminatePrimaryByForeign(joinEdge.getLeftExtendedNodes(), joinEdge.getRightExtendedNodes(),
+                boolean canEliminate = canEliminatePrimaryByForeign(joinEdge.getLeftExtendedNodes(),
+                        joinEdge.getRightExtendedNodes(),
                         joinEdge.getLeftInputSlots(), joinEdge.getRightInputSlots(), joinEdge);
+                if (canEliminate) {
+                    this.reservedShouldEliminatedViewNodes = LongBitmap.newBitmapDiff(
+                            reservedShouldEliminatedViewNodes, joinEdge.getLeftExtendedNodes());
+                }
+                return canEliminate;
             }
         }
         return false;
@@ -225,29 +253,78 @@ public class HyperGraphComparator {
     private boolean tryEliminateNodesAndEdge() {
         boolean hasFilterEdgeAbove = viewHyperGraph.getFilterEdges().stream()
                 .filter(e -> LongBitmap.getCardinality(e.getReferenceNodes()) == 1)
-                .anyMatch(e -> LongBitmap.isSubset(e.getReferenceNodes(), eliminateViewNodesMap));
+                .anyMatch(e -> LongBitmap.isSubset(e.getReferenceNodes(), shouldEliminateViewNodesMap));
         if (hasFilterEdgeAbove) {
             // If there is some filter edge above the eliminated node, we should rebuild a plan
             // Right now, just reject it.
             return false;
         }
-        return viewHyperGraph.getJoinEdges().stream()
-                .filter(joinEdge -> LongBitmap.isOverlap(joinEdge.getReferenceNodes(), eliminateViewNodesMap))
-                .allMatch(this::canEliminateViewEdge);
+        long allCanEliminateNodes = 0;
+        for (JoinEdge joinEdge : viewHyperGraph.getJoinEdges()) {
+            long canEliminateSideNodes = getCanEliminateSideNodes(joinEdge);
+            allCanEliminateNodes = LongBitmap.or(allCanEliminateNodes, canEliminateSideNodes);
+            if (LongBitmap.isOverlap(canEliminateSideNodes, reservedShouldEliminatedViewNodes)
+                    && !canEliminateViewEdge(joinEdge)) {
+                return false;
+            }
+        }
+        // check all can eliminateNodes contains all should eliminate nodes, to avoid some nodes can not be eliminated
+        // but in shouldEliminateViewNodesMap
+        // check all needed to eliminate nodes already be eliminated
+        return LongBitmap.containAll(allCanEliminateNodes, shouldEliminateViewNodesMap)
+                && LongBitmap.getCardinality(reservedShouldEliminatedViewNodes) == 0;
+    }
+
+    private static long getCanEliminateSideNodes(JoinEdge joinEdge) {
+        long leftExtendedNodes = joinEdge.getLeftExtendedNodes();
+        long rightExtendedNodes = joinEdge.getRightExtendedNodes();
+        long nodesToCheck = LongBitmap.newBitmap();
+        if (joinEdge.getJoinType().isLeftOuterJoin() && joinEdge.isRightSimple()) {
+            if (LongBitmap.getCardinality(rightExtendedNodes) == 1) {
+                nodesToCheck = LongBitmap.or(rightExtendedNodes, nodesToCheck);
+            }
+        }
+        if (joinEdge.getJoinType().isInnerJoin()) {
+            if (LongBitmap.getCardinality(leftExtendedNodes) == 1) {
+                nodesToCheck = LongBitmap.or(leftExtendedNodes, nodesToCheck);
+            }
+            if (LongBitmap.getCardinality(rightExtendedNodes) == 1) {
+                nodesToCheck = LongBitmap.or(rightExtendedNodes, nodesToCheck);
+            }
+        }
+        return nodesToCheck;
     }
 
     private boolean compareNodeWithExpr(StructInfoNode query, StructInfoNode view) {
-        List<Set<Expression>> queryExprSetList = query.getExprSetList();
-        List<Set<Expression>> viewExprSetList = view.getExprSetList();
+        Pair<List<Set<Expression>>, List<Set<Expression>>> queryExprSetList = query.getExprSetList();
+        Pair<List<Set<Expression>>, List<Set<Expression>>> viewExprSetList = view.getExprSetList();
+        if (queryExprSetList == null || viewExprSetList == null) {
+            return false;
+        }
+        return compareNodeWithExpr(query, ExpressionPosition.NODE_COULD_MOVE,
+                queryExprSetList.key(), viewExprSetList.key())
+                && compareNodeWithExpr(query, ExpressionPosition.NODE_COULD_NOT_MOVE,
+                queryExprSetList.value(), viewExprSetList.value());
+    }
+
+    private boolean compareNodeWithExpr(StructInfoNode query, ExpressionPosition expressionPosition,
+            List<Set<Expression>> queryExprSetList, List<Set<Expression>> viewExprSetList) {
         if (queryExprSetList == null || viewExprSetList == null
                 || queryExprSetList.size() != viewExprSetList.size()) {
             return false;
         }
         int size = queryExprSetList.size();
         for (int i = 0; i < size; i++) {
-            Set<Expression> mappingQueryExprSet = queryExprSetList.get(i).stream()
-                    .map(logicalCompatibilityContext::getViewNodeExprFromQuery)
-                    .collect(Collectors.toSet());
+            Set<Expression> queryExpressions = queryExprSetList.get(i);
+            Set<Expression> mappingQueryExprSet = new HashSet<>();
+            for (Expression queryExpression : queryExpressions) {
+                Optional<Expression> mappingViewExprByQueryExpr = getMappingViewExprByQueryExpr(queryExpression, query,
+                        this.logicalCompatibilityContext, expressionPosition);
+                if (!mappingViewExprByQueryExpr.isPresent()) {
+                    return false;
+                }
+                mappingQueryExprSet.add(mappingViewExprByQueryExpr.get());
+            }
             if (!mappingQueryExprSet.equals(viewExprSetList.get(i))) {
                 return false;
             }
@@ -391,19 +468,29 @@ public class HyperGraphComparator {
     }
 
     private Map<Edge, Edge> constructQueryToViewJoinMapWithExpr() {
-        Map<Expression, Edge> viewExprToEdge = getViewJoinEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-        Map<Expression, Edge> queryExprToEdge = getQueryJoinEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-
+        Map<Expression, Edge> viewExprToEdge = new HashMap<>();
+        List<JoinEdge> viewJoinEdges = getViewJoinEdges();
+        for (JoinEdge viewJoin : viewJoinEdges) {
+            for (Expression expression : viewJoin.getExpressions()) {
+                viewExprToEdge.put(expression, viewJoin);
+            }
+        }
+        Map<Expression, Edge> queryExprToEdge = new HashMap<>();
+        List<JoinEdge> queryJoinEdges = getQueryJoinEdges();
+        for (JoinEdge queryJoin : queryJoinEdges) {
+            for (Expression expression : queryJoin.getExpressions()) {
+                queryExprToEdge.put(expression, queryJoin);
+            }
+        }
         HashMap<Edge, Edge> edgeMap = new HashMap<>();
         for (Entry<Expression, Edge> entry : queryExprToEdge.entrySet()) {
             if (edgeMap.containsKey(entry.getValue())) {
                 continue;
             }
-            Expression viewExpr = logicalCompatibilityContext.getViewJoinExprFromQuery(entry.getKey());
+            Expression viewExpr = getMappingViewExprByQueryExpr(entry.getKey(),
+                    entry.getValue(),
+                    logicalCompatibilityContext,
+                    ExpressionPosition.JOIN_EDGE).orElse(null);
             if (viewExprToEdge.containsKey(viewExpr)) {
                 edgeMap.put(entry.getValue(), Objects.requireNonNull(viewExprToEdge.get(viewExpr)));
             }
@@ -411,25 +498,80 @@ public class HyperGraphComparator {
         return edgeMap;
     }
 
+    // Such as the filter as following, their expression is same, but should be different filter edge
+    // Only construct edge that can mapping, the edges which can not mapping would be handled by buildComparisonRes
+    //     LogicalJoin[569]
+    //       |--LogicalProject[567]
+    //       |  +--LogicalFilter[566] ( predicates=(l_orderkey#10 IS NULL OR ( not (l_orderkey#10 = 1))) )
+    //       |     +--LogicalJoin[565]
+    //       |        |--LogicalProject[562]
+    //       |        |  +--LogicalOlapScan
+    //       |        +--LogicalProject[564]
+    //       |           +--LogicalFilter[563] ( predicates=(l_orderkey#10 IS NULL OR ( not (l_orderkey#10 = 1))))
+    //       |              +--LogicalOlapScan
+    //       +--LogicalProject[568]
+    //         +--LogicalOlapScan
     private Map<Edge, Edge> constructQueryToViewFilterMapWithExpr() {
-        Map<Expression, Edge> viewExprToEdge = getViewFilterEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-        Map<Expression, Edge> queryExprToEdge = getQueryFilterEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-
-        HashMap<Edge, Edge> edgeMap = new HashMap<>();
-        for (Entry<Expression, Edge> entry : queryExprToEdge.entrySet()) {
-            if (edgeMap.containsKey(entry.getValue())) {
-                continue;
-            }
-            Expression viewExpr = logicalCompatibilityContext.getViewFilterExprFromQuery(entry.getKey());
-            if (viewExprToEdge.containsKey(viewExpr)) {
-                edgeMap.put(entry.getValue(), Objects.requireNonNull(viewExprToEdge.get(viewExpr)));
+        Multimap<Expression, Edge> viewExprToEdge = HashMultimap.create();
+        List<FilterEdge> viewFilterEdges = getViewFilterEdges();
+        for (FilterEdge viewEdge : viewFilterEdges) {
+            for (Expression expression : viewEdge.getExpressions()) {
+                viewExprToEdge.put(expression, viewEdge);
             }
         }
-        return edgeMap;
+        Multimap<Expression, Edge> queryExprToEdge = HashMultimap.create();
+        List<FilterEdge> queryFilterEdges = getQueryFilterEdges();
+        for (FilterEdge queryEdge : queryFilterEdges) {
+            for (Expression expression : queryEdge.getExpressions()) {
+                queryExprToEdge.put(expression, queryEdge);
+            }
+        }
+        HashMap<Edge, Edge> queryToViewEdgeMap = new HashMap<>();
+        for (Entry<Expression, Collection<Edge>> entry : queryExprToEdge.asMap().entrySet()) {
+            Expression queryExprViewBased = null;
+            for (Edge queryEdge : entry.getValue()) {
+                queryExprViewBased = getMappingViewExprByQueryExpr(entry.getKey(),
+                        queryEdge,
+                        logicalCompatibilityContext,
+                        ExpressionPosition.FILTER_EDGE).orElse(null);
+                if (queryExprViewBased == null) {
+                    continue;
+                }
+                Collection<Edge> viewEdges = viewExprToEdge.get(queryExprViewBased);
+                if (viewEdges.isEmpty()) {
+                    continue;
+                }
+                for (Edge viewEdge : viewEdges) {
+                    if (!isSubTreeNodesEquals(queryEdge, viewEdge, logicalCompatibilityContext)) {
+                        // Such as query filter edge is <{1} --FILTER-- {}> but view filter edge is
+                        // <{0, 1} --FILTER-- {}>, though they are all
+                        // l_orderkey#10 IS NULL OR ( not (l_orderkey#10 = 1)) but they are different actually
+                        continue;
+                    }
+                    queryToViewEdgeMap.put(queryEdge, viewEdge);
+                }
+            }
+        }
+        return queryToViewEdgeMap;
+    }
+
+    private static boolean isSubTreeNodesEquals(Edge queryEdge, Edge viewEdge,
+            LogicalCompatibilityContext logicalCompatibilityContext) {
+        if (!(queryEdge instanceof FilterEdge) || !(viewEdge instanceof FilterEdge)) {
+            return false;
+        }
+        // subTreeNodes should be equal
+        BiMap<Integer, Integer> queryToViewNodeIdMapping =
+                logicalCompatibilityContext.getQueryToViewNodeIDMapping();
+        List<Integer> queryNodeIndexViewBasedList = new ArrayList<>();
+        for (int queryNodeIndex : LongBitmap.getIterator(queryEdge.getSubTreeNodes())) {
+            Integer queryNodeIndexViewBased = queryToViewNodeIdMapping.get(queryNodeIndex);
+            if (queryNodeIndexViewBased == null) {
+                return false;
+            }
+            queryNodeIndexViewBasedList.add(queryNodeIndexViewBased);
+        }
+        return LongBitmap.newBitmap(queryNodeIndexViewBasedList) == viewEdge.getSubTreeNodes();
     }
 
     private void refreshViewEdges() {
@@ -455,23 +597,30 @@ public class HyperGraphComparator {
         if (query instanceof FilterEdge && view instanceof FilterEdge) {
             return compareFilterEdgeWithNode((FilterEdge) query, viewFilterEdgesAfterInferring.get(view.getIndex()));
         } else if (query instanceof JoinEdge && view instanceof JoinEdge) {
-            return compareJoinEdgeWithNode((JoinEdge) query, viewJoinEdgesAfterInferring.get(view.getIndex()));
+            // compare original or inferred join edge
+            return compareJoinEdgeWithNode((JoinEdge) query, viewJoinEdgesAfterInferring.get(view.getIndex()))
+                    || compareJoinEdgeWithNode((JoinEdge) query, (JoinEdge) view);
         }
         return false;
     }
 
     private boolean compareFilterEdgeWithNode(FilterEdge query, FilterEdge view) {
-        return rewriteQueryNodeMap(query.getReferenceNodes()) == view.getReferenceNodes();
+        return getViewNodesByQuery(query.getReferenceNodes()) == view.getReferenceNodes();
     }
 
     private boolean compareJoinEdgeWithNode(JoinEdge query, JoinEdge view) {
         boolean res = false;
+        // if eliminateViewNodesMap is not empty, we should compare the join nodes after eliminating
         if (query.getJoinType().swap() == view.getJoinType()) {
-            res |= rewriteQueryNodeMap(query.getLeftExtendedNodes()) == view.getRightExtendedNodes()
-                    && rewriteQueryNodeMap(query.getRightExtendedNodes()) == view.getLeftExtendedNodes();
+            res |= getViewNodesByQuery(query.getLeftExtendedNodes()) == LongBitmap.newBitmapDiff(
+                    view.getRightExtendedNodes(), this.shouldEliminateViewNodesMap)
+                    && getViewNodesByQuery(query.getRightExtendedNodes()) == LongBitmap.newBitmapDiff(
+                    view.getLeftExtendedNodes(), this.shouldEliminateViewNodesMap);
         }
-        res |= rewriteQueryNodeMap(query.getLeftExtendedNodes()) == view.getLeftExtendedNodes()
-                && rewriteQueryNodeMap(query.getRightExtendedNodes()) == view.getRightExtendedNodes();
+        res |= getViewNodesByQuery(query.getLeftExtendedNodes()) == LongBitmap.newBitmapDiff(
+                view.getLeftExtendedNodes(), this.shouldEliminateViewNodesMap)
+                && getViewNodesByQuery(query.getRightExtendedNodes()) == LongBitmap.newBitmapDiff(
+                view.getRightExtendedNodes(), this.shouldEliminateViewNodesMap);
         return res;
     }
 
@@ -494,8 +643,8 @@ public class HyperGraphComparator {
     }
 
     private boolean tryInferEdge(JoinEdge query, JoinEdge view) {
-        if (rewriteQueryNodeMap(query.getLeftRequiredNodes()) != view.getLeftRequiredNodes()
-                || rewriteQueryNodeMap(query.getRightRequiredNodes()) != view.getRightRequiredNodes()) {
+        if (getViewNodesByQuery(query.getLeftRequiredNodes()) != view.getLeftRequiredNodes()
+                || getViewNodesByQuery(query.getRightRequiredNodes()) != view.getRightRequiredNodes()) {
             return false;
         }
         if (!query.getJoinType().equals(view.getJoinType())) {
@@ -516,13 +665,45 @@ public class HyperGraphComparator {
         return true;
     }
 
-    private long rewriteQueryNodeMap(long bitmap) {
+    private long getViewNodesByQuery(long bitmap) {
         long newBitmap = LongBitmap.newBitmap();
         for (int i : LongBitmap.getIterator(bitmap)) {
             int newIdx = getQueryToViewNodeIdMap().getOrDefault(i, 0);
             newBitmap = LongBitmap.set(newBitmap, newIdx);
         }
         return newBitmap;
+    }
+
+    private Optional<Expression> getMappingViewExprByQueryExpr(Expression queryExpression,
+            HyperElement queryExpressionBelongedHyperElement,
+            LogicalCompatibilityContext context,
+            ExpressionPosition expressionPosition) {
+        Expression queryShuttledExpr;
+        Collection<Pair<Expression, HyperElement>> viewExpressions;
+        if (ExpressionPosition.JOIN_EDGE.equals(expressionPosition)) {
+            queryShuttledExpr = context.getQueryJoinShuttledExpr(queryExpression);
+            viewExpressions = context.getViewJoinExprFromQuery(queryShuttledExpr);
+        } else if (ExpressionPosition.FILTER_EDGE.equals(expressionPosition)) {
+            queryShuttledExpr = context.getQueryFilterShuttledExpr(queryExpression);
+            viewExpressions = context.getViewFilterExprFromQuery(queryShuttledExpr);
+        } else if (ExpressionPosition.NODE_COULD_MOVE.equals(expressionPosition)) {
+            queryShuttledExpr = context.getQueryNodeShuttledCouldMoveExpr(queryExpression);
+            viewExpressions = context.getViewNodeCouldMoveExprFromQuery(queryShuttledExpr);
+        } else {
+            queryShuttledExpr = context.getQueryNodeShuttledCouldNotMoveExpr(queryExpression);
+            viewExpressions = context.getViewNodeCouldNotMoveExprFromQuery(queryShuttledExpr);
+        }
+        if (viewExpressions.size() == 1) {
+            return Optional.of(viewExpressions.iterator().next().key());
+        }
+        long queryReferenceNodes = queryExpressionBelongedHyperElement.getReferenceNodes();
+        long viewReferenceNodes = getViewNodesByQuery(queryReferenceNodes);
+        for (Pair<Expression, HyperElement> viewExpressionPair : viewExpressions) {
+            if (viewExpressionPair.value().getReferenceNodes() == viewReferenceNodes) {
+                return Optional.of(viewExpressionPair.key());
+            }
+        }
+        return Optional.empty();
     }
 
     private void compareJoinEdgeWithExpr(Edge query, Edge view) {
@@ -532,7 +713,10 @@ public class HyperGraphComparator {
         Set<Expression> exprMappedOfView = new HashSet<>();
         List<Expression> residualQueryExpr = new ArrayList<>();
         for (Expression queryExpr : queryExprSet) {
-            Expression viewExpr = logicalCompatibilityContext.getViewJoinExprFromQuery(queryExpr);
+            Expression viewExpr = getMappingViewExprByQueryExpr(queryExpr,
+                    query,
+                    logicalCompatibilityContext,
+                    ExpressionPosition.JOIN_EDGE).orElse(null);
             if (viewExprSet.contains(viewExpr)) {
                 exprMappedOfView.add(viewExpr);
             } else {
@@ -551,7 +735,10 @@ public class HyperGraphComparator {
         Set<Expression> exprMappedOfView = new HashSet<>();
         List<Expression> residualQueryExpr = new ArrayList<>();
         for (Expression queryExpr : queryExprSet) {
-            Expression viewExpr = logicalCompatibilityContext.getViewFilterExprFromQuery(queryExpr);
+            Expression viewExpr = getMappingViewExprByQueryExpr(queryExpr,
+                    query,
+                    logicalCompatibilityContext,
+                    ExpressionPosition.FILTER_EDGE).orElse(null);
             if (viewExprSet.contains(viewExpr)) {
                 exprMappedOfView.add(viewExpr);
             } else {

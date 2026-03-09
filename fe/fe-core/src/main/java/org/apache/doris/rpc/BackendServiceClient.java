@@ -43,10 +43,13 @@ public class BackendServiceClient {
     private final ManagedChannel channel;
     private final long execPlanTimeout;
 
-    public BackendServiceClient(TNetworkAddress address, Executor executor) {
+    public BackendServiceClient(TNetworkAddress address, String resolvedIp, Executor executor) {
         this.address = address;
-        channel = NettyChannelBuilder.forAddress(address.getHostname(), address.getPort())
-                .executor(executor)
+        // Use resolved IP address instead of hostname to avoid DNS resolution issues
+        // If resolvedIp is empty or null, fallback to hostname
+        String targetHost = (resolvedIp != null && !resolvedIp.isEmpty()) ? resolvedIp : address.getHostname();
+        channel = NettyChannelBuilder.forAddress(targetHost, address.getPort())
+                .executor(executor).keepAliveTime(Config.grpc_keep_alive_second, TimeUnit.SECONDS)
                 .flowControlWindow(Config.grpc_max_message_size_bytes)
                 .keepAliveWithoutCalls(true)
                 .maxInboundMessageSize(Config.grpc_max_message_size_bytes).enableRetry().maxRetryAttempts(MAX_RETRY_NUM)
@@ -89,7 +92,8 @@ public class BackendServiceClient {
                 .cancelPlanFragment(request);
     }
 
-    public Future<InternalService.PFetchDataResult> fetchDataAsync(InternalService.PFetchDataRequest request) {
+    public ListenableFuture<InternalService.PFetchDataResult> fetchDataAsync(
+            InternalService.PFetchDataRequest request) {
         return stub.fetchData(request);
     }
 
@@ -188,6 +192,30 @@ public class BackendServiceClient {
         return stub.alterVaultSync(request);
     }
 
+    public Future<InternalService.PGetBeResourceResponse> getBeResource(InternalService.PGetBeResourceRequest request,
+            int timeoutSec) {
+        return stub.withDeadlineAfter(timeoutSec, TimeUnit.SECONDS).getBeResource(request);
+    }
+
+    public Future<InternalService.PDeleteDictionaryResponse> deleteDictionary(
+            InternalService.PDeleteDictionaryRequest request, int timeoutSec) {
+        return stub.withDeadlineAfter(timeoutSec, TimeUnit.SECONDS).deleteDictionary(request);
+    }
+
+    public Future<InternalService.PCommitRefreshDictionaryResponse> commitRefreshDictionary(
+            InternalService.PCommitRefreshDictionaryRequest request, int timeoutSec) {
+        return stub.withDeadlineAfter(timeoutSec, TimeUnit.SECONDS).commitRefreshDictionary(request);
+    }
+
+    public Future<InternalService.PAbortRefreshDictionaryResponse> abortRefreshDictionary(
+            InternalService.PAbortRefreshDictionaryRequest request, int timeoutSec) {
+        return stub.withDeadlineAfter(timeoutSec, TimeUnit.SECONDS).abortRefreshDictionary(request);
+    }
+
+    public Future<InternalService.PRequestCdcClientResult> requestCdcClient(
+            InternalService.PRequestCdcClientRequest request) {
+        return stub.requestCdcClient(request);
+    }
 
     public void shutdown() {
         ConnectivityState state = channel.getState(false);

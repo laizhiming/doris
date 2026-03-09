@@ -23,6 +23,9 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletMeta;
+import org.apache.doris.catalog.TabletSlidingWindowAccessStats;
+import org.apache.doris.cloud.catalog.CloudReplica;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.common.util.TimeUtils;
@@ -31,8 +34,8 @@ import org.apache.doris.system.Backend;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 
-import java.util.Arrays;
 import java.util.List;
 
 /*
@@ -40,13 +43,23 @@ import java.util.List;
  * show replicas' detail info within a tablet
  */
 public class ReplicasProcNode implements ProcNodeInterface {
-    public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>().add("ReplicaId")
-            .add("BackendId").add("Version").add("LstSuccessVersion").add("LstFailedVersion").add("LstFailedTime")
-            .add("SchemaHash").add("LocalDataSize").add("RemoteDataSize").add("RowCount").add("State").add("IsBad")
-            .add("IsUserDrop")
-            .add("VisibleVersionCount").add("VersionCount").add("PathHash").add("Path")
-            .add("MetaUrl").add("CompactionStatus").add("CooldownReplicaId")
-            .add("CooldownMetaId").add("QueryHits").build();
+    public static final ImmutableList<String> TITLE_NAMES;
+
+    static {
+        ImmutableList.Builder<String> builder = new ImmutableList.Builder<String>().add("ReplicaId")
+                .add("BackendId").add("Version").add("LstSuccessVersion").add("LstFailedVersion").add("LstFailedTime")
+                .add("SchemaHash").add("LocalDataSize").add("RemoteDataSize").add("RowCount").add("State").add("IsBad")
+                .add("IsUserDrop")
+                .add("VisibleVersionCount").add("VersionCount").add("PathHash").add("Path")
+                .add("MetaUrl").add("CompactionStatus").add("CooldownReplicaId")
+                .add("CooldownMetaId").add("QueryHits").add("WindowAccessCount").add("LastAccessTime");
+
+        if (Config.isCloudMode()) {
+            builder.add("PrimaryBackendId");
+        }
+
+        TITLE_NAMES = builder.build();
+    }
 
     private long tabletId;
     private List<Replica> replicas;
@@ -57,8 +70,8 @@ public class ReplicasProcNode implements ProcNodeInterface {
     }
 
     @Override
-    public ProcResult fetchResult() {
-        ImmutableMap<Long, Backend> backendMap = Env.getCurrentSystemInfo().getIdToBackend();
+    public ProcResult fetchResult() throws AnalysisException {
+        ImmutableMap<Long, Backend> backendMap = Env.getCurrentSystemInfo().getAllBackendsByAllCluster();
 
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
@@ -79,7 +92,16 @@ public class ReplicasProcNode implements ProcNodeInterface {
         }
 
         for (Replica replica : replicas) {
-            Backend be = backendMap.get(replica.getBackendId());
+            TabletSlidingWindowAccessStats.AccessStatsResult asr = TabletSlidingWindowAccessStats.getInstance()
+                    .getAccessInfo(tabletId);
+            long accessCount = 0;
+            long lastAccessTime = 0;
+            if (asr != null) {
+                accessCount = asr.accessCount;
+                lastAccessTime = asr.lastAccessTime;
+            }
+            long beId = replica.getBackendIdWithoutException();
+            Backend be = backendMap.get(beId);
             String host = (be == null ? Backend.DUMMY_IP : be.getHost());
             int port = (be == null ? 0 : be.getHttpPort());
             String hostPort = NetUtils.getHostPortInAccessibleFormat(host, port);
@@ -104,28 +126,35 @@ public class ReplicasProcNode implements ProcNodeInterface {
             if (Config.enable_query_hit_stats) {
                 queryHits = QueryStatsUtil.getMergedReplicaStats(replica.getId());
             }
-            result.addRow(Arrays.asList(String.valueOf(replica.getId()),
-                                        String.valueOf(replica.getBackendId()),
-                                        String.valueOf(replica.getVersion()),
-                                        String.valueOf(replica.getLastSuccessVersion()),
-                                        String.valueOf(replica.getLastFailedVersion()),
-                                        TimeUtils.longToTimeString(replica.getLastFailedTimestamp()),
-                                        String.valueOf(replica.getSchemaHash()),
-                                        String.valueOf(replica.getDataSize()),
-                                        String.valueOf(replica.getRemoteDataSize()),
-                                        String.valueOf(replica.getRowCount()),
-                                        String.valueOf(replica.getState()),
-                                        String.valueOf(replica.isBad()),
-                                        String.valueOf(replica.isUserDrop()),
-                                        String.valueOf(replica.getVisibleVersionCount()),
-                                        String.valueOf(replica.getTotalVersionCount()),
-                                        String.valueOf(replica.getPathHash()),
-                                        path,
-                                        metaUrl,
-                                        compactionUrl,
-                                        String.valueOf(tablet.getCooldownConf().first),
-                                        cooldownMetaId,
-                                        String.valueOf(queryHits)));
+            List<String> replicaInfo = Lists.newArrayList(String.valueOf(replica.getId()),
+                    String.valueOf(beId),
+                    String.valueOf(replica.getVersion()),
+                    String.valueOf(replica.getLastSuccessVersion()),
+                    String.valueOf(replica.getLastFailedVersion()),
+                    TimeUtils.longToTimeString(replica.getLastFailedTimestamp()),
+                    String.valueOf(replica.getSchemaHash()),
+                    String.valueOf(replica.getDataSize()),
+                    String.valueOf(replica.getRemoteDataSize()),
+                    String.valueOf(replica.getRowCount()),
+                    String.valueOf(replica.getState()),
+                    String.valueOf(replica.isBad()),
+                    String.valueOf(replica.isUserDrop()),
+                    String.valueOf(replica.getVisibleVersionCount()),
+                    String.valueOf(replica.getTotalVersionCount()),
+                    String.valueOf(replica.getPathHash()),
+                    path,
+                    metaUrl,
+                    compactionUrl,
+                    String.valueOf(tablet.getCooldownReplicaId()),
+                    cooldownMetaId,
+                    String.valueOf(queryHits),
+                    String.valueOf(accessCount),
+                    String.valueOf(lastAccessTime)
+                );
+            if (Config.isCloudMode()) {
+                replicaInfo.add(String.valueOf(((CloudReplica) replica).getPrimaryBackendId()));
+            }
+            result.addRow(replicaInfo);
         }
         return result;
     }

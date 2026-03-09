@@ -21,13 +21,19 @@ package org.apache.doris.catalog;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.EnvUtils;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.plugin.CloudPluginDownloader;
+import org.apache.doris.common.plugin.CloudPluginDownloader.PluginType;
 import org.apache.doris.common.proc.BaseProcResult;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.Util;
+import org.apache.doris.datasource.CatalogProperty;
 import org.apache.doris.datasource.ExternalCatalog;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
@@ -35,14 +41,13 @@ import org.apache.commons.codec.binary.Hex;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -77,6 +82,7 @@ public class JdbcResource extends Resource {
     public static final String JDBC_PRESTO = "jdbc:presto";
     public static final String JDBC_OCEANBASE = "jdbc:oceanbase";
     public static final String JDBC_DB2 = "jdbc:db2";
+    public static final String JDBC_GBASE = "jdbc:gbase";
 
     public static final String MYSQL = "MYSQL";
     public static final String POSTGRESQL = "POSTGRESQL";
@@ -89,6 +95,7 @@ public class JdbcResource extends Resource {
     public static final String OCEANBASE = "OCEANBASE";
     public static final String OCEANBASE_ORACLE = "OCEANBASE_ORACLE";
     public static final String DB2 = "DB2";
+    public static final String GBASE = "GBASE";
 
     public static final String JDBC_PROPERTIES_PREFIX = "jdbc.";
     public static final String JDBC_URL = "jdbc_url";
@@ -106,6 +113,7 @@ public class JdbcResource extends Resource {
     public static final String CHECK_SUM = "checksum";
     public static final String CREATE_TIME = "create_time";
     public static final String TEST_CONNECTION = "test_connection";
+    public static final String FUNCTION_RULES = "function_rules";
 
     private static final ImmutableList<String> ALL_PROPERTIES = new ImmutableList.Builder<String>().add(
             JDBC_URL,
@@ -116,17 +124,19 @@ public class JdbcResource extends Resource {
             TYPE,
             CREATE_TIME,
             ONLY_SPECIFIED_DATABASE,
-            LOWER_CASE_META_NAMES,
-            META_NAMES_MAPPING,
-            INCLUDE_DATABASE_LIST,
-            EXCLUDE_DATABASE_LIST,
+            ExternalCatalog.LOWER_CASE_META_NAMES,
+            ExternalCatalog.META_NAMES_MAPPING,
+            ExternalCatalog.INCLUDE_DATABASE_LIST,
+            ExternalCatalog.EXCLUDE_DATABASE_LIST,
             CONNECTION_POOL_MIN_SIZE,
             CONNECTION_POOL_MAX_SIZE,
             CONNECTION_POOL_MAX_LIFE_TIME,
             CONNECTION_POOL_MAX_WAIT_TIME,
             CONNECTION_POOL_KEEP_ALIVE,
             TEST_CONNECTION,
-            ExternalCatalog.USE_META_CACHE
+            ExternalCatalog.USE_META_CACHE,
+            CatalogProperty.ENABLE_MAPPING_VARBINARY,
+            CatalogProperty.ENABLE_MAPPING_TIMESTAMP_TZ
     ).build();
 
     // The default value of optional properties
@@ -135,10 +145,10 @@ public class JdbcResource extends Resource {
 
     static {
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ONLY_SPECIFIED_DATABASE, "false");
-        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(LOWER_CASE_META_NAMES, "false");
-        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(META_NAMES_MAPPING, "");
-        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(INCLUDE_DATABASE_LIST, "");
-        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(EXCLUDE_DATABASE_LIST, "");
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ExternalCatalog.LOWER_CASE_META_NAMES, "false");
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ExternalCatalog.META_NAMES_MAPPING, "");
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ExternalCatalog.INCLUDE_DATABASE_LIST, "");
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ExternalCatalog.EXCLUDE_DATABASE_LIST, "");
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(CONNECTION_POOL_MIN_SIZE, "1");
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(CONNECTION_POOL_MAX_SIZE, "30");
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(CONNECTION_POOL_MAX_LIFE_TIME, "1800000");
@@ -147,6 +157,8 @@ public class JdbcResource extends Resource {
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(TEST_CONNECTION, "true");
         OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(ExternalCatalog.USE_META_CACHE,
                 String.valueOf(ExternalCatalog.DEFAULT_USE_META_CACHE));
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(CatalogProperty.ENABLE_MAPPING_VARBINARY, "false");
+        OPTIONAL_PROPERTIES_DEFAULT_VALUE.put(CatalogProperty.ENABLE_MAPPING_TIMESTAMP_TZ, "false");
     }
 
     // timeout for both connection and read. 10 seconds is long enough.
@@ -190,12 +202,12 @@ public class JdbcResource extends Resource {
     }
 
     @Override
-    protected void setProperties(Map<String, String> properties) throws DdlException {
+    protected void setProperties(ImmutableMap<String, String> properties) throws DdlException {
         Preconditions.checkState(properties != null);
-        validateProperties(properties);
-        configs = properties;
+        this.configs = Maps.newHashMap(properties);
+        validateProperties(this.configs);
         applyDefaultProperties();
-        String currentDateTime = LocalDateTime.now(ZoneId.systemDefault()).toString().replace("T", " ");
+        String currentDateTime = TimeUtils.longToTimeString(System.currentTimeMillis());
         configs.put(CREATE_TIME, currentDateTime);
         // check properties
         for (String property : ALL_PROPERTIES) {
@@ -286,12 +298,18 @@ public class JdbcResource extends Resource {
     }
 
     public static String getFullDriverUrl(String driverUrl) throws IllegalArgumentException {
+        if (!(driverUrl.startsWith("file://") || driverUrl.startsWith("http://")
+                || driverUrl.startsWith("https://") || driverUrl.matches("^[^:/]+\\.jar$"))) {
+            throw new IllegalArgumentException("Invalid driver URL format. Supported formats are: "
+                    + "file://xxx.jar, http://xxx.jar, https://xxx.jar, or xxx.jar (without prefix).");
+        }
+
         try {
             URI uri = new URI(driverUrl);
             String schema = uri.getScheme();
             checkCloudWhiteList(driverUrl);
             if (schema == null && !driverUrl.startsWith("/")) {
-                return "file://" + Config.jdbc_drivers_dir + "/" + driverUrl;
+                return checkAndReturnDefaultDriverUrl(driverUrl);
             }
 
             if ("*".equals(Config.jdbc_driver_secure_path)) {
@@ -299,7 +317,7 @@ public class JdbcResource extends Resource {
             }
 
             boolean isAllowed = Arrays.stream(Config.jdbc_driver_secure_path.split(";"))
-                            .anyMatch(allowedPath -> driverUrl.startsWith(allowedPath.trim()));
+                    .anyMatch(allowedPath -> driverUrl.startsWith(allowedPath.trim()));
             if (!isAllowed) {
                 throw new IllegalArgumentException("Driver URL does not match any allowed paths: " + driverUrl);
             }
@@ -307,6 +325,46 @@ public class JdbcResource extends Resource {
         } catch (URISyntaxException e) {
             LOG.warn("invalid jdbc driver url: " + driverUrl);
             return driverUrl;
+        }
+    }
+
+    private static String checkAndReturnDefaultDriverUrl(String driverUrl) {
+        final String defaultDriverUrl = EnvUtils.getDorisHome() + "/plugins/jdbc_drivers";
+        final String defaultOldDriverUrl = EnvUtils.getDorisHome() + "/jdbc_drivers";
+        if (Config.jdbc_drivers_dir.equals(defaultDriverUrl)) {
+            // If true, which means user does not set `jdbc_drivers_dir` and use the default one.
+            // Because in new version, we change the default value of `jdbc_drivers_dir`
+            // from `DORIS_HOME/jdbc_drivers` to `DORIS_HOME/plugins/jdbc_drivers`,
+            // so we need to check the old default dir for compatibility.
+            String targetPath = defaultDriverUrl + "/" + driverUrl;
+            File targetFile = new File(targetPath);
+            String oldTargetPath = defaultOldDriverUrl + "/" + driverUrl;
+            File oldTargetFile = new File(oldTargetPath);
+            if (targetFile.exists()) {
+                // File exists in new default directory
+                return "file://" + targetPath;
+            } else if (oldTargetFile.exists()) {
+                // File exists in old default directory
+                return "file://" + oldTargetPath;
+            } else if (Config.isCloudMode()) {
+                // Cloud mode: download from cloud to default directory
+                try {
+                    String downloadedPath = CloudPluginDownloader.downloadFromCloud(
+                            PluginType.JDBC_DRIVERS, driverUrl, targetPath);
+                    return "file://" + downloadedPath;
+                } catch (Exception e) {
+                    LOG.warn("failed to download jdbc driver url: " + driverUrl, e);
+                    throw new RuntimeException("Cannot download JDBC driver from cloud: " + driverUrl
+                            + ". Please retry later or check your driver has been uploaded to cloud. Error: "
+                            + Util.getRootCauseMessage(e));
+                }
+            } else {
+                // File does not exist in both new and old default directory
+                throw new RuntimeException("JDBC driver file does not exist: " + driverUrl);
+            }
+        } else {
+            // Return user specified driver url directly.
+            return "file://" + Config.jdbc_drivers_dir + "/" + driverUrl;
         }
     }
 
@@ -331,6 +389,8 @@ public class JdbcResource extends Resource {
             return OCEANBASE;
         } else if (url.startsWith(JDBC_DB2)) {
             return DB2;
+        } else if (url.startsWith(JDBC_GBASE)) {
+            return GBASE;
         }
         throw new DdlException("Unsupported jdbc database type, please check jdbcUrl: " + url);
     }
@@ -485,4 +545,3 @@ public class JdbcResource extends Resource {
         }
     }
 }
-

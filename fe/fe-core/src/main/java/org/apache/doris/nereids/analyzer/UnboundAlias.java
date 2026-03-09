@@ -29,6 +29,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -36,21 +37,29 @@ import java.util.Optional;
  */
 public class UnboundAlias extends NamedExpression implements UnaryExpression, Unbound, PropagateNullable {
 
-    private Optional<String> alias;
+    private final Optional<String> alias;
+    private final boolean nameFromChild;
 
     public UnboundAlias(Expression child) {
-        super(ImmutableList.of(child));
-        this.alias = Optional.empty();
+        this(ImmutableList.of(child), Optional.empty());
     }
 
     public UnboundAlias(Expression child, String alias) {
-        super(ImmutableList.of(child));
-        this.alias = Optional.of(alias);
+        this(ImmutableList.of(child), Optional.of(alias));
+    }
+
+    public UnboundAlias(Expression child, String alias, boolean nameFromChild) {
+        this(ImmutableList.of(child), Optional.of(alias), nameFromChild);
     }
 
     private UnboundAlias(List<Expression> children, Optional<String> alias) {
+        this(children, alias, false);
+    }
+
+    private UnboundAlias(List<Expression> children, Optional<String> alias, boolean nameFromChild) {
         super(children);
         this.alias = alias;
+        this.nameFromChild = nameFromChild;
     }
 
     @Override
@@ -59,7 +68,7 @@ public class UnboundAlias extends NamedExpression implements UnaryExpression, Un
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         StringBuilder stringBuilder = new StringBuilder();
         stringBuilder.append("(" + child() + ")");
         alias.ifPresent(name -> stringBuilder.append(" AS " + name));
@@ -68,11 +77,41 @@ public class UnboundAlias extends NamedExpression implements UnaryExpression, Un
     }
 
     @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        if (!super.equals(o)) {
+            return false;
+        }
+        UnboundAlias other = (UnboundAlias) o;
+        return alias.equals(other.alias) && nameFromChild == other.nameFromChild;
+    }
+
+    @Override
+    public int computeHashCode() {
+        return Objects.hash(alias, nameFromChild, children());
+    }
+
+    @Override
     public String toString() {
         StringBuilder stringBuilder = new StringBuilder();
         stringBuilder.append("UnboundAlias(" + child() + ")");
         alias.ifPresent(name -> stringBuilder.append(" AS " + name));
         return stringBuilder.toString();
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(child().toDigest());
+        if (alias.isPresent()) {
+            sb.append(" AS " + alias.get());
+        }
+        return sb.toString();
     }
 
     @Override
@@ -88,5 +127,9 @@ public class UnboundAlias extends NamedExpression implements UnaryExpression, Un
 
     public Optional<String> getAlias() {
         return alias;
+    }
+
+    public boolean isNameFromChild() {
+        return nameFromChild;
     }
 }

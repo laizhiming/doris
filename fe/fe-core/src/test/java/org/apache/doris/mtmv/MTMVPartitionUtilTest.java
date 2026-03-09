@@ -19,13 +19,17 @@ package org.apache.doris.mtmv;
 
 import org.apache.doris.analysis.PartitionKeyDesc;
 import org.apache.doris.analysis.PartitionValue;
+import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo.MTMVPartitionType;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -34,6 +38,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 public class MTMVPartitionUtilTest {
@@ -50,11 +56,19 @@ public class MTMVPartitionUtilTest {
     @Mocked
     private OlapTable baseOlapTable;
     @Mocked
+    private DatabaseIf databaseIf;
+    @Mocked
+    private CatalogIf catalogIf;
+    @Mocked
     private MTMVSnapshotIf baseSnapshotIf;
     @Mocked
     private MTMVRefreshSnapshot refreshSnapshot;
     @Mocked
     private MTMVUtil mtmvUtil;
+    @Mocked
+    private MTMVRefreshContext context;
+    @Mocked
+    private MTMVBaseVersions versions;
 
     private Set<BaseTableInfo> baseTables = Sets.newHashSet();
 
@@ -66,6 +80,22 @@ public class MTMVPartitionUtilTest {
                 mtmv.getRelation();
                 minTimes = 0;
                 result = relation;
+
+                context.getMtmv();
+                minTimes = 0;
+                result = mtmv;
+
+                context.getPartitionMappings();
+                minTimes = 0;
+                result = Maps.newHashMap();
+
+                context.getBaseVersions();
+                minTimes = 0;
+                result = versions;
+
+                context.getBaseTableSnapshotCache();
+                minTimes = 0;
+                result = Maps.newHashMap();
 
                 mtmv.getPartitions();
                 minTimes = 0;
@@ -95,23 +125,19 @@ public class MTMVPartitionUtilTest {
                 minTimes = 0;
                 result = true;
 
-                baseOlapTable.getTableSnapshot();
+                baseOlapTable.getTableSnapshot((MTMVRefreshContext) any, (Optional) any);
                 minTimes = 0;
                 result = baseSnapshotIf;
-
-                mtmv.getPartitionName(anyLong);
-                minTimes = 0;
-                result = "name1";
 
                 mtmv.getRefreshSnapshot();
                 minTimes = 0;
                 result = refreshSnapshot;
 
-                refreshSnapshot.equalsWithBaseTable(anyString, anyLong, (MTMVSnapshotIf) any);
+                refreshSnapshot.equalsWithBaseTable(anyString, (BaseTableInfo) any, (MTMVSnapshotIf) any);
                 minTimes = 0;
                 result = true;
 
-                relation.getBaseTables();
+                relation.getBaseTablesOneLevelAndFromView();
                 minTimes = 0;
                 result = baseTables;
 
@@ -119,21 +145,42 @@ public class MTMVPartitionUtilTest {
                 minTimes = 0;
                 result = true;
 
-                baseOlapTable.getPartitionSnapshot(anyString);
+                baseOlapTable.getPartitionSnapshot(anyString, (MTMVRefreshContext) any, (Optional) any);
                 minTimes = 0;
                 result = baseSnapshotIf;
 
-                baseOlapTable.getPartitionName(anyLong);
-                minTimes = 0;
-                result = "name1";
-
-                refreshSnapshot.equalsWithRelatedPartition(anyString, anyString, (MTMVSnapshotIf) any);
+                refreshSnapshot.equalsWithPct(anyString, anyString, (MTMVSnapshotIf) any,
+                        (BaseTableInfo) any);
                 minTimes = 0;
                 result = true;
 
-                refreshSnapshot.getSnapshotPartitions(anyString);
+                refreshSnapshot.getPctSnapshots(anyString, (BaseTableInfo) any);
                 minTimes = 0;
                 result = Sets.newHashSet("name2");
+
+                baseOlapTable.getName();
+                minTimes = 0;
+                result = "t1";
+
+                baseOlapTable.getDatabase();
+                minTimes = 0;
+                result = databaseIf;
+
+                databaseIf.getFullName();
+                minTimes = 0;
+                result = "db1";
+
+                databaseIf.getCatalog();
+                minTimes = 0;
+                result = catalogIf;
+
+                databaseIf.getCatalog();
+                minTimes = 0;
+                result = catalogIf;
+
+                catalogIf.getName();
+                minTimes = 0;
+                result = "ctl1";
             }
         };
     }
@@ -148,7 +195,7 @@ public class MTMVPartitionUtilTest {
     public void testIsMTMVSyncNotSync() {
         new Expectations() {
             {
-                refreshSnapshot.equalsWithBaseTable(anyString, anyLong, (MTMVSnapshotIf) any);
+                refreshSnapshot.equalsWithBaseTable(anyString, (BaseTableInfo) any, (MTMVSnapshotIf) any);
                 minTimes = 0;
                 result = false;
             }
@@ -160,7 +207,7 @@ public class MTMVPartitionUtilTest {
     @Test
     public void testIsSyncWithPartition() throws AnalysisException {
         boolean isSyncWithPartition = MTMVPartitionUtil
-                .isSyncWithPartitions(mtmv, "name1", baseOlapTable, Sets.newHashSet("name2"));
+                .isSyncWithPartitions(context, "name1", Sets.newHashSet("name2"), baseOlapTable);
         Assert.assertTrue(isSyncWithPartition);
     }
 
@@ -168,13 +215,13 @@ public class MTMVPartitionUtilTest {
     public void testIsSyncWithPartitionNotEqual() throws AnalysisException {
         new Expectations() {
             {
-                refreshSnapshot.getSnapshotPartitions(anyString);
+                refreshSnapshot.getPctSnapshots(anyString, (BaseTableInfo) any);
                 minTimes = 0;
                 result = Sets.newHashSet("name2", "name3");
             }
         };
         boolean isSyncWithPartition = MTMVPartitionUtil
-                .isSyncWithPartitions(mtmv, "name1", baseOlapTable, Sets.newHashSet("name2"));
+                .isSyncWithPartitions(context, "name1", Sets.newHashSet("name2"), baseOlapTable);
         Assert.assertFalse(isSyncWithPartition);
     }
 
@@ -182,13 +229,14 @@ public class MTMVPartitionUtilTest {
     public void testIsSyncWithPartitionNotSync() throws AnalysisException {
         new Expectations() {
             {
-                refreshSnapshot.equalsWithRelatedPartition(anyString, anyString, (MTMVSnapshotIf) any);
+                refreshSnapshot.equalsWithPct(anyString, anyString, (MTMVSnapshotIf) any,
+                        (BaseTableInfo) any);
                 minTimes = 0;
                 result = false;
             }
         };
         boolean isSyncWithPartition = MTMVPartitionUtil
-                .isSyncWithPartitions(mtmv, "name1", baseOlapTable, Sets.newHashSet("name2"));
+                .isSyncWithPartitions(context, "name1", Sets.newHashSet("name2"), baseOlapTable);
         Assert.assertFalse(isSyncWithPartition);
     }
 
@@ -207,5 +255,68 @@ public class MTMVPartitionUtilTest {
         );
         String rangeName = MTMVPartitionUtil.generatePartitionName(rangeDesc);
         Assert.assertEquals("p_1_2", rangeName);
+    }
+
+    @Test
+    public void testIsTableExcluded() {
+        Set<TableNameInfo> excludedTriggerTables = Sets.newHashSet(new TableNameInfo("table1"));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table1")));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db2", "table1")));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl2", "db1", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table2")));
+
+        excludedTriggerTables = Sets.newHashSet(new TableNameInfo("db1.table1"));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db2", "table1")));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl2", "db1", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table2")));
+
+        excludedTriggerTables = Sets.newHashSet(new TableNameInfo("ctl1.db1.table1"));
+        Assert.assertTrue(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db2", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl2", "db1", "table1")));
+        Assert.assertFalse(
+                MTMVPartitionUtil.isTableExcluded(excludedTriggerTables, new TableNameInfo("ctl1", "db1", "table2")));
+    }
+
+    @Test
+    public void testIsTableNamelike() {
+        TableNameInfo tableNameToCheck = new TableNameInfo("ctl1", "db1", "table1");
+        Assert.assertTrue(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("table1"), tableNameToCheck));
+        Assert.assertTrue(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("db1.table1"), tableNameToCheck));
+        Assert.assertTrue(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl1.db1.table1"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl1.table1"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl1.db2.table1"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl1.db1.table2"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl2.db1.table1"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("db1"), tableNameToCheck));
+        Assert.assertFalse(MTMVPartitionUtil.isTableNamelike(new TableNameInfo("ctl1"), tableNameToCheck));
+    }
+
+    @Test
+    public void testGetTableSnapshotFromContext() throws AnalysisException {
+        Map<BaseTableInfo, MTMVSnapshotIf> cache = Maps.newHashMap();
+        new Expectations() {
+            {
+                context.getBaseTableSnapshotCache();
+                minTimes = 0;
+                result = cache;
+            }
+        };
+        Assert.assertTrue(cache.isEmpty());
+        MTMVPartitionUtil.getTableSnapshotFromContext(baseOlapTable, context);
+        Assert.assertEquals(1, cache.size());
+        Assert.assertEquals(baseSnapshotIf, cache.values().iterator().next());
     }
 }

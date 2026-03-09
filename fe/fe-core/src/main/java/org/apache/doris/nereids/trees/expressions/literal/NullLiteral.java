@@ -19,6 +19,7 @@ package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.types.BooleanType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.NullType;
 
@@ -27,12 +28,13 @@ import java.util.Objects;
 /**
  * Represents Null literal
  */
-public class NullLiteral extends Literal {
+public class NullLiteral extends Literal implements ComparableLiteral {
 
     public static final NullLiteral INSTANCE = new NullLiteral();
+    public static final NullLiteral BOOLEAN_INSTANCE = new NullLiteral(BooleanType.INSTANCE);
 
     public NullLiteral() {
-        super(NullType.INSTANCE);
+        this(NullType.INSTANCE);
     }
 
     public NullLiteral(DataType dataType) {
@@ -60,6 +62,14 @@ public class NullLiteral extends Literal {
     }
 
     @Override
+    public int compareTo(ComparableLiteral other) {
+        if (other instanceof NullLiteral) {
+            return 0;
+        }
+        return -1;
+    }
+
+    @Override
     public double getDouble() {
         return 0;
     }
@@ -80,7 +90,7 @@ public class NullLiteral extends Literal {
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(super.hashCode(), dataType);
+    protected int computeHashCode() {
+        return Objects.hash(super.computeHashCode(), dataType);
     }
 }

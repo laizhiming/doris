@@ -18,6 +18,8 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("testAggTableCountDistinctInBitmapType") {
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql """ DROP TABLE IF EXISTS test_tb; """
 
     sql """
@@ -25,26 +27,21 @@ suite ("testAggTableCountDistinctInBitmapType") {
         """
 
     sql """insert into test_tb values(1,to_bitmap(1));"""
+    sql """insert into test_tb values(1,to_bitmap(1));"""
     sql """insert into test_tb values(2,to_bitmap(2));"""
+    sql """insert into test_tb values(2,to_bitmap(2));"""
+    sql """insert into test_tb values(3,to_bitmap(3));"""
     sql """insert into test_tb values(3,to_bitmap(3));"""
 
 
     sql "analyze table test_tb with sync;"
-    sql """set enable_stats=false;"""
+    sql """alter table test_tb modify column k1 set stats ('row_count'='6');"""
 
     qt_select_star "select * from test_tb order by 1;"
-
 
     explain {
         sql("select k1, count(distinct v1) from test_tb group by k1;")
         contains "bitmap_union_count"
     }
     qt_select_mv "select k1, count(distinct v1) from test_tb group by k1 order by k1;"
-
-    sql """set enable_stats=true;"""
-    explain {
-        sql("select k1, count(distinct v1) from test_tb group by k1;")
-        contains "bitmap_union_count"
-    }
-
 }

@@ -26,9 +26,9 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.service.FeDiskInfo;
 import org.apache.doris.system.Frontend;
 import org.apache.doris.system.SystemInfoService.HostInfo;
+import org.apache.doris.tablefunction.FrontendsTableValuedFunction;
 
 import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -45,19 +45,6 @@ import java.util.List;
 public class FrontendsProcNode implements ProcNodeInterface {
     private static final Logger LOG = LogManager.getLogger(FrontendsProcNode.class);
 
-    public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
-            .add("Name").add("Host").add("EditLogPort").add("HttpPort").add("QueryPort").add("RpcPort")
-            .add("ArrowFlightSqlPort").add("Role").add("IsMaster").add("ClusterId").add("Join").add("Alive")
-            .add("ReplayedJournalId").add("LastStartTime").add("LastHeartbeat")
-            .add("IsHelper").add("ErrMsg").add("Version")
-            .add("CurrentConnected")
-            .build();
-
-    public static final ImmutableList<String> DISK_TITLE_NAMES = new ImmutableList.Builder<String>()
-            .add("Name").add("Host").add("DirType").add("Dir").add("Filesystem")
-            .add("Capacity").add("Used").add("Available").add("UseRate").add("MountOn")
-            .build();
-
     private Env env;
 
     public FrontendsProcNode(Env env) {
@@ -67,7 +54,7 @@ public class FrontendsProcNode implements ProcNodeInterface {
     @Override
     public ProcResult fetchResult() {
         BaseProcResult result = new BaseProcResult();
-        result.setNames(TITLE_NAMES);
+        result.setNames(FrontendsTableValuedFunction.getFrontendsTitleNames());
 
         List<List<String>> infos = Lists.newArrayList();
 
@@ -126,7 +113,9 @@ public class FrontendsProcNode implements ProcNodeInterface {
             selfNode = ConnectContext.get().getCurrentConnectedFEIp();
         }
 
-        for (Frontend fe : env.getFrontends(null /* all */)) {
+        List<Frontend> envFes = env.getFrontends(null /* all */);
+        LOG.info("bdbje fes {}, env fes {}", allFe, envFes);
+        for (Frontend fe : envFes) {
             List<String> info = new ArrayList<String>();
             info.add(fe.getNodeName());
             info.add(fe.getHost());
@@ -166,9 +155,19 @@ public class FrontendsProcNode implements ProcNodeInterface {
             info.add(fe.getVersion());
             // To indicate which FE we currently connected
             info.add(fe.getHost().equals(selfNode) ? "Yes" : "No");
+            info.add(TimeUtils.longToTimeString(fe.getLiveSince()));
 
             infos.add(info);
         }
+    }
+
+    public static Frontend getCurrentFrontendVersion(Env env) {
+        for (Frontend fe : env.getFrontends(null /* all */)) {
+            if (fe.getHost().equals(env.getSelfNode().getHost())) {
+                return fe;
+            }
+        }
+        return null;
     }
 
     public static void getFrontendsDiskInfo(Env env, List<List<String>> infos) {
@@ -202,11 +201,6 @@ public class FrontendsProcNode implements ProcNodeInterface {
             if (fe.getEditLogPort() != addr.getPort()) {
                 continue;
             }
-            if (!Strings.isNullOrEmpty(addr.getHostName())) {
-                if (addr.getHostName().equals(fe.getHost())) {
-                    return true;
-                }
-            }
             // if hostname of InetSocketAddress is ip, addr.getHostName() may be not equal to fe.getIp()
             // so we need to compare fe.getIp() with address.getHostAddress()
             InetAddress address = addr.getAddress();
@@ -216,6 +210,22 @@ public class FrontendsProcNode implements ProcNodeInterface {
             }
             if (fe.getHost().equals(address.getHostAddress())) {
                 return true;
+            }
+        }
+
+        // Avoid calling getHostName multiple times, don't remove it
+        for (InetSocketAddress addr : allFeHosts) {
+            // Avoid calling getHostName multiple times, don't remove it
+            if (fe.getEditLogPort() != addr.getPort()) {
+                continue;
+            }
+            // https://bugs.openjdk.org/browse/JDK-8143378#:~:text=getHostName()%3B%20takes%20about%205,millisecond%20on%20JDK%20update%2051
+            // getHostName sometime has bug, take 5s
+            String host = addr.getHostName();
+            if (!Strings.isNullOrEmpty(host)) {
+                if (host.equals(fe.getHost())) {
+                    return true;
+                }
             }
         }
         return false;

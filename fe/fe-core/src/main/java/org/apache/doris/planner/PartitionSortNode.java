@@ -21,7 +21,6 @@ import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.SortInfo;
 import org.apache.doris.nereids.trees.plans.PartitionTopnPhase;
 import org.apache.doris.nereids.trees.plans.WindowFuncType;
-import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPartTopNPhase;
 import org.apache.doris.thrift.TPartitionSortNode;
@@ -54,7 +53,7 @@ public class PartitionSortNode extends PlanNode {
      */
     public PartitionSortNode(PlanNodeId id, PlanNode input, WindowFuncType function, List<Expr> partitionExprs,
             SortInfo info, boolean hasGlobalLimit, long partitionLimit, PartitionTopnPhase phase) {
-        super(id, "PartitionTopN", StatisticalType.PARTITION_TOPN_NODE);
+        super(id, "PartitionTopN");
         Preconditions.checkArgument(info.getOrderingExprs().size() == info.getIsAscOrder().size());
         this.function = function;
         this.partitionExprs = partitionExprs;
@@ -63,13 +62,7 @@ public class PartitionSortNode extends PlanNode {
         this.partitionLimit = partitionLimit;
         this.phase = phase;
         this.tupleIds.addAll(Lists.newArrayList(info.getSortTupleDescriptor().getId()));
-        this.tblRefIds.addAll(Lists.newArrayList(info.getSortTupleDescriptor().getId()));
-        this.nullableTupleIds.addAll(input.getNullableTupleIds());
         this.children.add(input);
-    }
-
-    public SortInfo getSortInfo() {
-        return info;
     }
 
     @Override
@@ -142,7 +135,10 @@ public class PartitionSortNode extends PlanNode {
         Preconditions.checkState(tupleIds.size() == 1, "Incorrect size for tupleIds in PartitionSortNode");
 
         TopNAlgorithm topNAlgorithm;
-        if (function == WindowFuncType.ROW_NUMBER) {
+        if (hasGlobalLimit) {
+            // only need row number if has global limit, so we change algorithm directly
+            topNAlgorithm = TopNAlgorithm.ROW_NUMBER;
+        } else if (function == WindowFuncType.ROW_NUMBER) {
             topNAlgorithm = TopNAlgorithm.ROW_NUMBER;
         } else if (function == WindowFuncType.RANK) {
             topNAlgorithm = TopNAlgorithm.RANK;

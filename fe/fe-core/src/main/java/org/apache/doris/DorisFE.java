@@ -27,13 +27,17 @@ import org.apache.doris.common.Log4jConfig;
 import org.apache.doris.common.LogUtils;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.Version;
+import org.apache.doris.common.lock.DeadlockMonitor;
 import org.apache.doris.common.util.JdkUtils;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.httpv2.HttpServer;
 import org.apache.doris.journal.bdbje.BDBDebugger;
 import org.apache.doris.journal.bdbje.BDBTool;
 import org.apache.doris.journal.bdbje.BDBToolOptions;
 import org.apache.doris.persist.meta.MetaReader;
+import org.apache.doris.qe.Coordinator;
+import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.QeService;
 import org.apache.doris.qe.SimpleScheduler;
 import org.apache.doris.service.ExecuteEnv;
@@ -47,6 +51,7 @@ import io.netty.util.internal.logging.Log4JLoggerFactory;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.logging.log4j.LogManager;
@@ -60,6 +65,11 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.StandardOpenOption;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class DorisFE {
     private static final Logger LOG = LogManager.getLogger(DorisFE.class);
@@ -78,6 +88,12 @@ public class DorisFE {
     private static FileChannel processLockFileChannel;
     private static FileLock processFileLock;
 
+    // set to true when all servers are ready.
+    private static final AtomicBoolean serverReady = new AtomicBoolean(false);
+
+    // HTTP server instance, used for graceful shutdown
+    private static HttpServer httpServer;
+
     public static void main(String[] args) {
         // Every doris version should have a final meta version, it should not change
         // between small releases. Add a check here to avoid mistake.
@@ -95,11 +111,15 @@ public class DorisFE {
         start(DORIS_HOME_DIR, PID_DIR, args, options);
     }
 
+    private static void startMonitor() {
+        if (Config.enable_deadlock_detection) {
+            DeadlockMonitor deadlockMonitor = new DeadlockMonitor();
+            deadlockMonitor.startMonitoring(Config.deadlock_detection_interval_minute, TimeUnit.MINUTES);
+        }
+    }
+
     // entrance for doris frontend
     public static void start(String dorisHomeDir, String pidDir, String[] args, StartupOptions options) {
-        if (System.getenv("DORIS_LOG_TO_STDERR") != null) {
-            Log4jConfig.foreground = true;
-        }
         if (Strings.isNullOrEmpty(dorisHomeDir)) {
             System.err.println("env DORIS_HOME is not set.");
             return;
@@ -132,8 +152,25 @@ public class DorisFE {
                 throw new IllegalArgumentException("Java version doesn't match");
             }
 
+            // Set foreground flag after Config.init() but before Log4jConfig class loading,
+            // so that Log4jConfig's static block can read the correct config values (e.g. log_rollover_strategy).
+            if (System.getenv("DORIS_LOG_TO_STDERR") != null) {
+                Log4jConfig.foreground = true;
+            }
             Log4jConfig.initLogging(dorisHomeDir + "/conf/");
-            Runtime.getRuntime().addShutdownHook(new Thread(LogManager::shutdown));
+            // Add shutdown hook for graceful exit
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                LOG.info("Received shutdown signal, starting graceful shutdown...");
+                serverReady.set(false);
+                gracefulShutdown();
+
+                // Shutdown HTTP server after main process graceful shutdown is complete
+                if (httpServer != null) {
+                    httpServer.shutdown();
+                }
+
+                LogManager.shutdown();
+            }));
 
             // set dns cache ttl
             java.security.Security.setProperty("networkaddress.cache.ttl", "60");
@@ -152,6 +189,8 @@ public class DorisFE {
                 LOG.error("start doris failed.", e);
                 System.exit(-1);
             }
+
+            fuzzyConfigs();
 
             LOG.info("Doris FE starting...");
 
@@ -174,6 +213,14 @@ public class DorisFE {
             System.setProperty("software.amazon.awssdk.http.service.impl",
                     "software.amazon.awssdk.http.urlconnection.UrlConnectionSdkHttpService");
 
+            if (cmdLineOpts.getClusterSnapshotPath() != null) {
+                String clusterSnapshotPath = cmdLineOpts.getClusterSnapshotPath();
+                if (!clusterSnapshotPath.startsWith("/")) {
+                    // relative path
+                    clusterSnapshotPath = dorisHomeDir + "/" + clusterSnapshotPath;
+                }
+                Env.getCurrentEnv().setClusterSnapshotFile(clusterSnapshotPath);
+            }
             // init catalog and wait it be ready
             Env.getCurrentEnv().initialize(args);
             Env.getCurrentEnv().waitForReady();
@@ -186,7 +233,7 @@ public class DorisFE {
             feServer.start();
 
             if (options.enableHttpServer) {
-                HttpServer httpServer = new HttpServer();
+                httpServer = new HttpServer();
                 httpServer.setPort(Config.http_port);
                 httpServer.setHttpsPort(Config.https_port);
                 httpServer.setMaxHttpPostSize(Config.jetty_server_max_http_post_size);
@@ -214,15 +261,21 @@ public class DorisFE {
             }
 
             ThreadPoolManager.registerAllThreadPoolMetric();
+            startMonitor();
 
+            serverReady.set(true);
+
+            // JVM will exit when shutdown hook is completed
             while (true) {
                 Thread.sleep(2000);
             }
         } catch (Throwable e) {
-            // Some exception may thrown before LOG is inited.
+            // Some exception may throw before LOG is inited.
             // So need to print to stdout
             e.printStackTrace();
-            LOG.warn("", e);
+            LOG.error("", e);
+            // to avoid nonDaemon Thread block main Thread, we need to force exit
+            System.exit(-1);
         }
     }
 
@@ -299,6 +352,10 @@ public class DorisFE {
         options.addOption("m", "metaversion", true, "Specify the meta version to decode log value");
         options.addOption("r", FeConstants.METADATA_FAILURE_RECOVERY_KEY, false,
                 "Check if the specified metadata recover is valid");
+        options.addOption(Option.builder().longOpt(FeConstants.RECOVERY_JOURNAL_ID_KEY).hasArg()
+                .desc("Specify the recovery truncate journal id, and journals greater than this id will be removed")
+                .build());
+        options.addOption("c", "cluster_snapshot", true, "Specify the cluster snapshot json file");
 
         CommandLine cmd = null;
         try {
@@ -334,6 +391,14 @@ public class DorisFE {
         }
         if (cmd.hasOption('r') || cmd.hasOption(FeConstants.METADATA_FAILURE_RECOVERY_KEY)) {
             System.setProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY, "true");
+        }
+        if (cmd.hasOption(FeConstants.RECOVERY_JOURNAL_ID_KEY)) {
+            String recoveryJournalId = cmd.getOptionValue(FeConstants.RECOVERY_JOURNAL_ID_KEY);
+            if (Strings.isNullOrEmpty(recoveryJournalId)) {
+                System.err.println("recovery_journal_id is missing");
+                System.exit(-1);
+            }
+            System.setProperty(FeConstants.RECOVERY_JOURNAL_ID_KEY, recoveryJournalId.trim());
         }
         if (cmd.hasOption('b') || cmd.hasOption("bdb")) {
             if (cmd.hasOption('l') || cmd.hasOption("listdb")) {
@@ -386,6 +451,15 @@ public class DorisFE {
                 System.exit(-1);
             }
         }
+        // cluster snapshot
+        if (cmd.hasOption('c') || cmd.hasOption("cluster_snapshot")) {
+            String clusterSnapshotFile = cmd.getOptionValue("cluster_snapshot");
+            if (Strings.isNullOrEmpty(clusterSnapshotFile)) {
+                System.err.println("Missing cluster_snapshot file");
+                System.exit(-1);
+            }
+            return new CommandLineOptions(false, null, null, "", clusterSnapshotFile.trim());
+        }
 
         // helper node is null, means no helper node is specified
         return new CommandLineOptions(false, null, null, "");
@@ -403,6 +477,18 @@ public class DorisFE {
         LOG.info("Build info: {}", Version.DORIS_BUILD_INFO);
         LOG.info("Build hash: {}", Version.DORIS_BUILD_HASH);
         LOG.info("Java compile version: {}", Version.DORIS_JAVA_COMPILE_VERSION);
+
+        if (!Version.DORIS_FEATURE_LIST.isEmpty()) {
+            LogUtils.stdout("Features: " + Version.DORIS_FEATURE_LIST);
+            LOG.info("Features: {}", Version.DORIS_FEATURE_LIST);
+        }
+
+        if (Config.isCloudMode()) {
+            LogUtils.stdout("Run FE in the cloud mode, cloud_unique_id: " + Config.cloud_unique_id
+                    + ", meta_service_endpoint: " + Config.meta_service_endpoint);
+        } else {
+            LogUtils.stdout("Run FE in the local mode");
+        }
     }
 
     private static void checkCommandLineOptions(CommandLineOptions cmdLineOpts) {
@@ -483,7 +569,7 @@ public class DorisFE {
             releaseFileLockAndCloseFileChannel();
             throw new RuntimeException("Try to lock process failed", e);
         }
-        throw new RuntimeException("FE process has been started，please do not start multiple FE processes at the "
+        throw new RuntimeException("FE process has been started, please do not start multiple FE processes at the "
                 + "same time");
     }
 
@@ -511,8 +597,66 @@ public class DorisFE {
         }
     }
 
+    private static void fuzzyConfigs() {
+        if (!Config.use_fuzzy_conf) {
+            return;
+        }
+
+        // Keep global fuzzy knobs that are not session-based.
+        if (Config.fuzzy_test_type.equalsIgnoreCase("daily")
+                || Config.fuzzy_test_type.equalsIgnoreCase("rqg")) {
+            Config.random_add_order_by_keys_for_mow = (LocalDate.now().getDayOfMonth() % 2 == 0);
+            LOG.info("fuzzy set random_add_order_by_keys_for_mow={}", Config.random_add_order_by_keys_for_mow);
+        }
+
+        Config.enable_txn_log_outside_lock = new Random().nextBoolean();
+        LOG.info("fuzzy set enable_txn_log_outside_lock={}", Config.enable_txn_log_outside_lock);
+        Config.enable_batch_editlog = new Random().nextBoolean();
+        LOG.info("fuzzy set enable_batch_editlog={}", Config.enable_batch_editlog);
+
+        setFuzzyForCatalog();
+    }
+
+    private static void setFuzzyForCatalog() {
+        if (!Config.fuzzy_test_type.equals("external")) {
+            return;
+        }
+
+        Config.max_hive_partition_cache_num = Util.getRandomLong(0, 10, 10000);
+        Config.max_hive_partition_table_cache_num = Util.getRandomLong(0, 10, 10000);
+        Config.external_cache_expire_time_seconds_after_access = Util.getRandomLong(0, 1, 10, 86400);
+        Config.external_cache_refresh_time_minutes = Util.getRandomLong(1, 10);
+        Config.max_external_cache_loader_thread_pool_size = Util.getRandomInt(1, 10, 64);
+        Config.max_external_file_cache_num = Util.getRandomInt(0, 10, 10000);
+        Config.max_external_schema_cache_num = Util.getRandomInt(0, 1, 10, 10000);
+        Config.max_external_table_cache_num = Util.getRandomInt(0, 1, 10, 10000);
+        Config.max_external_table_row_count_cache_num = Util.getRandomInt(0, 1, 10, 100000);
+        Config.max_external_table_split_file_meta_cache_num = Util.getRandomInt(0, 1, 10, 100000);
+    }
+
     public static class StartupOptions {
         public boolean enableHttpServer = true;
         public boolean enableQeService = true;
+    }
+
+    public static boolean isServerReady() {
+        return serverReady.get();
+    }
+
+    private static void gracefulShutdown() {
+        // wait for all queries to finish
+        try {
+            long now = System.currentTimeMillis();
+            List<Coordinator> allCoordinators = QeProcessorImpl.INSTANCE.getAllCoordinators();
+            while (!allCoordinators.isEmpty() && System.currentTimeMillis() - now < 300 * 1000L) {
+                Thread.sleep(1000);
+                allCoordinators = QeProcessorImpl.INSTANCE.getAllCoordinators();
+                LOG.info("waiting {} queries to finish before shutdown", allCoordinators.size());
+            }
+        } catch (Throwable t) {
+            LOG.error("", t);
+        }
+
+        LOG.info("graceful shutdown finished");
     }
 }

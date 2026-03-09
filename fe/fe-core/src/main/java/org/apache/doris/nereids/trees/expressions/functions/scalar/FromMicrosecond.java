@@ -20,7 +20,9 @@ package org.apache.doris.nereids.trees.expressions.functions.scalar;
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
-import org.apache.doris.nereids.trees.expressions.functions.PropagateNullableOnDateLikeV2Args;
+import org.apache.doris.nereids.trees.expressions.functions.FromSecondMonotonic;
+import org.apache.doris.nereids.trees.expressions.functions.PropagateNullLiteral;
+import org.apache.doris.nereids.trees.expressions.functions.PropagateNullable;
 import org.apache.doris.nereids.trees.expressions.shape.BinaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.BigIntType;
@@ -35,19 +37,26 @@ import java.util.List;
  * ScalarFunction 'from_microsecond'.
  */
 public class FromMicrosecond extends ScalarFunction
-        implements BinaryExpression, ExplicitlyCastableSignature, PropagateNullableOnDateLikeV2Args {
+        implements BinaryExpression, ExplicitlyCastableSignature, PropagateNullLiteral, PropagateNullable,
+        FromSecondMonotonic {
 
+    public static final int RESULT_SCALE = 6;
     private static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
-            FunctionSignature.ret(DateTimeV2Type.MAX).args(BigIntType.INSTANCE));
+            FunctionSignature.ret(DateTimeV2Type.of(RESULT_SCALE)).args(BigIntType.INSTANCE));
 
     public FromMicrosecond(Expression arg0) {
         super("from_microsecond", arg0);
     }
 
+    /** constructor for withChildren and reuse signature */
+    private FromMicrosecond(ScalarFunctionParams functionParams) {
+        super(functionParams);
+    }
+
     @Override
     public FromMicrosecond withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new FromMicrosecond(children.get(0));
+        return new FromMicrosecond(getFunctionParams(children));
     }
 
     @Override
@@ -58,5 +67,10 @@ public class FromMicrosecond extends ScalarFunction
     @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitScalarFunction(this, context);
+    }
+
+    @Override
+    public Expression withConstantArgs(Expression literal) {
+        return new FromMicrosecond(literal);
     }
 }

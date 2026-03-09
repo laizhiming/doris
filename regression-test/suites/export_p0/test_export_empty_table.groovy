@@ -30,7 +30,12 @@ suite("test_export_empty_table", "p0") {
     // check whether the FE config 'enable_outfile_to_local' is true
     StringBuilder strBuilder = new StringBuilder()
     strBuilder.append("curl --location-trusted -u " + context.config.jdbcUser + ":" + context.config.jdbcPassword)
-    strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+        strBuilder.append(" https://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+        strBuilder.append(" --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey"))
+    } else {
+        strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    }
 
     String command = strBuilder.toString()
     def process = command.toString().execute()
@@ -56,8 +61,8 @@ suite("test_export_empty_table", "p0") {
     }
 
     def table_export_name = "test_export_empty_table"
-    def table_load_name = "test_load_empty_table"
-    def outfile_path_prefix = """/tmp/test_export"""
+    def outfile_path_prefix = """/tmp/test_export_empty_table"""
+    def local_tvf_prefix = "tmp/test_export_empty_table"
 
     // create table
     sql """ DROP TABLE IF EXISTS ${table_export_name} """
@@ -84,29 +89,13 @@ suite("test_export_empty_table", "p0") {
    
     qt_select_export1 """ SELECT * FROM ${table_export_name} t ORDER BY user_id; """
 
+    def machine_user_name = "root"
     def check_path_exists = { dir_path ->
-        File path = new File(dir_path)
-        if (!path.exists()) {
-            assert path.mkdirs()
-        } else {
-            throw new IllegalStateException("""${dir_path} already exists! """)
-        }
-    }
-
-    def check_file_amounts = { dir_path, amount ->
-        File path = new File(dir_path)
-        File[] files = path.listFiles()
-        assert files.length == amount
+        mkdirRemotePathOnAllBE(machine_user_name, dir_path)
     }
 
     def delete_files = { dir_path ->
-        File path = new File(dir_path)
-        if (path.exists()) {
-            for (File f: path.listFiles()) {
-                f.delete();
-            }
-            path.delete();
-        }
+        deleteRemotePathOnAllBE(machine_user_name, dir_path)
     }
 
     def waiting_export = { export_label ->
@@ -125,7 +114,7 @@ suite("test_export_empty_table", "p0") {
 
     // 1. test csv
     def uuid = UUID.randomUUID().toString()
-    def outFilePath = """${outfile_path_prefix}_${uuid}"""
+    def outFilePath = "${outfile_path_prefix}/${table_export_name}_${uuid}"
     def label = "label_${uuid}"
     try {
         // check export path
@@ -142,8 +131,25 @@ suite("test_export_empty_table", "p0") {
         """
         waiting_export.call(label)
         
-        // check file amounts
-        check_file_amounts.call("${outFilePath}", 0)
+        // use local() tvf to check
+        def ipList = [:]
+        def portList = [:]
+        getBackendIpHeartbeatPort(ipList, portList)
+        ipList.each { beid, ip ->
+            test {
+                sql """
+                    select * from local(
+                    "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                    "backend_id" = "${beid}",
+                    "format" = "csv",
+                    "column_separator" = ",");
+                """
+
+                // because we export the empty data,
+                // there is no files.
+                exception "get file list from backend failed."
+            }
+        }
     } finally {
         delete_files.call("${outFilePath}")
     }
@@ -151,7 +157,7 @@ suite("test_export_empty_table", "p0") {
 
     // 2. test parquet
     uuid = UUID.randomUUID().toString()
-    outFilePath = """${outfile_path_prefix}_${uuid}"""
+    outFilePath = "${outfile_path_prefix}/${table_export_name}_${uuid}"
     label = "label_${uuid}"
     try {
         // check export path
@@ -167,15 +173,32 @@ suite("test_export_empty_table", "p0") {
         """
         waiting_export.call(label)
         
-        // check file amounts
-        check_file_amounts.call("${outFilePath}", 0)
+        // use local() tvf to reload the data
+        def ipList = [:]
+        def portList = [:]
+        getBackendIpHeartbeatPort(ipList, portList)
+        ipList.each { beid, ip ->
+            test {
+                sql """
+                    select * from local(
+                    "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                    "backend_id" = "${beid}",
+                    "format" = "csv",
+                    "column_separator" = ",");
+                """
+
+                // because we export the empty data,
+                // there is no files.
+                exception "get file list from backend failed."
+            }
+         }
     } finally {
         delete_files.call("${outFilePath}")
     }
 
     // 3. test orc
     uuid = UUID.randomUUID().toString()
-    outFilePath = """${outfile_path_prefix}_${uuid}"""
+    outFilePath = "${outfile_path_prefix}/${table_export_name}_${uuid}"
     label = "label_${uuid}"
     try {
         // check export path
@@ -191,15 +214,32 @@ suite("test_export_empty_table", "p0") {
         """
         waiting_export.call(label)
         
-        // check file amounts
-        check_file_amounts.call("${outFilePath}", 0)
+        // use local() tvf to reload the data
+        def ipList = [:]
+        def portList = [:]
+        getBackendIpHeartbeatPort(ipList, portList)
+        ipList.each { beid, ip ->
+            test {
+                sql """
+                    select * from local(
+                    "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                    "backend_id" = "${beid}",
+                    "format" = "csv",
+                    "column_separator" = ",");
+                """
+
+                // because we export the empty data,
+                // there is no files.
+                exception "get file list from backend failed."
+            }
+        }
     } finally {
         delete_files.call("${outFilePath}")
     }
 
     // 4. test csv_with_names
     uuid = UUID.randomUUID().toString()
-    outFilePath = """${outfile_path_prefix}_${uuid}"""
+    outFilePath = "${outfile_path_prefix}/${table_export_name}_${uuid}"
     label = "label_${uuid}"
     try {
         // check export path
@@ -216,17 +256,33 @@ suite("test_export_empty_table", "p0") {
         """
         waiting_export.call(label)
         
-        // check file amounts
-        check_file_amounts.call("${outFilePath}", 0)
+        // use local() tvf to reload the data
+        def ipList = [:]
+        def portList = [:]
+        getBackendIpHeartbeatPort(ipList, portList)
+        ipList.each { beid, ip ->
+            test {
+                sql """
+                    select * from local(
+                    "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                    "backend_id" = "${beid}",
+                    "format" = "csv",
+                    "column_separator" = ",");
+                """
+
+                // because we export the empty data,
+                // there is no files.
+                exception "get file list from backend failed."
+            }
+        }
     } finally {
-        try_sql("DROP TABLE IF EXISTS ${table_load_name}")
         delete_files.call("${outFilePath}")
     }
 
 
     // 5. test csv_with_names_and_types
     uuid = UUID.randomUUID().toString()
-    outFilePath = """${outfile_path_prefix}_${uuid}"""
+    outFilePath = "${outfile_path_prefix}/${table_export_name}_${uuid}"
     label = "label_${uuid}"
     try {
         // check export path
@@ -243,8 +299,25 @@ suite("test_export_empty_table", "p0") {
         """
         waiting_export.call(label)
         
-        // check file amounts
-        check_file_amounts.call("${outFilePath}", 0)
+        // use local() tvf to reload the data
+        def ipList = [:]
+        def portList = [:]
+        getBackendIpHeartbeatPort(ipList, portList)
+        ipList.each { beid, ip ->
+            test {
+                sql """
+                    select * from local(
+                    "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                    "backend_id" = "${beid}",
+                    "format" = "csv",
+                    "column_separator" = ",");
+                """
+
+                // because we export the empty data,
+                // there is no files.
+                exception "get file list from backend failed."
+            }
+        }
     } finally {
         delete_files.call("${outFilePath}")
     }

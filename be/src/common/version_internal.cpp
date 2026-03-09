@@ -34,6 +34,9 @@ int doris_build_version_minor() {
 int doris_build_version_patch() {
     return DORIS_BUILD_VERSION_PATCH;
 }
+int doris_build_version_hotfix() {
+    return DORIS_BUILD_VERSION_HOTFIX;
+}
 const char* doris_build_version_rc_version() {
     return DORIS_BUILD_VERSION_RC_VERSION;
 }
@@ -52,6 +55,9 @@ const char* doris_build_time() {
 }
 const char* doris_build_info() {
     return DORIS_BUILD_INFO;
+}
+const std::string doris_feature_list() {
+    return std::string(DORIS_FEATURE_LIST);
 }
 
 } // namespace version

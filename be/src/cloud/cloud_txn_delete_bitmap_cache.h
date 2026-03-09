@@ -19,18 +19,18 @@
 
 #include <mutex>
 
-#include "olap/lru_cache.h"
-#include "olap/olap_common.h"
-#include "olap/partial_update_info.h"
-#include "olap/rowset/rowset.h"
-#include "olap/tablet_meta.h"
-#include "olap/txn_manager.h"
+#include "storage/olap_common.h"
+#include "storage/partial_update_info.h"
+#include "storage/rowset/rowset.h"
+#include "storage/tablet/tablet_meta.h"
+#include "storage/txn/txn_manager.h"
 #include "util/countdown_latch.h"
+#include "util/lru_cache.h"
 
 namespace doris {
 
 // Record transaction related delete bitmaps using a lru cache.
-class CloudTxnDeleteBitmapCache : public LRUCachePolicyTrackingManual {
+class CloudTxnDeleteBitmapCache : public LRUCachePolicy {
 public:
     CloudTxnDeleteBitmapCache(size_t size_in_bytes);
 
@@ -42,22 +42,37 @@ public:
                                RowsetSharedPtr* rowset, DeleteBitmapPtr* delete_bitmap,
                                RowsetIdUnorderedSet* rowset_ids, int64_t* txn_expiration,
                                std::shared_ptr<PartialUpdateInfo>* partial_update_info,
-                               std::shared_ptr<PublishStatus>* publish_status);
+                               std::shared_ptr<PublishStatus>* publish_status,
+                               TxnPublishInfo* previous_publish_info);
 
     void set_tablet_txn_info(TTransactionId transaction_id, int64_t tablet_id,
                              DeleteBitmapPtr delete_bitmap, const RowsetIdUnorderedSet& rowset_ids,
                              RowsetSharedPtr rowset, int64_t txn_expirationm,
                              std::shared_ptr<PartialUpdateInfo> partial_update_info);
 
-    void update_tablet_txn_info(TTransactionId transaction_id, int64_t tablet_id,
-                                DeleteBitmapPtr delete_bitmap,
-                                const RowsetIdUnorderedSet& rowset_ids,
-                                PublishStatus publish_status);
+    Status update_tablet_txn_info(TTransactionId transaction_id, int64_t tablet_id,
+                                  DeleteBitmapPtr delete_bitmap,
+                                  const RowsetIdUnorderedSet& rowset_ids,
+                                  PublishStatus publish_status, TxnPublishInfo publish_info = {});
 
     void remove_expired_tablet_txn_info();
 
     void remove_unused_tablet_txn_info(TTransactionId transaction_id, int64_t tablet_id);
 
+    // Mark a rowset as empty/skipped (lightweight marker, no rowset stored)
+    // Used for empty rowsets when skip_writing_empty_rowset_metadata is enabled
+    void mark_empty_rowset(TTransactionId txn_id, int64_t tablet_id, int64_t txn_expiration);
+
+    // Check if this is a known empty/skipped rowset
+    // Returns true if was marked as empty rowset
+    // Note: Does not remove the marker, as CalcDeleteBitmapTask may retry.
+    // Cleanup is handled by expiration-based removal in remove_expired_tablet_txn_info()
+    bool is_empty_rowset(TTransactionId txn_id, int64_t tablet_id);
+
+    // !!!ATTENTION!!!: the delete bitmap stored in CloudTxnDeleteBitmapCache contains sentinel marks,
+    // and the version in BitmapKey is DeleteBitmap::TEMP_VERSION_COMMON.
+    // when using delete bitmap from this cache, the caller should manually remove these marks if don't need it
+    // and should replace versions in BitmapKey by the correct version
     Status get_delete_bitmap(TTransactionId transaction_id, int64_t tablet_id,
                              DeleteBitmapPtr* delete_bitmap, RowsetIdUnorderedSet* rowset_ids,
                              std::shared_ptr<PublishStatus>* publish_status);
@@ -88,6 +103,8 @@ private:
         int64_t txn_expiration;
         std::shared_ptr<PartialUpdateInfo> partial_update_info;
         std::shared_ptr<PublishStatus> publish_status = nullptr;
+        // used to determine if the retry needs to re-calculate the delete bitmap
+        TxnPublishInfo publish_info;
         TxnVal() : txn_expiration(0) {};
         TxnVal(RowsetSharedPtr rowset_, int64_t txn_expiration_,
                std::shared_ptr<PartialUpdateInfo> partial_update_info_,
@@ -100,8 +117,11 @@ private:
 
     std::map<TxnKey, TxnVal> _txn_map;
     std::multimap<int64_t, TxnKey> _expiration_txn;
+    // Lightweight markers for empty/skipped rowsets (only stores TxnKey, ~16 bytes per entry)
+    // Used to track empty rowsets that were not committed to meta-service
+    std::set<TxnKey> _empty_rowset_markers;
     std::shared_mutex _rwlock;
-    scoped_refptr<Thread> _clean_thread;
+    std::shared_ptr<Thread> _clean_thread;
     CountDownLatch _stop_latch;
 };
 

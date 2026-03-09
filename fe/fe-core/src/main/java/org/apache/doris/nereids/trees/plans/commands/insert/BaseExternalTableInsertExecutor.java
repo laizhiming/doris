@@ -18,10 +18,13 @@
 package org.apache.doris.nereids.trees.plans.commands.insert;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.profile.SummaryProfile;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -37,6 +40,7 @@ import org.apache.doris.transaction.TransactionStatus;
 import org.apache.doris.transaction.TransactionType;
 
 import com.google.common.base.Strings;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -47,8 +51,6 @@ import java.util.Optional;
  */
 public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExecutor {
     private static final Logger LOG = LogManager.getLogger(BaseExternalTableInsertExecutor.class);
-    private static final long INVALID_TXN_ID = -1L;
-    protected long txnId = INVALID_TXN_ID;
     protected TransactionStatus txnStatus = TransactionStatus.ABORTED;
     protected final TransactionManager transactionManager;
     protected final String catalogName;
@@ -60,8 +62,8 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
     public BaseExternalTableInsertExecutor(ConnectContext ctx, ExternalTable table,
                                            String labelName, NereidsPlanner planner,
                                            Optional<InsertCommandContext> insertCtx,
-                                           boolean emptyInsert) {
-        super(ctx, table, labelName, planner, insertCtx, emptyInsert);
+                                           boolean emptyInsert, long jobId) {
+        super(ctx, table, labelName, planner, insertCtx, emptyInsert, jobId);
         catalogName = table.getCatalog().getName();
         transactionManager = table.getCatalog().getTransactionManager();
 
@@ -69,15 +71,6 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
             summaryProfile = Optional.of(ConnectContext.get().getExecutor().getSummaryProfile());
         }
     }
-
-    public long getTxnId() {
-        return txnId;
-    }
-
-    /**
-     * collect commit infos from BEs
-     */
-    protected abstract void setCollectCommitInfoFunc();
 
     /**
      * At this time, FE has successfully collected all commit information from BEs.
@@ -93,7 +86,6 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
     @Override
     public void beginTransaction() {
         txnId = transactionManager.begin();
-        setCollectCommitInfoFunc();
     }
 
     @Override
@@ -101,17 +93,50 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
         if (ctx.getState().getStateType() == QueryState.MysqlStateType.ERR) {
             LOG.warn("errors when abort txn. {}", ctx.getQueryIdentifier());
         } else {
-            doBeforeCommit();
             summaryProfile.ifPresent(profile -> profile.setTransactionBeginTime(transactionType()));
-            transactionManager.commit(txnId);
-            summaryProfile.ifPresent(SummaryProfile::setTransactionEndTime);
+            long t0 = System.currentTimeMillis();
+            doBeforeCommit();
+            long t1 = System.currentTimeMillis();
+            if (table instanceof ExternalTable) {
+                try {
+                    ExternalTable externalTable = (ExternalTable) table;
+                    externalTable.getCatalog().getExecutionAuthenticator().execute(() -> {
+                        try {
+                            transactionManager.commit(txnId);
+                        } catch (UserException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                } catch (Exception e) {
+                    throw new UserException(Util.getRootCauseMessage(e), e);
+                }
+            } else {
+                transactionManager.commit(txnId);
+            }
             txnStatus = TransactionStatus.COMMITTED;
-            Env.getCurrentEnv().getRefreshManager().refreshTable(
-                    catalogName,
-                    table.getDatabase().getFullName(),
-                    table.getName(),
-                    true);
+            long t2 = System.currentTimeMillis();
+
+            // Handle post-commit operations (e.g., cache refresh)
+            doAfterCommit();
+            long t3 = System.currentTimeMillis();
+            LOG.info("Transaction commit breakdown: doBeforeCommit={}ms, commit={}ms, doAfterCommit={}ms, total={}ms",
+                    t1 - t0, t2 - t1, t3 - t2, t3 - t0);
+            summaryProfile.ifPresent(SummaryProfile::setTransactionEndTime);
         }
+    }
+
+    /**
+     * Called after transaction commit.
+     * Subclasses can override this to customize post-commit behavior.
+     * Default: full table refresh.
+     */
+    protected void doAfterCommit() throws DdlException {
+        // Default: full table refresh
+        Env.getCurrentEnv().getRefreshManager().handleRefreshTable(
+                catalogName,
+                table.getDatabase().getFullName(),
+                table.getName(),
+                true);
     }
 
     @Override
@@ -125,19 +150,37 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
 
     @Override
     protected void onFail(Throwable t) {
-        errMsg = t.getMessage() == null ? "unknown reason" : t.getMessage();
+        errMsg = Util.getRootCauseMessage(t);
         String queryId = DebugUtil.printId(ctx.queryId());
         // if any throwable being thrown during insert operation, first we should abort this txn
         LOG.warn("insert [{}] with query id {} failed", labelName, queryId, t);
-        StringBuilder sb = new StringBuilder(t.getMessage());
+        String firstErrorMsgPart = "";
+        String urlPart = "";
         if (txnId != INVALID_TXN_ID) {
             LOG.warn("insert [{}] with query id {} abort txn {} failed", labelName, queryId, txnId);
+            if (!Strings.isNullOrEmpty(coordinator.getFirstErrorMsg())) {
+                firstErrorMsgPart = StringUtils.abbreviate(coordinator.getFirstErrorMsg(),
+                        Config.first_error_msg_max_length);
+            }
             if (!Strings.isNullOrEmpty(coordinator.getTrackingUrl())) {
-                sb.append(". url: ").append(coordinator.getTrackingUrl());
+                urlPart = coordinator.getTrackingUrl();
             }
         }
-        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, t.getMessage());
-        transactionManager.rollback(txnId);
+        String finalErrorMsg = InsertUtils.getFinalErrorMsg(t.getMessage(), firstErrorMsgPart, urlPart);
+        ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, finalErrorMsg);
+
+        if (table instanceof ExternalTable) {
+            try {
+                ExternalTable externalTable = (ExternalTable) table;
+                externalTable.getCatalog().getExecutionAuthenticator().execute(() -> {
+                    transactionManager.rollback(txnId);
+                });
+            } catch (Exception e) {
+                LOG.warn("errors when abort txn. {} for table: {}", txnId, table.getName(), e);
+            }
+        } else {
+            transactionManager.rollback(txnId);
+        }
     }
 
     @Override

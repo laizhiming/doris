@@ -21,7 +21,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
 
-suite("test_export_external_table", "p0,external,mysql,external_docker,external_docker_mysql") {
+suite("test_export_external_table", "p0,external") {
     // open nereids
     sql """ set enable_nereids_planner=true """
     sql """ set enable_fallback_to_original_planner=false """
@@ -29,7 +29,12 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
     // check whether the FE config 'enable_outfile_to_local' is true
     StringBuilder strBuilder = new StringBuilder()
     strBuilder.append("curl --location-trusted -u " + context.config.jdbcUser + ":" + context.config.jdbcPassword)
-    strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+        strBuilder.append(" https://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+        strBuilder.append(" --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey"))
+    } else {
+        strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    }
 
     String command = strBuilder.toString()
     def process = command.toString().execute()
@@ -54,41 +59,16 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
         return
     }
 
+    def machine_user_name = "root"
     def check_path_exists = { dir_path ->
-        List<List<Object>> backends =  sql """ show backends """
-        assertTrue(backends.size() > 0)
-        File path = new File(dir_path)
-        if (!path.exists()) {
-            assert path.mkdirs()
-        } else {
-            throw new IllegalStateException("""${dir_path} already exists! """)
-        }
-        if (backends.size() > 1) {
-            for (List<Object> backend : backends) {
-                def be_host = backend[1]
-                def cmd="""mkdir -p ${dir_path}"""
-                sshExec("root", be_host, cmd.toString())
-            }
-        }
-
-    }
-    def check_file_amounts = { dir_path, amount ->
-        File path = new File(dir_path)
-        File[] files = path.listFiles()
-        assert files.length == amount
+        mkdirRemotePathOnAllBE(machine_user_name, dir_path)
     }
     def delete_files = { dir_path ->
-        File path = new File(dir_path)
-        if (path.exists()) {
-            for (File f: path.listFiles()) {
-                f.delete();
-            }
-            path.delete();
-        }
+        deleteRemotePathOnAllBE(machine_user_name, dir_path)
     }
-    def waiting_export = { export_label ->
+    def waiting_export = { ctlName, dbName, export_label ->
         while (true) {
-            def res = sql """ show export where label = "${export_label}" """
+            def res = sql """ show export from ${ctlName}.${dbName} where label = "${export_label}" """
             logger.info("export state: " + res[0][2])
             if (res[0][2] == "FINISHED") {
                 break;
@@ -99,21 +79,21 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
             }
         }
     }
-    
 
     // this table name must be `test1`, because this is an external table.
     def table_export_name = "test1"
     def table_load_name = "test_load_external__basic"
-    def outfile_path_prefix = """/tmp/test_export"""
+    def outfile_path_prefix = """/tmp/test_export_external_table"""
+    def local_tvf_prefix = "tmp/test_export_external_table"
 
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
 
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
-        String catalog_name = "mysql_jdbc_catalog";
+        String catalog_name = "test_export_external_table";
         String internal_db_name = "regression_test_external_table_p0_export";
         String ex_db_name = "doris_test";
         String mysql_port = context.config.otherConfigs.get("mysql_57_port");
@@ -163,7 +143,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
 
         // 1. basic test
         def uuid = UUID.randomUUID().toString()
-        def outFilePath = """${outfile_path_prefix}_${uuid}"""
+        def outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}" 
         def label = "label_${uuid}"
         try {
             // check export path
@@ -179,34 +159,33 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
 
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get export outfile info ${outfileinfo}")
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'column_separator', ','
-                set 'strict_mode', 'true'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(100, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into  internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "format" = "csv",
+                            "column_separator" = ","
+                        );
+                    """
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -218,7 +197,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
 
         // 2. export external table under internal catalog
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}" 
         label = "label_${uuid}"
         try {
             // check export path
@@ -236,37 +215,34 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                 );
             """
 
-            sql """ switch ${catalog_name} """
-            sql """ use ${ex_db_name} """
+            waiting_export.call(catalog_name, ex_db_name, label)
 
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            def export_res = sql """show export from ${catalog_name}.${ex_db_name} where label='${label}'"""
+            logger.info("get external export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get external export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'column_separator', ','
-                set 'strict_mode', 'true'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(100, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into  internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "format" = "csv",
+                            "column_separator" = ","
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -279,7 +255,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
         sql """ switch ${catalog_name} """
         // 3. csv_with_names
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}"
         label = "label_${uuid}"
         try {
             // check export path
@@ -295,35 +271,34 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
+
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get csv_with_names export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get csv_with_names export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'column_separator', ','
-                set 'strict_mode', 'true'
-                set 'format', 'csv_with_names'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(30, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into  internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "column_separator" = ",",
+                            "format" = "csv_with_names"
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -336,7 +311,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
 
         // 4. csv_with_names_and_types
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}"
         label = "label_${uuid}"
         try {
             // check export path
@@ -352,35 +327,34 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
+
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get csv_with_names_and_types export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get csv_with_names_and_types export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'column_separator', ','
-                set 'strict_mode', 'true'
-                set 'format', 'csv_with_names_and_types'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(30, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into  internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into  internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "column_separator" = ",",
+                            "format" = "csv_with_names_and_types"
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -393,7 +367,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
 
         // 5. orc
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}"
         label = "label_${uuid}"
         try {
             // check export path
@@ -408,34 +382,33 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "format" = "orc"
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
+
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get orc export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get orc export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'strict_mode', 'true'
-                set 'format', 'orc'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(30, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into  internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into  internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "format" = "orc"
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -445,10 +418,9 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
             delete_files.call("${outFilePath}")
         }
 
-
-        // 5. parquet
+        // 6. parquet
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}"
         label = "label_${uuid}"
         try {
             // check export path
@@ -463,34 +435,33 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "format" = "parquet"
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
+
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get parquet export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get parquet export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'strict_mode', 'true'
-                set 'format', 'parquet'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(30, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into  internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into internal.${internal_db_name}.${table_load_name}
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "format" = "parquet"
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 
@@ -500,10 +471,9 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
             delete_files.call("${outFilePath}")
         }
 
-
         // 7. test columns property
         uuid = UUID.randomUUID().toString()
-        outFilePath = """${outfile_path_prefix}_${uuid}"""
+        outFilePath = "${outfile_path_prefix}" + "/${table_export_name}_${uuid}"
         label = "label_${uuid}"
         try {
             // check export path
@@ -520,36 +490,34 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
-            
-            // check file amounts
-            check_file_amounts.call("${outFilePath}", 1)
+            waiting_export.call(catalog_name, ex_db_name, label)
+
+            def export_res = sql """show export where label='${label}'"""
+            logger.info("get columns property export res ${export_res}")
+            def outfileinfo = export_res[0][11];
+            logger.info("get columns property export outfile info ${outfileinfo}")
 
             // check data correctness
             create_load_table(table_load_name)
 
-            File[] files = new File("${outFilePath}").listFiles()
-            String file_path = files[0].getAbsolutePath()
-            streamLoad {
-                table "${table_load_name}"
-
-                set 'column_separator', ','
-                set 'strict_mode', 'true'
-                set 'format', 'csv_with_names'
-                set 'columns', 'k8, k1, k5, k3, k7'
-
-                file "${file_path}"
-                time 10000 // limit inflight 10s
-
-                check { result, exception, startTime, endTime ->
-                    if (exception != null) {
-                        throw exception
-                    }
-                    log.info("Stream load result: ${result}".toString())
-                    def json = parseJson(result)
-                    assertEquals("success", json.Status.toLowerCase())
-                    assertEquals(30, json.NumberTotalRows)
-                    assertEquals(0, json.NumberFilteredRows)
+            // use local() tvf to reload the data
+            def ipList = [:]
+            def portList = [:]
+            getBackendIpHeartbeatPort(ipList, portList)
+            ipList.each { beid, ip ->
+                if (outfileinfo.contains(ip)) {
+                    logger.info("Begin to insert into internal.${internal_db_name}.${table_load_name} from local()")
+                    sql """
+                        insert into internal.${internal_db_name}.${table_load_name} (k8, k1, k5, k3, k7)
+                        select * from local(
+                            "file_path" = "${local_tvf_prefix}/${table_export_name}_${uuid}/*",
+                            "backend_id" = "${beid}",
+                            "format" = "csv_with_names",
+                            "column_separator" = ","
+                        );         
+                    """ 
+                    def insert_res = sql "show last insert;"
+                    logger.info("insert from local(), BE id = ${beid}, result: " + insert_res.toString())
                 }
             }
 

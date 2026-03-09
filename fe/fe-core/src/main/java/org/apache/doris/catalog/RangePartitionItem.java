@@ -45,6 +45,19 @@ public class RangePartitionItem extends PartitionItem {
         return partitionKeyRange;
     }
 
+    public String getItemsString() {
+        // ATTN: DO NOT EDIT unless unless you explicitly guarantee compatibility
+        // between different versions.
+        //
+        // the ccr syncer depends on this string to identify partitions between two
+        // clusters (cluster versions may be different).
+        return partitionKeyRange.toString();
+    }
+
+    public String getItemsSql() {
+        return toPartitionKeyDesc().toSql();
+    }
+
     @Override
     public boolean isDefaultPartition() {
         return false;

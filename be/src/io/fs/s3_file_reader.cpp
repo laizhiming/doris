@@ -32,12 +32,17 @@
 #include <utility>
 
 #include "common/compiler_util.h" // IWYU pragma: keep
+#include "common/metrics/doris_metrics.h"
+#include "io/cache/block_file_cache.h"
 #include "io/fs/err_utils.h"
 #include "io/fs/obj_storage_client.h"
 #include "io/fs/s3_common.h"
+#include "runtime/runtime_profile.h"
+#include "runtime/thread_context.h"
+#include "runtime/workload_management/io_throttle.h"
 #include "util/bvar_helper.h"
-#include "util/doris_metrics.h"
-#include "util/runtime_profile.h"
+#include "util/concurrency_stats.h"
+#include "util/debug_points.h"
 #include "util/s3_util.h"
 
 namespace doris::io {
@@ -54,6 +59,7 @@ bvar::PerSecond<bvar::Adder<uint64_t>> s3_read_througthput("s3_file_reader", "s3
 // record successfull request, and s3_get_request_qps will record all request.
 bvar::PerSecond<bvar::Adder<uint64_t>> s3_get_request_qps("s3_file_reader", "s3_get_request",
                                                           &s3_file_reader_read_counter);
+bvar::LatencyRecorder s3_file_reader_latency("s3_file_reader", "s3_latency");
 
 Result<FileReaderSPtr> S3FileReader::create(std::shared_ptr<const ObjClientHolder> client,
                                             std::string bucket, std::string key, int64_t file_size,
@@ -111,6 +117,11 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
     size_t bytes_req = result.size;
     char* to = result.data;
     bytes_req = std::min(bytes_req, _file_size - offset);
+    VLOG_DEBUG << fmt::format("S3FileReader::read_at_impl offset={} size={} path={} hash={}",
+                              offset, result.size, _path.native(),
+                              io::BlockFileCache::hash(_path.native()).to_string());
+    VLOG_DEBUG << "enter s3 read_at_impl, off=" << offset << " n=" << bytes_req
+               << " req=" << result.size << " file size=" << _file_size;
     if (UNLIKELY(bytes_req == 0)) {
         *bytes_read = 0;
         return Status::OK();
@@ -120,26 +131,36 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
     if (!client) {
         return Status::InternalError("init s3 client error");
     }
-    // // clang-format off
-    // auto resp = client->get_object( { .bucket = _bucket, .key = _key, },
-    //         to, offset, bytes_req, bytes_read);
-    // // clang-format on
-    // if (resp.status.code != ErrorCode::OK) {
-    //     return std::move(Status(resp.status.code, std::move(resp.status.msg))
-    //                              .append(fmt::format("failed to read from {}", _path.native())));
-    // }
-    // if (*bytes_read != bytes_req) {
-    //     return Status::InternalError("failed to read from {}(bytes read: {}, bytes req: {})",
-    //                                  _path.native(), *bytes_read, bytes_req);
-    SCOPED_BVAR_LATENCY(s3_bvar::s3_get_latency);
+
+    SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().s3_file_reader_read);
 
     int retry_count = 0;
     const int base_wait_time = config::s3_read_base_wait_time_ms; // Base wait time in milliseconds
     const int max_wait_time = config::s3_read_max_wait_time_ms; // Maximum wait time in milliseconds
     const int max_retries = config::max_s3_client_retry; // wait 1s, 2s, 4s, 8s for each backoff
 
+    int64_t begin_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    LIMIT_REMOTE_SCAN_IO(bytes_read);
+    DBUG_EXECUTE_IF("S3FileReader::read_at_impl.io_slow", {
+        auto sleep_time = dp->param("sleep", 3);
+        LOG_INFO("S3FileReader::read_at_impl.io_slow inject microseconds {} s", sleep_time)
+                .tag("bucket", _bucket)
+                .tag("key", _key);
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_time));
+    });
+    Defer defer_latency {[&]() {
+        int64_t end_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+        s3_file_reader_latency << (end_ts - begin_ts);
+    }};
+    SCOPED_RAW_TIMER(&_s3_stats.total_get_request_time_ns);
+
     int total_sleep_time = 0;
     while (retry_count <= max_retries) {
+        *bytes_read = 0;
         s3_file_reader_read_counter << 1;
         // clang-format off
         auto resp = client->get_object( { .bucket = _bucket, .key = _key, },
@@ -165,8 +186,12 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
             }
         }
         if (*bytes_read != bytes_req) {
-            return Status::InternalError("failed to read (bytes read: {}, bytes req: {})",
-                                         *bytes_read, bytes_req);
+            std::string msg = fmt::format(
+                    "failed to get object, path={} offset={} bytes_req={} bytes_read={} "
+                    "file_size={} tries={}",
+                    _path.native(), offset, bytes_req, *bytes_read, _file_size, (retry_count + 1));
+            LOG(WARNING) << msg;
+            return Status::InternalError(msg);
         }
         _s3_stats.total_bytes_read += bytes_req;
         s3_bytes_read_total << bytes_req;
@@ -178,7 +203,12 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
         }
         return Status::OK();
     }
-    return Status::InternalError("failed to read from s3, exceeded maximum retries");
+    std::string msg = fmt::format(
+            "failed to get object, path={} offset={} bytes_req={} bytes_read={} file_size={} "
+            "tries={}",
+            _path.native(), offset, bytes_req, *bytes_read, _file_size, (max_retries + 1));
+    LOG(WARNING) << msg;
+    return Status::InternalError(msg);
 }
 
 void S3FileReader::_collect_profile_before_close() {
@@ -193,11 +223,14 @@ void S3FileReader::_collect_profile_before_close() {
                 _profile, "TooManyRequestSleepTime", TUnit::TIME_MS, s3_profile_name);
         RuntimeProfile::Counter* total_bytes_read =
                 ADD_CHILD_COUNTER(_profile, "TotalBytesRead", TUnit::BYTES, s3_profile_name);
+        RuntimeProfile::Counter* total_get_request_time_ns =
+                ADD_CHILD_TIMER(_profile, "TotalGetRequestTime", s3_profile_name);
 
         COUNTER_UPDATE(total_get_request_counter, _s3_stats.total_get_request_counter);
         COUNTER_UPDATE(too_many_request_err_counter, _s3_stats.too_many_request_err_counter);
         COUNTER_UPDATE(too_many_request_sleep_time, _s3_stats.too_many_request_sleep_time_ms);
         COUNTER_UPDATE(total_bytes_read, _s3_stats.total_bytes_read);
+        COUNTER_UPDATE(total_get_request_time_ns, _s3_stats.total_get_request_time_ns);
     }
 }
 

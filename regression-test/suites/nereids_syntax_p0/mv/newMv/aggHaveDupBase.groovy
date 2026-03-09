@@ -17,13 +17,14 @@
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
-suite ("agg_have_dup_base") {
+suite ("aggHaveDupBase") {
+
+    String db = context.config.getDbNameByFile(context.file)
+    sql "use ${db}"
+    // this mv rewrite would not be rewritten in RBO, so set NOT_IN_RBO explicitly
+    sql "set pre_materialized_view_rewrite_strategy = NOT_IN_RBO"
 
     def tbName1 = "agg_have_dup_base"
-    def getJobState = { tableName ->
-        def jobStateResult = sql """  SHOW ALTER TABLE MATERIALIZED VIEW WHERE TableName='${tableName}' ORDER BY CreateTime DESC LIMIT 1; """
-        return jobStateResult[0][8]
-    }
     sql """ DROP TABLE IF EXISTS agg_have_dup_base; """
     sql """
             create table agg_have_dup_base(
@@ -36,16 +37,14 @@ suite ("agg_have_dup_base") {
             distributed BY hash(k1) buckets 3
             properties("replication_num" = "1");
         """
+    sql """alter table agg_have_dup_base modify column k1 set stats ('row_count'='5');"""
 
     sql "insert into agg_have_dup_base select 1,1,1,'a';"
     sql "insert into agg_have_dup_base select 2,2,2,'b';"
     sql "insert into agg_have_dup_base select 3,-3,null,'c';"
     sql "insert into agg_have_dup_base select 3,-3,null,'c';"
 
-    createMV( "create materialized view k12s3m as select k1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
-
-    sleep(3000)
-
+    create_sync_mv(db, "agg_have_dup_base", "k12s3m", "select k1 as a1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
 
     sql "insert into agg_have_dup_base select -4,-4,-4,'d';"
 
@@ -53,54 +52,22 @@ suite ("agg_have_dup_base") {
     sql "SET enable_fallback_to_original_planner=false"
 
     sql "analyze table agg_have_dup_base with sync;"
-    sql """set enable_stats=false;"""
-
 
     order_qt_select_star "select * from agg_have_dup_base order by k1;"
 
-    explain {
-        sql("select k1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
+    mv_rewrite_success("select k1,sum(k2),max(k2) from agg_have_dup_base group by k1;", "k12s3m")
+    
     order_qt_select_mv "select k1,sum(k2),max(k2) from agg_have_dup_base group by k1 order by k1;"
 
-    explain {
-        sql("select k1,sum(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
+    mv_rewrite_success("select k1,sum(k2) from agg_have_dup_base group by k1;", "k12s3m")
+    
     order_qt_select_mv "select k1,sum(k2) from agg_have_dup_base group by k1 order by k1;"
 
-    explain {
-        sql("select k1,max(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
+    mv_rewrite_success("select k1,max(k2) from agg_have_dup_base group by k1;", "k12s3m")
+    
     order_qt_select_mv "select k1,max(k2) from agg_have_dup_base group by k1 order by k1;"
 
-    explain {
-        sql("select unix_timestamp(k1) tmp,sum(k2) from agg_have_dup_base group by tmp;")
-        contains "(k12s3m)"
-    }
+    mv_rewrite_success("select unix_timestamp(k1) tmp,sum(k2) from agg_have_dup_base group by tmp", "k12s3m")
+    
     order_qt_select_mv "select unix_timestamp(k1) tmp,sum(k2) from agg_have_dup_base group by tmp order by tmp;"
-
-    sql """set enable_stats=true;"""
-
-    explain {
-        sql("select k1,sum(k2),max(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
-
-    explain {
-        sql("select k1,sum(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
-
-    explain {
-        sql("select k1,max(k2) from agg_have_dup_base group by k1;")
-        contains "(k12s3m)"
-    }
-
-    explain {
-        sql("select unix_timestamp(k1) tmp,sum(k2) from agg_have_dup_base group by tmp;")
-        contains "(k12s3m)"
-    }
 }

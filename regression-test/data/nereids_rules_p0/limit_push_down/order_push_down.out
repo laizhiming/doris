@@ -55,13 +55,12 @@ PhysicalResultSink
 
 -- !left_outer_join_order --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
-------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
---------PhysicalTopN[MERGE_SORT]
-----------PhysicalTopN[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
---------PhysicalOlapScan[t2]
+--PhysicalTopN[GATHER_SORT]
+----hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
+------PhysicalTopN[MERGE_SORT]
+--------PhysicalTopN[LOCAL_SORT]
+----------PhysicalOlapScan[t1]
+------PhysicalOlapScan[t2]
 
 -- !right_outer_join_order --
 PhysicalResultSink
@@ -75,13 +74,13 @@ PhysicalResultSink
 
 -- !cross_join_order --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.msg) lazySlots:(t1.id)]
+----PhysicalTopN[GATHER_SORT]
 ------NestedLoopJoin[CROSS_JOIN]
 --------PhysicalTopN[MERGE_SORT]
 ----------PhysicalTopN[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
---------PhysicalOlapScan[t2]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.id)]
+--------PhysicalStorageLayerAggregate[t2]
 
 -- !limit_offset_sort_join --
 PhysicalResultSink
@@ -95,21 +94,21 @@ PhysicalResultSink
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------PhysicalOlapScan[t1]
 
 -- !limit_offset_agg_having --
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------PhysicalOlapScan[t1]
 
 -- !limit_offset_sort_agg_having --
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------PhysicalOlapScan[t1]
 
 -- !limit_distinct --
@@ -124,7 +123,7 @@ PhysicalResultSink
 ----------------hashAgg[GLOBAL]
 ------------------hashAgg[LOCAL]
 --------------------PhysicalOlapScan[t1]
-------------PhysicalOlapScan[t2]
+------------PhysicalStorageLayerAggregate[t2]
 
 -- !limit_distinct --
 PhysicalResultSink
@@ -138,7 +137,7 @@ PhysicalResultSink
 ----------------hashAgg[GLOBAL]
 ------------------hashAgg[LOCAL]
 --------------------PhysicalOlapScan[t1]
-------------PhysicalOlapScan[t2]
+------------PhysicalStorageLayerAggregate[t2]
 
 -- !limit_distinct --
 PhysicalResultSink
@@ -172,12 +171,12 @@ PhysicalResultSink
 
 -- !limit_sort_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.id,row_num) lazySlots:(t1.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.msg)]
 
 -- !limit_offset_window --
 PhysicalResultSink
@@ -191,24 +190,24 @@ PhysicalResultSink
 
 -- !limit_offset_sort_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.id,row_num) lazySlots:(t1.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.msg)]
 
 -- !limit_sort_filter --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLimit[GLOBAL]
+----PhysicalLimit[LOCAL]
 ------filter((t1.id = 1))
 --------PhysicalOlapScan[t1]
 
 -- !limit_offset_sort_filter --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLimit[GLOBAL]
+----PhysicalLimit[LOCAL]
 ------filter((t1.id = 1))
 --------PhysicalOlapScan[t1]
 
@@ -264,33 +263,33 @@ PhysicalResultSink
 
 -- !limit_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.id,row_num) lazySlots:(t1.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.msg)]
 
 -- !limit_offset_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.id,row_num) lazySlots:(t1.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.msg)]
 
 -- !limit_filter --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLimit[GLOBAL]
+----PhysicalLimit[LOCAL]
 ------filter((t1.id = 1))
 --------PhysicalOlapScan[t1]
 
 -- !limit_offset_filter --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLimit[GLOBAL]
+----PhysicalLimit[LOCAL]
 ------filter((t1.id = 1))
 --------PhysicalOlapScan[t1]
 
@@ -334,12 +333,12 @@ PhysicalResultSink
 
 -- !limit_subquery_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.id,row_num) lazySlots:(t1.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.msg)]
 
 -- !limit_nested_subquery --
 PhysicalResultSink
@@ -371,31 +370,28 @@ PhysicalResultSink
 ------------hashJoin[RIGHT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
 --------------PhysicalOlapScan[t1]
 --------------PhysicalOlapScan[t2]
---------PhysicalTopN[MERGE_SORT]
-----------PhysicalTopN[LOCAL_SORT]
-------------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t3.id = t4.id)) otherCondition=()
---------------PhysicalTopN[MERGE_SORT]
-----------------PhysicalTopN[LOCAL_SORT]
-------------------PhysicalOlapScan[t3]
---------------PhysicalOlapScan[t4]
+--------PhysicalTopN[GATHER_SORT]
+----------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t3.id = t4.id)) otherCondition=()
+------------PhysicalTopN[MERGE_SORT]
+--------------PhysicalTopN[LOCAL_SORT]
+----------------PhysicalOlapScan[t3]
+------------PhysicalOlapScan[t4]
 
 -- !limit_union_window --
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
 ------PhysicalUnion
---------PhysicalTopN[MERGE_SORT]
-----------PhysicalTopN[LOCAL_SORT]
-------------PhysicalWindow
---------------PhysicalQuickSort[MERGE_SORT]
-----------------PhysicalQuickSort[LOCAL_SORT]
-------------------PhysicalOlapScan[t1]
---------PhysicalTopN[MERGE_SORT]
-----------PhysicalTopN[LOCAL_SORT]
-------------PhysicalWindow
---------------PhysicalQuickSort[MERGE_SORT]
-----------------PhysicalQuickSort[LOCAL_SORT]
-------------------PhysicalOlapScan[t2]
+--------PhysicalTopN[GATHER_SORT]
+----------PhysicalWindow
+------------PhysicalQuickSort[MERGE_SORT]
+--------------PhysicalQuickSort[LOCAL_SORT]
+----------------PhysicalOlapScan[t1]
+--------PhysicalTopN[GATHER_SORT]
+----------PhysicalWindow
+------------PhysicalQuickSort[MERGE_SORT]
+--------------PhysicalQuickSort[LOCAL_SORT]
+----------------PhysicalOlapScan[t2]
 
 -- !limit_subquery_join_filter --
 PhysicalResultSink
@@ -409,13 +405,14 @@ PhysicalResultSink
 
 -- !limit_subqueryjoin_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
-------PhysicalWindow
---------PhysicalQuickSort[LOCAL_SORT]
-----------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
-------------PhysicalOlapScan[t1]
-------------PhysicalOlapScan[t2]
+--PhysicalLazyMaterialize[materializedSlots:(subq.id,row_num) lazySlots:(subq.msg)]
+----PhysicalTopN[MERGE_SORT]
+------PhysicalTopN[LOCAL_SORT]
+--------PhysicalWindow
+----------PhysicalQuickSort[LOCAL_SORT]
+------------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
+--------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(subq.msg)]
+--------------PhysicalOlapScan[t2]
 
 -- !limit_subquery_union_filter --
 PhysicalResultSink
@@ -533,12 +530,11 @@ PhysicalCteAnchor ( cteId=CTEId#0 )
 ----filter((t1.id < 10))
 ------PhysicalOlapScan[t1]
 --PhysicalResultSink
-----PhysicalTopN[MERGE_SORT]
-------PhysicalTopN[LOCAL_SORT]
---------PhysicalWindow
-----------PhysicalQuickSort[MERGE_SORT]
-------------PhysicalQuickSort[LOCAL_SORT]
---------------PhysicalCteConsumer ( cteId=CTEId#0 )
+----PhysicalTopN[GATHER_SORT]
+------PhysicalWindow
+--------PhysicalQuickSort[MERGE_SORT]
+----------PhysicalQuickSort[LOCAL_SORT]
+------------PhysicalCteConsumer ( cteId=CTEId#0 )
 
 -- !limit_project_filter --
 PhysicalResultSink
@@ -567,12 +563,12 @@ PhysicalResultSink
 
 -- !limit_subquery_window --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(id,row_num) lazySlots:(subq.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------PhysicalWindow
 --------PhysicalQuickSort[MERGE_SORT]
 ----------PhysicalQuickSort[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(subq.msg)]
 
 -- !limit_nested_subquery --
 PhysicalResultSink
@@ -584,32 +580,30 @@ PhysicalResultSink
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------PhysicalOlapScan[t1]
 
 -- !limit_cross_join --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(t1.msg) lazySlots:(t1.id)]
+----PhysicalTopN[GATHER_SORT]
 ------NestedLoopJoin[CROSS_JOIN]
 --------PhysicalTopN[MERGE_SORT]
 ----------PhysicalTopN[LOCAL_SORT]
-------------PhysicalOlapScan[t1]
---------PhysicalOlapScan[t2]
+------------PhysicalLazyMaterializeOlapScan[t1 lazySlots:(t1.id)]
+--------PhysicalStorageLayerAggregate[t2]
 
 -- !limit_multiple_left_outer_join --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
-------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t3.id)) otherCondition=()
---------PhysicalTopN[MERGE_SORT]
-----------PhysicalTopN[LOCAL_SORT]
-------------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
---------------PhysicalTopN[MERGE_SORT]
-----------------PhysicalTopN[LOCAL_SORT]
-------------------PhysicalOlapScan[t1]
---------------PhysicalOlapScan[t2]
---------PhysicalOlapScan[t3]
+--PhysicalTopN[GATHER_SORT]
+----hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t3.id)) otherCondition=()
+------PhysicalTopN[GATHER_SORT]
+--------hashJoin[LEFT_OUTER_JOIN] hashCondition=((t1.id = t2.id)) otherCondition=()
+----------PhysicalTopN[MERGE_SORT]
+------------PhysicalTopN[LOCAL_SORT]
+--------------PhysicalOlapScan[t1]
+----------PhysicalOlapScan[t2]
+------PhysicalOlapScan[t3]
 
 -- !limit_multiple_right_outer_join --
 PhysicalResultSink
@@ -633,39 +627,41 @@ PhysicalResultSink
 
 -- !limit_subquery_cross_join --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
+--PhysicalLazyMaterialize[materializedSlots:(subq.id) lazySlots:(t2.id,t2.msg)]
+----PhysicalTopN[GATHER_SORT]
 ------NestedLoopJoin[CROSS_JOIN]
 --------PhysicalTopN[MERGE_SORT]
 ----------PhysicalTopN[LOCAL_SORT]
 ------------PhysicalOlapScan[t1]
---------PhysicalOlapScan[t2]
+--------PhysicalLazyMaterializeOlapScan[t2 lazySlots:(t2.id,t2.msg)]
 
 -- !limit_subquery_multiple_join --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
-------hashJoin[INNER_JOIN] hashCondition=((subq.id = t3.id)) otherCondition=()
---------hashJoin[INNER_JOIN] hashCondition=((subq.id = t2.id)) otherCondition=()
-----------PhysicalOlapScan[t1]
-----------PhysicalOlapScan[t2]
---------PhysicalOlapScan[t3]
+--PhysicalLazyMaterialize[materializedSlots:(subq.id,t2.id,t3.id) lazySlots:(t2.msg,t3.msg)]
+----PhysicalTopN[MERGE_SORT]
+------PhysicalTopN[LOCAL_SORT]
+--------hashJoin[INNER_JOIN] hashCondition=((subq.id = t3.id)) otherCondition=()
+----------hashJoin[INNER_JOIN] hashCondition=((subq.id = t2.id)) otherCondition=()
+------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t2 lazySlots:(t2.msg)]
+----------PhysicalLazyMaterializeOlapScan[t3 lazySlots:(t3.msg)]
 
 -- !limit_subquery_multiple_join_nested_subquery --
 PhysicalResultSink
---PhysicalTopN[MERGE_SORT]
-----PhysicalTopN[LOCAL_SORT]
-------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t3.id)) otherCondition=()
---------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t2.id)) otherCondition=()
-----------PhysicalOlapScan[t1]
-----------PhysicalOlapScan[t2]
---------PhysicalOlapScan[t3]
+--PhysicalLazyMaterialize[materializedSlots:(subq2.id,t2.id,t3.id) lazySlots:(t2.msg,t3.msg)]
+----PhysicalTopN[MERGE_SORT]
+------PhysicalTopN[LOCAL_SORT]
+--------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t3.id)) otherCondition=()
+----------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t2.id)) otherCondition=()
+------------PhysicalOlapScan[t1]
+------------PhysicalLazyMaterializeOlapScan[t2 lazySlots:(t2.msg)]
+----------PhysicalLazyMaterializeOlapScan[t3 lazySlots:(t3.msg)]
 
 -- !limit_subquery_multiple_join_nested_subquery_distinct --
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t3.id)) otherCondition=()
 ----------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t2.id)) otherCondition=()
 ------------PhysicalOlapScan[t1]
@@ -676,7 +672,7 @@ PhysicalResultSink
 PhysicalResultSink
 --PhysicalTopN[MERGE_SORT]
 ----PhysicalTopN[LOCAL_SORT]
-------hashAgg[LOCAL]
+------hashAgg[GLOBAL]
 --------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t3.id)) otherCondition=()
 ----------hashJoin[INNER_JOIN] hashCondition=((subq2.id = t2.id)) otherCondition=()
 ------------filter((t1.id > 100))

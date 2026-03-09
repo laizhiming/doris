@@ -17,20 +17,19 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.StructField;
 import org.apache.doris.catalog.StructType;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.FormatOptions;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TTypeDesc;
 import org.apache.doris.thrift.TTypeNode;
 
-import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
 
-import java.io.DataInput;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -40,19 +39,6 @@ public class StructLiteral extends LiteralExpr {
     public StructLiteral() {
         type = new StructType();
         children = new ArrayList<>();
-    }
-
-    public StructLiteral(LiteralExpr... exprs) throws AnalysisException {
-        type = new StructType();
-        children = new ArrayList<>();
-        for (int i = 0; i < exprs.length; i++) {
-            if (!StructType.STRUCT.supportSubType(exprs[i].getType())) {
-                throw new AnalysisException("Invalid element type in STRUCT: " + exprs[i].getType());
-            }
-            ((StructType) type).addField(
-                    new StructField(StructField.DEFAULT_FIELD_NAME + (i + 1), exprs[i].getType()));
-            children.add(exprs[i]);
-        }
     }
 
     /**
@@ -67,6 +53,7 @@ public class StructLiteral extends LiteralExpr {
             }
             children.add(expr);
         }
+        this.nullable = false;
     }
 
     protected StructLiteral(StructLiteral other) {
@@ -81,9 +68,10 @@ public class StructLiteral extends LiteralExpr {
     }
 
     @Override
-    public String toDigestImpl() {
+    protected String toSqlImpl(boolean disableTableName, boolean needExternalSql, TableType tableType,
+            TableIf table) {
         List<String> list = new ArrayList<>(children.size());
-        children.forEach(v -> list.add(v.toDigestImpl()));
+        children.forEach(v -> list.add(v.toSqlImpl(disableTableName, needExternalSql, tableType, table)));
         return "STRUCT(" + StringUtils.join(list, ", ") + ")";
     }
 
@@ -106,29 +94,31 @@ public class StructLiteral extends LiteralExpr {
     }
 
     @Override
-    public String getStringValueForArray() {
+    public String getStringValueForQuery(FormatOptions options) {
         List<String> list = new ArrayList<>(children.size());
-        children.forEach(v -> list.add(v.getStringValueForArray()));
-        return "{" + StringUtils.join(list, ", ") + "}";
+        ++options.level;
+        // same with be default field index start with 1
+        for (int i = 0; i < children.size(); i++) {
+            Expr child = children.get(i);
+            list.add(options.getNestedStringWrapper()
+                    + ((StructType) type).getFields().get(i).getName()
+                    + options.getNestedStringWrapper()
+                    + options.getMapKeyDelim()
+                    + child.getStringValueInComplexTypeForQuery(options));
+        }
+        --options.level;
+        return "{" + StringUtils.join(list, options.getCollectionDelim()) + "}";
     }
 
     @Override
-    public String getStringValueInFe() {
+    public String getStringValueForStreamLoad(FormatOptions options) {
         List<String> list = new ArrayList<>(children.size());
         // same with be default field index start with 1
         for (int i = 0; i < children.size(); i++) {
             Expr child = children.get(i);
-            list.add("\"" + ((StructType) type).getFields().get(i).getName() + "\": "
-                    + getStringLiteralForComplexType(child));
+            list.add(child.getStringValueInComplexTypeForQuery(options));
         }
-        return "{" + StringUtils.join(list, ", ") + "}";
-    }
-
-    @Override
-    public String getStringValueForStreamLoad() {
-        List<String> list = new ArrayList<>(children.size());
-        children.forEach(v -> list.add(getStringLiteralForComplexType(v)));
-        return "{" + StringUtils.join(list, ", ") + "}";
+        return "{" + StringUtils.join(list, options.getCollectionDelim()) + "}";
     }
 
     @Override
@@ -139,22 +129,6 @@ public class StructLiteral extends LiteralExpr {
         container.setTypes(new ArrayList<TTypeNode>());
         type.toThrift(container);
         msg.setType(container);
-    }
-
-    @Override
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        int size = in.readInt();
-        children = new ArrayList<>(size);
-        for (int i = 0; i < size; i++) {
-            children.add(Expr.readIn(in));
-        }
-    }
-
-    public static StructLiteral read(DataInput in) throws IOException {
-        StructLiteral literal = new StructLiteral();
-        literal.readFields(in);
-        return literal;
     }
 
     @Override
@@ -170,37 +144,6 @@ public class StructLiteral extends LiteralExpr {
     @Override
     public int compareLiteral(LiteralExpr expr) {
         return 0;
-    }
-
-    @Override
-    public LiteralExpr convertTo(Type targetType) throws AnalysisException {
-        Preconditions.checkState(targetType instanceof StructType);
-        List<StructField> fields = ((StructType) targetType).getFields();
-        LiteralExpr[] literals = new LiteralExpr[children.size()];
-        for (int i = 0; i < children.size(); i++) {
-            literals[i] = (LiteralExpr) Expr.convertLiteral(children.get(i), fields.get(i).getType());
-        }
-        return new StructLiteral(literals);
-    }
-
-    @Override
-    public Expr uncheckedCastTo(Type targetType) throws AnalysisException {
-        if (!targetType.isStructType()) {
-            return super.uncheckedCastTo(targetType);
-        }
-        ArrayList<StructField> fields = ((StructType) targetType).getFields();
-        StructLiteral literal = new StructLiteral(this);
-        for (int i = 0; i < children.size(); ++ i) {
-            Expr child = Expr.convertLiteral(children.get(i), fields.get(i).getType());
-            // all children should be literal or else it will make be core
-            if (!child.isLiteral()) {
-                throw new AnalysisException("Unexpected struct literal cast failed. from type: "
-                        + this.type + ", to type: " + targetType);
-            }
-            literal.children.set(i, child);
-        }
-        literal.setType(targetType);
-        return literal;
     }
 
     @Override

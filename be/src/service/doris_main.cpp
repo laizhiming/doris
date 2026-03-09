@@ -24,6 +24,7 @@
 // IWYU pragma: no_include <bthread/errno.h>
 #include <errno.h> // IWYU pragma: keep
 #include <fcntl.h>
+#include <fmt/core.h>
 #if !defined(__SANITIZE_ADDRESS__) && !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && \
         !defined(THREAD_SANITIZER) && !defined(USE_JEMALLOC)
 #include <gperftools/malloc_extension.h> // IWYU pragma: keep
@@ -48,9 +49,10 @@
 #include "cloud/cloud_backend_service.h"
 #include "cloud/config.h"
 #include "common/stack_trace.h"
-#include "olap/tablet_schema_cache.h"
-#include "olap/utils.h"
 #include "runtime/memory/mem_tracker_limiter.h"
+#include "storage/tablet/tablet_schema_cache.h"
+#include "storage/utils.h"
+#include "util/concurrency_stats.h"
 #include "util/jni-util.h"
 
 #if defined(LEAK_SANITIZER)
@@ -67,8 +69,6 @@
 #include "common/signal_handler.h"
 #include "common/status.h"
 #include "io/cache/block_file_cache_factory.h"
-#include "olap/options.h"
-#include "olap/storage_engine.h"
 #include "runtime/exec_env.h"
 #include "runtime/user_function_cache.h"
 #include "service/arrow_flight/flight_sql_service.h"
@@ -76,16 +76,18 @@
 #include "service/backend_service.h"
 #include "service/brpc_service.h"
 #include "service/http_service.h"
+#include "storage/options.h"
+#include "storage/storage_engine.h"
+#include "udf/python/python_env.h"
 #include "util/debug_util.h"
 #include "util/disk_info.h"
 #include "util/mem_info.h"
+#include "util/string_util.h"
 #include "util/thrift_rpc_helper.h"
 #include "util/thrift_server.h"
 #include "util/uid_util.h"
 
-namespace doris {
-class TMasterInfo;
-} // namespace doris
+namespace doris {} // namespace doris
 
 static void help(const char*);
 
@@ -340,6 +342,8 @@ int main(int argc, char** argv) {
         exit(-1);
     }
 
+    SCOPED_INIT_THREAD_CONTEXT();
+
     using doris::Status;
     using std::string;
 
@@ -490,13 +494,77 @@ int main(int argc, char** argv) {
     Status status = Status::OK();
     if (doris::config::enable_java_support) {
         // Init jni
-        status = doris::JniUtil::Init();
+        status = doris::Jni::Util::Init();
         if (!status.ok()) {
             LOG(WARNING) << "Failed to initialize JNI: " << status;
             exit(1);
         } else {
             LOG(INFO) << "Doris backend JNI is initialized.";
         }
+    }
+
+    if (doris::config::enable_python_udf_support) {
+        if (std::string python_udf_root_path =
+                    fmt::format("{}/lib/udf/python", std::getenv("DORIS_HOME"));
+            !std::filesystem::exists(python_udf_root_path)) {
+            std::filesystem::create_directories(python_udf_root_path);
+        }
+
+        // Normalize and trim all Python-related config parameters
+        std::string python_env_mode =
+                std::string(doris::trim(doris::to_lower(doris::config::python_env_mode)));
+        std::string python_conda_root_path =
+                std::string(doris::trim(doris::config::python_conda_root_path));
+        std::string python_venv_root_path =
+                std::string(doris::trim(doris::config::python_venv_root_path));
+        std::string python_venv_interpreter_paths =
+                std::string(doris::trim(doris::config::python_venv_interpreter_paths));
+
+        if (python_env_mode == "conda") {
+            if (python_conda_root_path.empty()) {
+                LOG(ERROR)
+                        << "Python conda root path is empty, please set `python_conda_root_path` "
+                           "or set `enable_python_udf_support` to `false`";
+                exit(1);
+            }
+            LOG(INFO) << "Doris backend python version manager is initialized. Python conda "
+                         "root path: "
+                      << python_conda_root_path;
+            status = doris::PythonVersionManager::instance().init(doris::PythonEnvType::CONDA,
+                                                                  python_conda_root_path, "");
+        } else if (python_env_mode == "venv") {
+            if (python_venv_root_path.empty()) {
+                LOG(ERROR)
+                        << "Python venv root path is empty, please set `python_venv_root_path` or "
+                           "set `enable_python_udf_support` to `false`";
+                exit(1);
+            }
+            if (python_venv_interpreter_paths.empty()) {
+                LOG(ERROR)
+                        << "Python interpreter paths is empty, please set "
+                           "`python_venv_interpreter_paths` or set `enable_python_udf_support` to "
+                           "`false`";
+                exit(1);
+            }
+            LOG(INFO) << "Doris backend python version manager is initialized. Python venv "
+                         "root path: "
+                      << python_venv_root_path
+                      << ", python interpreter paths: " << python_venv_interpreter_paths;
+            status = doris::PythonVersionManager::instance().init(doris::PythonEnvType::VENV,
+                                                                  python_venv_root_path,
+                                                                  python_venv_interpreter_paths);
+        } else {
+            status = Status::InvalidArgument(
+                    "Python env mode is invalid, should be `conda` or `venv`. If you don't want to "
+                    "enable the Python UDF function, please set `enable_python_udf_support` to "
+                    "`false`");
+        }
+
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to initialize python version manager: " << status;
+            exit(1);
+        }
+        LOG(INFO) << doris::PythonVersionManager::instance().to_string();
     }
 
     // Doris own signal handler must be register after jvm is init.
@@ -525,8 +593,6 @@ int main(int argc, char** argv) {
         exit(-1);
     }
 
-    doris::ThreadLocalHandle::create_thread_local_if_not_exits();
-
     // init exec env
     auto* exec_env(doris::ExecEnv::GetInstance());
     status = doris::ExecEnv::init(doris::ExecEnv::GetInstance(), paths, spill_paths, broken_paths);
@@ -534,6 +600,9 @@ int main(int argc, char** argv) {
         std::cerr << "failed to init doris storage engine, res=" << status;
         return 0;
     }
+
+    // Start concurrency stats manager
+    doris::ConcurrencyStatsManager::instance().start();
 
     // begin to start services
     doris::ThriftRpcHelper::setup(exec_env);
@@ -579,11 +648,11 @@ int main(int argc, char** argv) {
     stop_work_if_error(status, "Doris Be http service did not start correctly, exiting");
 
     // 4. heart beat server
-    doris::TMasterInfo* master_info = exec_env->master_info();
+    doris::ClusterInfo* cluster_info = exec_env->cluster_info();
     std::unique_ptr<doris::ThriftServer> heartbeat_thrift_server;
     doris::Status heartbeat_status = doris::create_heartbeat_server(
             exec_env, doris::config::heartbeat_service_port, &heartbeat_thrift_server,
-            doris::config::heartbeat_service_thread_count, master_info);
+            doris::config::heartbeat_service_thread_count, cluster_info);
 
     stop_work_if_error(heartbeat_status, "Heartbeat services did not start correctly, exiting");
 
@@ -595,12 +664,16 @@ int main(int argc, char** argv) {
     std::shared_ptr<doris::flight::FlightSqlServer> flight_server =
             std::move(doris::flight::FlightSqlServer::create()).ValueOrDie();
     status = flight_server->init(doris::config::arrow_flight_sql_port);
+    stop_work_if_error(
+            status, "Arrow Flight Service did not start correctly, exiting, " + status.to_string());
 
     // 6. start daemon thread to do clean or gc jobs
     doris::Daemon daemon;
     daemon.start();
-    stop_work_if_error(
-            status, "Arrow Flight Service did not start correctly, exiting, " + status.to_string());
+
+    exec_env->storage_engine().notify_listeners();
+
+    doris::k_is_server_ready = true;
 
     while (!doris::k_doris_exit) {
 #if defined(LEAK_SANITIZER)
@@ -608,6 +681,7 @@ int main(int argc, char** argv) {
 #endif
         sleep(3);
     }
+    doris::k_is_server_ready = false;
     LOG(INFO) << "Doris main exiting.";
 #if defined(LLVM_PROFILE)
     __llvm_profile_write_file();
@@ -615,6 +689,15 @@ int main(int argc, char** argv) {
 #endif
     // For graceful shutdown, need to wait for all running queries to stop
     exec_env->wait_for_all_tasks_done();
+
+    if (!doris::config::enable_graceful_exit_check) {
+        // If not in memleak check mode, no need to wait all objects de-constructed normally, just exit.
+        // It will make sure that graceful shutdown can be done definitely.
+        LOG(INFO) << "Doris main exited.";
+        google::FlushLogFiles(google::GLOG_INFO);
+        _exit(0); // Do not call exit(0), it will wait for all objects de-constructed normally
+        return 0;
+    }
     daemon.stop();
     flight_server.reset();
     LOG(INFO) << "Flight server stopped.";
@@ -633,8 +716,7 @@ int main(int argc, char** argv) {
     service.reset();
     LOG(INFO) << "Backend Service stopped";
     exec_env->destroy();
-    doris::ThreadLocalHandle::del_thread_local_if_count_is_zero();
-    LOG(INFO) << "Doris main exited.";
+    LOG(INFO) << "All service stopped, doris main exited.";
     return 0;
 }
 

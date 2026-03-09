@@ -19,10 +19,12 @@ package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.exceptions.CastException;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DecimalV3Type;
 
 import com.google.common.base.Preconditions;
+import org.apache.log4j.Logger;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -32,6 +34,7 @@ import java.util.Objects;
  * Literal for DecimalV3 Type
  */
 public class DecimalV3Literal extends FractionalLiteral {
+    private static final Logger logger = Logger.getLogger(Literal.class);
 
     private final BigDecimal value;
 
@@ -44,12 +47,32 @@ public class DecimalV3Literal extends FractionalLiteral {
      * Constructor for DecimalV3Literal
      */
     public DecimalV3Literal(DecimalV3Type dataType, BigDecimal value) {
-        super(DecimalV3Type.createDecimalV3TypeLooseCheck(dataType.getPrecision(), dataType.getScale()));
+        super(DecimalV3Type.createDecimalV3TypeLooseCheck(
+                dataType.getPrecision() == -1 ? value.precision() : dataType.getPrecision(),
+                dataType.getScale() == -1 ? value.scale() : dataType.getScale())
+        );
+
+        int precision = dataType.getPrecision() == -1 ? value.precision() : dataType.getPrecision();
+        int scale = dataType.getScale() == -1 ? value.scale() : dataType.getScale();
         Objects.requireNonNull(value, "value not be null");
-        checkPrecisionAndScale(dataType.getPrecision(), dataType.getScale(), value);
-        BigDecimal adjustedValue = value.scale() < 0 ? value
-                : value.setScale(dataType.getScale(), RoundingMode.HALF_UP);
+        checkPrecisionAndScale(precision, scale, value);
+        BigDecimal adjustedValue = value.scale() < 0 ? value : value.setScale(scale, RoundingMode.HALF_UP);
+        logger.info("DecimalV3Literal orig bigDecimal: " + value
+                + ", targetType: " + dataType + ", result big decimal: " + adjustedValue);
         this.value = Objects.requireNonNull(adjustedValue);
+    }
+
+    // In some scenarios, when enable_decimal256=false, the creation of DecimalV3Literal with
+    // a precision exceeding 38 is not allowed, such as during the parsing stage.
+    public static DecimalV3Literal createWithCheck256(BigDecimal value) {
+        return new DecimalV3Literal(DecimalV3Type.createDecimalV3Type(value), value);
+    }
+
+    // In some scenarios, even when enable_decimal256=false, it is still possible
+    // to create DecimalV3Literal with a precision exceeding 38,
+    // for example, intermediate steps in constant folding calculations and expression simplification.
+    public static DecimalV3Literal createWithoutCheck256(BigDecimal value) {
+        return new DecimalV3Literal(DecimalV3Type.createDecimalV3TypeNotCheck256(value), value);
     }
 
     @Override
@@ -72,16 +95,45 @@ public class DecimalV3Literal extends FractionalLiteral {
         return value.doubleValue();
     }
 
-    public DecimalV3Literal roundCeiling(int newScale) {
-        return new DecimalV3Literal(DecimalV3Type
-                .createDecimalV3Type(((DecimalV3Type) dataType).getPrecision(), newScale),
-                value.setScale(newScale, RoundingMode.CEILING));
+    @Override
+    public BigDecimal getBigDecimalValue() {
+        return value;
     }
 
+    /**
+     * get ceiling of a decimal v3 literal
+     * @param newScale scale we want to cast to
+     * @return new decimal v3 literal with new scalar
+     */
+    public DecimalV3Literal roundCeiling(int newScale) {
+        if (newScale >= this.getValue().scale()) {
+            return this;
+        }
+        return createWithoutCheck256(value.setScale(newScale, RoundingMode.CEILING));
+    }
+
+    /**
+     * get floor of a decimal v3 literal
+     * @param newScale scale we want to cast to
+     * @return new decimal v3 literal with new scalar
+     */
     public DecimalV3Literal roundFloor(int newScale) {
-        return new DecimalV3Literal(DecimalV3Type
-                .createDecimalV3Type(((DecimalV3Type) dataType).getPrecision(), newScale),
-                value.setScale(newScale, RoundingMode.FLOOR));
+        if (newScale >= this.getValue().scale()) {
+            return this;
+        }
+        return createWithoutCheck256(value.setScale(newScale, RoundingMode.FLOOR));
+    }
+
+    /**
+     * get round of a decimal v3 literal
+     * @param newScale scale we want to cast to
+     * @return new decimal v3 literal with new scalar
+     */
+    public DecimalV3Literal round(int newScale) {
+        if (newScale >= this.getValue().scale()) {
+            return this;
+        }
+        return createWithoutCheck256(value.setScale(newScale, RoundingMode.HALF_UP));
     }
 
     /**
@@ -89,6 +141,9 @@ public class DecimalV3Literal extends FractionalLiteral {
      */
     private static void checkPrecisionAndScale(int precision, int scale, BigDecimal value) throws AnalysisException {
         Preconditions.checkNotNull(value);
+        if (value.compareTo(BigDecimal.ZERO) == 0) {
+            return;
+        }
         int realPrecision = value.precision();
         int realScale = value.scale();
         boolean valid = true;
@@ -101,7 +156,7 @@ public class DecimalV3Literal extends FractionalLiteral {
         }
 
         if (!valid) {
-            throw new AnalysisException(
+            throw new CastException(
                     String.format("Invalid precision and scale - expect (%d, %d), but (%d, %d)",
                             precision, scale, realPrecision, realScale));
         }
@@ -120,5 +175,15 @@ public class DecimalV3Literal extends FractionalLiteral {
         }
         DecimalV3Literal literal = (DecimalV3Literal) o;
         return Objects.equals(dataType, literal.dataType);
+    }
+
+    @Override
+    public String computeToSql() {
+        return value.toPlainString();
+    }
+
+    @Override
+    public String toString() {
+        return toSql();
     }
 }

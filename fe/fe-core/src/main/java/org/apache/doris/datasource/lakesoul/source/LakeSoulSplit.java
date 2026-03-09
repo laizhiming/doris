@@ -17,14 +17,18 @@
 
 package org.apache.doris.datasource.lakesoul.source;
 
+import org.apache.doris.common.util.LocationPath;
 import org.apache.doris.datasource.FileSplit;
 
 import lombok.Data;
-import org.apache.hadoop.fs.Path;
 
 import java.util.List;
 import java.util.Map;
 
+/**
+ * @deprecated LakeSoul catalog support has been deprecated and will be removed in a future version.
+ */
+@Deprecated
 @Data
 public class LakeSoulSplit extends FileSplit {
 
@@ -46,7 +50,8 @@ public class LakeSoulSplit extends FileSplit {
                          long fileLength,
                          String[] hosts,
                          List<String> partitionValues) {
-        super(new Path(paths.get(0)), start, length, fileLength, hosts, partitionValues);
+        super(LocationPath.of(paths.get(0)), start, length, fileLength,
+                0, hosts, partitionValues);
         this.paths = paths;
         this.primaryKeys = primaryKeys;
         this.partitionDesc = partitionDesc;

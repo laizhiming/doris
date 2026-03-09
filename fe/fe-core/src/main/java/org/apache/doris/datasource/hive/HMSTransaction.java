@@ -25,22 +25,30 @@ import org.apache.doris.backup.Status;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.profile.SummaryProfile;
+import org.apache.doris.common.util.PathUtils;
+import org.apache.doris.datasource.NameMapping;
+import org.apache.doris.datasource.statistics.CommonStatistics;
 import org.apache.doris.fs.FileSystem;
 import org.apache.doris.fs.FileSystemProvider;
 import org.apache.doris.fs.FileSystemUtil;
+import org.apache.doris.fs.remote.ObjFileSystem;
 import org.apache.doris.fs.remote.RemoteFile;
 import org.apache.doris.fs.remote.S3FileSystem;
 import org.apache.doris.fs.remote.SwitchingFileSystem;
 import org.apache.doris.nereids.trees.plans.commands.insert.HiveInsertCommandContext;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.thrift.TFileType;
+import org.apache.doris.thrift.THiveLocationParams;
 import org.apache.doris.thrift.THivePartitionUpdate;
 import org.apache.doris.thrift.TS3MPUPendingUpload;
 import org.apache.doris.thrift.TUpdateMode;
 import org.apache.doris.transaction.Transaction;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.base.Verify;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
@@ -56,11 +64,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
-import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
-import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 
+import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -73,7 +81,9 @@ import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -81,20 +91,21 @@ public class HMSTransaction implements Transaction {
     private static final Logger LOG = LogManager.getLogger(HMSTransaction.class);
     private final HiveMetadataOps hiveOps;
     private final FileSystem fs;
-    private String dbName;
-    private String tbName;
     private Optional<SummaryProfile> summaryProfile = Optional.empty();
     private String queryId;
+    private boolean isOverwrite = false;
+    TFileType fileType;
 
-    private final Map<DatabaseTableName, Action<TableAndMore>> tableActions = new HashMap<>();
-    private final Map<DatabaseTableName, Map<List<String>, Action<PartitionAndMore>>>
+    private final Map<NameMapping, Action<TableAndMore>> tableActions = new HashMap<>();
+    private final Map<NameMapping, Map<List<String>, Action<PartitionAndMore>>>
             partitionActions = new HashMap<>();
-    private final Map<DatabaseTableName, List<FieldSchema>> tableColumns = new HashMap<>();
+    private final Map<NameMapping, List<FieldSchema>> tableColumns = new HashMap<>();
 
     private final Executor fileSystemExecutor;
     private HmsCommitter hmsCommitter;
     private List<THivePartitionUpdate> hivePartitionUpdates = Lists.newArrayList();
-    private String declaredIntentionsToWrite;
+    private Optional<String> stagingDirectory;
+    private boolean isMockedPartitionUpdate = false;
 
     private static class UncompletedMpuPendingUpload {
 
@@ -144,14 +155,6 @@ public class HMSTransaction implements Transaction {
         doCommit();
     }
 
-    public String getDbName() {
-        return dbName;
-    }
-
-    public String getTbName() {
-        return tbName;
-    }
-
     public List<THivePartitionUpdate> mergePartitions(List<THivePartitionUpdate> hivePUs) {
         Map<String, THivePartitionUpdate> mm = new HashMap<>();
         for (THivePartitionUpdate pu : hivePUs) {
@@ -172,29 +175,67 @@ public class HMSTransaction implements Transaction {
 
     @Override
     public void rollback() {
-        if (hmsCommitter != null) {
+        if (hmsCommitter == null) {
+            return;
+        }
+        try {
+            hmsCommitter.abort();
             hmsCommitter.rollback();
+        } finally {
+            hmsCommitter.shutdownExecutorService();
         }
     }
 
     public void beginInsertTable(HiveInsertCommandContext ctx) {
-        declaredIntentionsToWrite = ctx.getWritePath();
         queryId = ctx.getQueryId();
+        isOverwrite = ctx.isOverwrite();
+        fileType = ctx.getFileType();
+        if (fileType == TFileType.FILE_S3) {
+            stagingDirectory = Optional.empty();
+        } else {
+            stagingDirectory = Optional.of(ctx.getWritePath());
+        }
     }
 
-    public void finishInsertTable(String dbName, String tbName) {
-        this.dbName = dbName;
-        this.tbName = tbName;
+    public void finishInsertTable(NameMapping nameMapping) {
+        Table table = getTable(nameMapping);
+        if (hivePartitionUpdates.isEmpty() && isOverwrite && table.getPartitionKeysSize() == 0) {
+            // use an empty hivePartitionUpdate to clean source table
+            isMockedPartitionUpdate = true;
+            THivePartitionUpdate emptyUpdate = new THivePartitionUpdate() {{
+                    setUpdateMode(TUpdateMode.OVERWRITE);
+                    setFileSize(0);
+                    setRowCount(0);
+                    setFileNames(Collections.emptyList());
+                    if (fileType == TFileType.FILE_S3) {
+                        setS3MpuPendingUploads(Lists.newArrayList(new TS3MPUPendingUpload()));
+                        setLocation(new THiveLocationParams() {{
+                                setWritePath(table.getSd().getLocation());
+                            }
+                        });
+                    } else {
+                        stagingDirectory.ifPresent((v) -> {
+                            fs.makeDir(v);
+                            setLocation(new THiveLocationParams() {{
+                                    setWritePath(v);
+                                }
+                            });
+                        });
+                    }
+                }
+            };
+            hivePartitionUpdates = Lists.newArrayList(emptyUpdate);
+        }
+
         List<THivePartitionUpdate> mergedPUs = mergePartitions(hivePartitionUpdates);
         for (THivePartitionUpdate pu : mergedPUs) {
             if (pu.getS3MpuPendingUploads() != null) {
                 for (TS3MPUPendingUpload s3MPUPendingUpload : pu.getS3MpuPendingUploads()) {
                     uncompletedMpuPendingUploads.add(
-                            new UncompletedMpuPendingUpload(s3MPUPendingUpload, pu.getLocation().getTargetPath()));
+                            new UncompletedMpuPendingUpload(s3MPUPendingUpload, pu.getLocation().getWritePath()));
                 }
             }
         }
-        Table table = getTable(dbName, tbName);
         List<Pair<THivePartitionUpdate, HivePartitionStatistics>> insertExistsPartitions = new ArrayList<>();
         for (THivePartitionUpdate pu : mergedPUs) {
             TUpdateMode updateMode = pu.getUpdateMode();
@@ -210,16 +251,15 @@ public class HMSTransaction implements Transaction {
                     case APPEND:
                         finishChangingExistingTable(
                                 ActionType.INSERT_EXISTING,
-                                dbName,
-                                tbName,
+                                nameMapping,
                                 writePath,
                                 pu.getFileNames(),
                                 hivePartitionStatistics,
                                 pu);
                         break;
                     case OVERWRITE:
-                        dropTable(dbName, tbName);
-                        createTable(table, writePath, pu.getFileNames(), hivePartitionStatistics, pu);
+                        dropTable(nameMapping);
+                        createTable(nameMapping, table, writePath, pu.getFileNames(), hivePartitionStatistics, pu);
                         break;
                     default:
                         throw new RuntimeException("Not support mode:[" + updateMode + "] in unPartitioned table");
@@ -231,26 +271,48 @@ public class HMSTransaction implements Transaction {
                         insertExistsPartitions.add(Pair.of(pu, hivePartitionStatistics));
                         break;
                     case NEW:
-                    case OVERWRITE:
-                        StorageDescriptor sd = table.getSd();
-                        HivePartition hivePartition = new HivePartition(
-                                dbName,
-                                tbName,
-                                false,
-                                sd.getInputFormat(),
-                                pu.getLocation().getTargetPath(),
-                                HiveUtil.toPartitionValues(pu.getName()),
-                                Maps.newHashMap(),
-                                sd.getOutputFormat(),
-                                sd.getSerdeInfo().getSerializationLib(),
-                                getTableColumns(dbName, tbName)
-                        );
-                        if (updateMode == TUpdateMode.OVERWRITE) {
-                            dropPartition(dbName, tbName, hivePartition.getPartitionValues(), true);
+                        // Check if partition really exists in HMS (may be cache miss in Doris)
+                        String partitionName = pu.getName();
+                        if (Strings.isNullOrEmpty(partitionName)) {
+                            // This should not happen for partitioned tables
+                            LOG.warn("Partition name is null/empty for NEW mode in partitioned table, skipping");
+                            break;
                         }
-                        addPartition(
-                                dbName, tbName, hivePartition, writePath,
-                                pu.getName(), pu.getFileNames(), hivePartitionStatistics, pu);
+                        List<String> partitionValues = HiveUtil.toPartitionValues(partitionName);
+                        boolean existsInHMS = false;
+                        try {
+                            Partition hmsPartition = hiveOps.getClient().getPartition(
+                                    nameMapping.getRemoteDbName(),
+                                    nameMapping.getRemoteTblName(),
+                                    partitionValues);
+                            existsInHMS = (hmsPartition != null);
+                        } catch (Exception e) {
+                            // Partition not found in HMS, treat as truly new
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("Partition {} not found in HMS, will create it", pu.getName());
+                            }
+                        }
+
+                        if (existsInHMS) {
+                            // Partition exists in HMS but not in Doris cache
+                            // Treat as APPEND instead of NEW to avoid creation error
+                            LOG.info("Partition {} already exists in HMS (Doris cache miss), treating as APPEND",
+                                    pu.getName());
+                            insertExistsPartitions.add(Pair.of(pu, hivePartitionStatistics));
+                        } else {
+                            // Truly new partition, create it
+                            createAndAddPartition(nameMapping, table, partitionValues, writePath,
+                                    pu, hivePartitionStatistics, false);
+                        }
+                        break;
+                    case OVERWRITE:
+                        String overwritePartitionName = pu.getName();
+                        if (Strings.isNullOrEmpty(overwritePartitionName)) {
+                            LOG.warn("Partition name is null/empty for OVERWRITE mode in partitioned table, skipping");
+                            break;
+                        }
+                        createAndAddPartition(nameMapping, table, HiveUtil.toPartitionValues(overwritePartitionName),
+                                writePath, pu, hivePartitionStatistics, true);
                         break;
                     default:
                         throw new RuntimeException("Not support mode:[" + updateMode + "] in partitioned table");
@@ -259,7 +321,7 @@ public class HMSTransaction implements Transaction {
         }
 
         if (!insertExistsPartitions.isEmpty()) {
-            convertToInsertExistingPartitionAction(insertExistsPartitions);
+            convertToInsertExistingPartitionAction(nameMapping, insertExistsPartitions);
         }
     }
 
@@ -267,45 +329,47 @@ public class HMSTransaction implements Transaction {
         hmsCommitter = new HmsCommitter();
 
         try {
-            for (Map.Entry<DatabaseTableName, Action<TableAndMore>> entry : tableActions.entrySet()) {
+            for (Map.Entry<NameMapping, Action<TableAndMore>> entry : tableActions.entrySet()) {
+                NameMapping nameMapping = entry.getKey();
                 Action<TableAndMore> action = entry.getValue();
                 switch (action.getType()) {
                     case INSERT_EXISTING:
-                        hmsCommitter.prepareInsertExistingTable(action.getData());
+                        hmsCommitter.prepareInsertExistingTable(nameMapping, action.getData());
                         break;
                     case ALTER:
-                        hmsCommitter.prepareAlterTable(action.getData());
+                        hmsCommitter.prepareAlterTable(nameMapping, action.getData());
                         break;
                     default:
                         throw new UnsupportedOperationException("Unsupported table action type: " + action.getType());
                 }
             }
 
-            for (Map.Entry<DatabaseTableName, Map<List<String>, Action<PartitionAndMore>>> tableEntry
+            for (Map.Entry<NameMapping, Map<List<String>, Action<PartitionAndMore>>> tableEntry
                     : partitionActions.entrySet()) {
+                NameMapping nameMapping = tableEntry.getKey();
                 for (Map.Entry<List<String>, Action<PartitionAndMore>> partitionEntry :
                         tableEntry.getValue().entrySet()) {
                     Action<PartitionAndMore> action = partitionEntry.getValue();
                     switch (action.getType()) {
                         case INSERT_EXISTING:
-                            hmsCommitter.prepareInsertExistPartition(action.getData());
+                            hmsCommitter.prepareInsertExistPartition(nameMapping, action.getData());
                             break;
                         case ADD:
-                            hmsCommitter.prepareAddPartition(action.getData());
+                            hmsCommitter.prepareAddPartition(nameMapping, action.getData());
                             break;
                         case ALTER:
-                            hmsCommitter.prepareAlterPartition(action.getData());
+                            hmsCommitter.prepareAlterPartition(nameMapping, action.getData());
                             break;
                         default:
                             throw new UnsupportedOperationException(
-                                "Unsupported partition action type: " + action.getType());
+                                    "Unsupported partition action type: " + action.getType());
                     }
                 }
             }
 
             hmsCommitter.doCommit();
         } catch (Throwable t) {
-            LOG.warn("Failed to commit for {}.{}, abort it.", dbName, tbName);
+            LOG.warn("Failed to commit for {}, abort it.", queryId);
             try {
                 hmsCommitter.abort();
                 hmsCommitter.rollback();
@@ -315,6 +379,7 @@ public class HMSTransaction implements Transaction {
             throw t;
         } finally {
             hmsCommitter.runClearPathsForFinish();
+            hmsCommitter.shutdownExecutorService();
         }
     }
 
@@ -333,11 +398,15 @@ public class HMSTransaction implements Transaction {
         return hivePartitionUpdates.stream().mapToLong(THivePartitionUpdate::getRowCount).sum();
     }
 
+    public List<THivePartitionUpdate> getHivePartitionUpdates() {
+        return hivePartitionUpdates;
+    }
+
     private void convertToInsertExistingPartitionAction(
+            NameMapping nameMapping,
             List<Pair<THivePartitionUpdate, HivePartitionStatistics>> partitions) {
-        DatabaseTableName databaseTableName = new DatabaseTableName(dbName, tbName);
         Map<List<String>, Action<PartitionAndMore>> partitionActionsForTable =
-                partitionActions.computeIfAbsent(databaseTableName, k -> new HashMap<>());
+                partitionActions.computeIfAbsent(nameMapping, k -> new HashMap<>());
 
         for (List<Pair<THivePartitionUpdate, HivePartitionStatistics>> partitionBatch :
                 Iterables.partition(partitions, 100)) {
@@ -355,7 +424,7 @@ public class HMSTransaction implements Transaction {
                     case DROP_PRESERVE_DATA:
                         throw new RuntimeException(
                                 "Not found partition from partition actions"
-                                        + "for " + databaseTableName + ", partitions: " + partitionNames);
+                                        + "for " + nameMapping.getFullLocalName() + ", partitions: " + partitionNames);
                     case ADD:
                     case ALTER:
                     case INSERT_EXISTING:
@@ -370,7 +439,8 @@ public class HMSTransaction implements Transaction {
 
             Map<String, Partition> partitionsByNamesMap = HiveUtil.convertToNamePartitionMap(
                     partitionNames,
-                    hiveOps.getClient().getPartitions(dbName, tbName, partitionNames));
+                    hiveOps.getClient().getPartitions(nameMapping.getRemoteDbName(), nameMapping.getRemoteTblName(),
+                            partitionNames));
 
             for (int i = 0; i < partitionsByNamesMap.size(); i++) {
                 String partitionName = partitionNames.get(i);
@@ -379,7 +449,7 @@ public class HMSTransaction implements Transaction {
                 if (partition == null) {
                     // Prevent this partition from being deleted by other engines
                     throw new RuntimeException(
-                            "Not found partition from hms for " + databaseTableName
+                            "Not found partition from hms for " + nameMapping.getFullLocalName()
                                     + ", partitions: " + partitionNames);
                 }
                 THivePartitionUpdate pu = partitionBatch.get(i).first;
@@ -389,8 +459,7 @@ public class HMSTransaction implements Transaction {
                 List<String> partitionValues = HiveUtil.toPartitionValues(pu.getName());
 
                 HivePartition hivePartition = new HivePartition(
-                        dbName,
-                        tbName,
+                        nameMapping,
                         false,
                         sd.getInputFormat(),
                         partition.getSd().getLocation(),
@@ -398,7 +467,7 @@ public class HMSTransaction implements Transaction {
                         partition.getParameters(),
                         sd.getOutputFormat(),
                         sd.getSerdeInfo().getSerializationLib(),
-                        getTableColumns(dbName, tbName)
+                        sd.getCols()
                 );
 
                 partitionActionsForTable.put(
@@ -406,12 +475,12 @@ public class HMSTransaction implements Transaction {
                         new Action<>(
                                 ActionType.INSERT_EXISTING,
                                 new PartitionAndMore(
-                                    hivePartition,
-                                    pu.getLocation().getWritePath(),
-                                    pu.getName(),
-                                    pu.getFileNames(),
-                                    updateStats,
-                                    pu
+                                        hivePartition,
+                                        pu.getLocation().getWritePath(),
+                                        pu.getName(),
+                                        pu.getFileNames(),
+                                        updateStats,
+                                        pu
                                 ))
                 );
             }
@@ -431,18 +500,16 @@ public class HMSTransaction implements Transaction {
     }
 
     public static class UpdateStatisticsTask {
-        private final String dbName;
-        private final String tableName;
+        private final NameMapping nameMapping;
         private final Optional<String> partitionName;
         private final HivePartitionStatistics updatePartitionStat;
         private final boolean merge;
 
         private boolean done;
 
-        public UpdateStatisticsTask(String dbName, String tableName, Optional<String> partitionName,
-                                    HivePartitionStatistics statistics, boolean merge) {
-            this.dbName = Objects.requireNonNull(dbName, "dbName is null");
-            this.tableName = Objects.requireNonNull(tableName, "tableName is null");
+        public UpdateStatisticsTask(NameMapping nameMapping, Optional<String> partitionName,
+                HivePartitionStatistics statistics, boolean merge) {
+            this.nameMapping = Objects.requireNonNull(nameMapping, "nameMapping is null");
             this.partitionName = Objects.requireNonNull(partitionName, "partitionName is null");
             this.updatePartitionStat = Objects.requireNonNull(statistics, "statistics is null");
             this.merge = merge;
@@ -450,9 +517,9 @@ public class HMSTransaction implements Transaction {
 
         public void run(HiveMetadataOps hiveOps) {
             if (partitionName.isPresent()) {
-                hiveOps.updatePartitionStatistics(dbName, tableName, partitionName.get(), this::updateStatistics);
+                hiveOps.updatePartitionStatistics(nameMapping, partitionName.get(), this::updateStatistics);
             } else {
-                hiveOps.updateTableStatistics(dbName, tableName, this::updateStatistics);
+                hiveOps.updateTableStatistics(nameMapping, this::updateStatistics);
             }
             done = true;
         }
@@ -462,17 +529,17 @@ public class HMSTransaction implements Transaction {
                 return;
             }
             if (partitionName.isPresent()) {
-                hmsOps.updatePartitionStatistics(dbName, tableName, partitionName.get(), this::resetStatistics);
+                hmsOps.updatePartitionStatistics(nameMapping, partitionName.get(), this::resetStatistics);
             } else {
-                hmsOps.updateTableStatistics(dbName, tableName, this::resetStatistics);
+                hmsOps.updateTableStatistics(nameMapping, this::resetStatistics);
             }
         }
 
         public String getDescription() {
             if (partitionName.isPresent()) {
-                return "alter partition parameters " + tableName + " " + partitionName.get();
+                return "alter partition parameters " + nameMapping.getFullLocalName() + " " + partitionName.get();
             } else {
-                return "alter table parameters " +  tableName;
+                return "alter table parameters " + nameMapping.getFullRemoteName();
             }
         }
 
@@ -482,7 +549,7 @@ public class HMSTransaction implements Transaction {
 
         private HivePartitionStatistics resetStatistics(HivePartitionStatistics currentStatistics) {
             return HivePartitionStatistics
-                    .reduce(currentStatistics, updatePartitionStat, HivePartitionStatistics.ReduceOperator.SUBTRACT);
+                    .reduce(currentStatistics, updatePartitionStat, CommonStatistics.ReduceOperator.SUBTRACT);
         }
     }
 
@@ -498,18 +565,22 @@ public class HMSTransaction implements Transaction {
             return partitions;
         }
 
+        public void clear() {
+            partitions.clear();
+            createdPartitionValues.clear();
+        }
+
         public void addPartition(HivePartitionWithStatistics partition) {
             partitions.add(partition);
         }
 
         public void run(HiveMetadataOps hiveOps) {
             HivePartition firstPartition = partitions.get(0).getPartition();
-            String dbName = firstPartition.getDbName();
-            String tableName = firstPartition.getTblName();
+            NameMapping nameMapping = firstPartition.getNameMapping();
             List<List<HivePartitionWithStatistics>> batchedPartitions = Lists.partition(partitions, 20);
             for (List<HivePartitionWithStatistics> batch : batchedPartitions) {
                 try {
-                    hiveOps.addPartitions(dbName, tableName, batch);
+                    hiveOps.addPartitions(nameMapping, batch);
                     for (HivePartitionWithStatistics partition : batch) {
                         createdPartitionValues.add(partition.getPartition().getPartitionValues());
                     }
@@ -522,15 +593,14 @@ public class HMSTransaction implements Transaction {
 
         public List<List<String>> rollback(HiveMetadataOps hiveOps) {
             HivePartition firstPartition = partitions.get(0).getPartition();
-            String dbName = firstPartition.getDbName();
-            String tableName = firstPartition.getTblName();
+            NameMapping nameMapping = firstPartition.getNameMapping();
             List<List<String>> rollbackFailedPartitions = new ArrayList<>();
             for (List<String> createdPartitionValue : createdPartitionValues) {
                 try {
-                    hiveOps.dropPartition(dbName, tableName, createdPartitionValue, false);
+                    hiveOps.dropPartition(nameMapping, createdPartitionValue, false);
                 } catch (Throwable t) {
-                    LOG.warn("Failed to drop partition on {}.{}.{} when rollback",
-                            dbName, tableName, rollbackFailedPartitions);
+                    LOG.warn("Failed to drop partition on {}.{} when rollback",
+                            nameMapping.getFullLocalName(), rollbackFailedPartitions);
                     rollbackFailedPartitions.add(createdPartitionValue);
                 }
             }
@@ -558,9 +628,9 @@ public class HMSTransaction implements Transaction {
         @Override
         public String toString() {
             return new StringJoiner(", ", DirectoryCleanUpTask.class.getSimpleName() + "[", "]")
-                .add("path=" + path)
-                .add("deleteEmptyDir=" + deleteEmptyDir)
-                .toString();
+                    .add("path=" + path)
+                    .add("deleteEmptyDir=" + deleteEmptyDir)
+                    .toString();
         }
     }
 
@@ -602,12 +672,11 @@ public class HMSTransaction implements Transaction {
         @Override
         public String toString() {
             return new StringJoiner(", ", RenameDirectoryTask.class.getSimpleName() + "[", "]")
-                .add("renameFrom:" + renameFrom)
-                .add("renameTo:" + renameTo)
-                .toString();
+                    .add("renameFrom:" + renameFrom)
+                    .add("renameTo:" + renameTo)
+                    .toString();
         }
     }
-
 
 
     private void recursiveDeleteItems(Path directory, boolean deleteEmptyDir, boolean reverse) {
@@ -616,15 +685,23 @@ public class HMSTransaction implements Transaction {
         if (!deleteResult.getNotDeletedEligibleItems().isEmpty()) {
             LOG.warn("Failed to delete directory {}. Some eligible items can't be deleted: {}.",
                     directory.toString(), deleteResult.getNotDeletedEligibleItems());
+            throw new RuntimeException(
+                "Failed to delete directory for files: " + deleteResult.getNotDeletedEligibleItems());
         } else if (deleteEmptyDir && !deleteResult.dirNotExists()) {
             LOG.warn("Failed to delete directory {} due to dir isn't empty", directory.toString());
+            throw new RuntimeException("Failed to delete directory for empty dir: " + directory.toString());
         }
     }
 
     private DeleteRecursivelyResult recursiveDeleteFiles(Path directory, boolean deleteEmptyDir, boolean reverse) {
         try {
-            if (!fs.directoryExists(directory.toString()).ok()) {
+            Status status = fs.directoryExists(directory.toString());
+            if (status.getErrCode().equals(Status.ErrCode.NOT_FOUND)) {
                 return new DeleteRecursivelyResult(true, ImmutableList.of());
+            } else if (!status.ok()) {
+                ImmutableList.Builder<String> notDeletedEligibleItems = ImmutableList.builder();
+                notDeletedEligibleItems.add(directory.toString() + "/*");
+                return new DeleteRecursivelyResult(false, notDeletedEligibleItems.build());
             }
         } catch (Exception e) {
             ImmutableList.Builder<String> notDeletedEligibleItems = ImmutableList.builder();
@@ -697,48 +774,6 @@ public class HMSTransaction implements Transaction {
         return !fs.directoryExists(path.toString()).ok();
     }
 
-    public static class DatabaseTableName {
-        private final String dbName;
-        private final String tbName;
-
-        public DatabaseTableName(String dbName, String tbName) {
-            this.dbName = dbName;
-            this.tbName = tbName;
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            if (this == other) {
-                return true;
-            }
-
-            if (other == null || getClass() != other.getClass()) {
-                return false;
-            }
-
-            DatabaseTableName that = (DatabaseTableName) other;
-            return Objects.equals(dbName, that.dbName) && Objects.equals(tbName, that.tbName);
-        }
-
-        @Override
-        public String toString() {
-            return dbName + "." + tbName;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(dbName, tbName);
-        }
-
-        public String getTbName() {
-            return tbName;
-        }
-
-        public String getDbName() {
-            return dbName;
-        }
-    }
-
     private static class TableAndMore {
         private final Table table;
         private final String currentLocation;
@@ -783,9 +818,9 @@ public class HMSTransaction implements Transaction {
         @Override
         public String toString() {
             return MoreObjects.toStringHelper(this)
-                .add("table", table)
-                .add("statisticsUpdate", statisticsUpdate)
-                .toString();
+                    .add("table", table)
+                    .add("statisticsUpdate", statisticsUpdate)
+                    .toString();
         }
     }
 
@@ -841,10 +876,10 @@ public class HMSTransaction implements Transaction {
         @Override
         public String toString() {
             return MoreObjects.toStringHelper(this)
-                .add("partition", partition)
-                .add("currentLocation", currentLocation)
-                .add("fileNames", fileNames)
-                .toString();
+                    .add("partition", partition)
+                    .add("currentLocation", currentLocation)
+                    .add("fileNames", fileNames)
+                    .toString();
         }
     }
 
@@ -889,16 +924,16 @@ public class HMSTransaction implements Transaction {
         @Override
         public String toString() {
             return MoreObjects.toStringHelper(this)
-                .add("type", type)
-                .add("data", data)
-                .toString();
+                    .add("type", type)
+                    .add("data", data)
+                    .toString();
         }
     }
 
-    public synchronized Table getTable(String databaseName, String tableName) {
-        Action<TableAndMore> tableAction = tableActions.get(new DatabaseTableName(databaseName, tableName));
+    private synchronized Table getTable(NameMapping nameMapping) {
+        Action<TableAndMore> tableAction = tableActions.get(nameMapping);
         if (tableAction == null) {
-            return hiveOps.getClient().getTable(databaseName, tableName);
+            return hiveOps.getClient().getTable(nameMapping.getRemoteDbName(), nameMapping.getRemoteTblName());
         }
         switch (tableAction.getType()) {
             case ADD:
@@ -912,28 +947,21 @@ public class HMSTransaction implements Transaction {
             default:
                 throw new IllegalStateException("Unknown action type: " + tableAction.getType());
         }
-        throw new RuntimeException("Not Found table: " + databaseName + "." + tableName);
-    }
-
-    public synchronized List<FieldSchema> getTableColumns(String databaseName, String tableName) {
-        return tableColumns.computeIfAbsent(new DatabaseTableName(databaseName, tableName),
-            key -> hiveOps.getClient().getSchema(dbName, tbName));
+        throw new RuntimeException("Not Found table: " + nameMapping);
     }
 
     public synchronized void finishChangingExistingTable(
             ActionType actionType,
-            String databaseName,
-            String tableName,
+            NameMapping nameMapping,
             String location,
             List<String> fileNames,
             HivePartitionStatistics statisticsUpdate,
             THivePartitionUpdate hivePartitionUpdate) {
-        DatabaseTableName databaseTableName = new DatabaseTableName(databaseName, tableName);
-        Action<TableAndMore> oldTableAction = tableActions.get(databaseTableName);
+        Action<TableAndMore> oldTableAction = tableActions.get(nameMapping);
         if (oldTableAction == null) {
-            Table table = hiveOps.getClient().getTable(databaseTableName.getDbName(), databaseTableName.getTbName());
+            Table table = hiveOps.getClient().getTable(nameMapping.getRemoteDbName(), nameMapping.getRemoteTblName());
             tableActions.put(
-                    databaseTableName,
+                    nameMapping,
                     new Action<>(
                             actionType,
                             new TableAndMore(
@@ -947,7 +975,7 @@ public class HMSTransaction implements Transaction {
 
         switch (oldTableAction.getType()) {
             case DROP:
-                throw new RuntimeException("Not found table: " + databaseTableName);
+                throw new RuntimeException("Not found table: " + nameMapping.getFullLocalName());
             case ADD:
             case ALTER:
             case INSERT_EXISTING:
@@ -963,27 +991,28 @@ public class HMSTransaction implements Transaction {
     }
 
     public synchronized void createTable(
-            Table table, String location, List<String> fileNames, HivePartitionStatistics statistics,
+            NameMapping nameMapping,
+            Table table, String location, List<String> fileNames,
+            HivePartitionStatistics statistics,
             THivePartitionUpdate hivePartitionUpdate) {
         // When creating a table, it should never have partition actions. This is just a sanity check.
-        checkNoPartitionAction(dbName, tbName);
-        DatabaseTableName databaseTableName = new DatabaseTableName(dbName, tbName);
-        Action<TableAndMore> oldTableAction = tableActions.get(databaseTableName);
+        checkNoPartitionAction(nameMapping);
+        Action<TableAndMore> oldTableAction = tableActions.get(nameMapping);
         TableAndMore tableAndMore = new TableAndMore(table, location, fileNames, statistics, hivePartitionUpdate);
         if (oldTableAction == null) {
-            tableActions.put(databaseTableName, new Action<>(ActionType.ADD, tableAndMore));
+            tableActions.put(nameMapping, new Action<>(ActionType.ADD, tableAndMore));
             return;
         }
         switch (oldTableAction.getType()) {
             case DROP:
-                tableActions.put(databaseTableName, new Action<>(ActionType.ALTER, tableAndMore));
+                tableActions.put(nameMapping, new Action<>(ActionType.ALTER, tableAndMore));
                 return;
 
             case ADD:
             case ALTER:
             case INSERT_EXISTING:
             case MERGE:
-                throw new RuntimeException("Table already exists: " + databaseTableName);
+                throw new RuntimeException("Table already exists: " + nameMapping.getFullLocalName());
             case DROP_PRESERVE_DATA:
                 break;
             default:
@@ -992,18 +1021,17 @@ public class HMSTransaction implements Transaction {
     }
 
 
-    public synchronized void dropTable(String databaseName, String tableName) {
+    public synchronized void dropTable(NameMapping nameMapping) {
         // Dropping table with partition actions requires cleaning up staging data, which is not implemented yet.
-        checkNoPartitionAction(databaseName, tableName);
-        DatabaseTableName databaseTableName = new DatabaseTableName(databaseName, tableName);
-        Action<TableAndMore> oldTableAction = tableActions.get(databaseTableName);
+        checkNoPartitionAction(nameMapping);
+        Action<TableAndMore> oldTableAction = tableActions.get(nameMapping);
         if (oldTableAction == null || oldTableAction.getType() == ActionType.ALTER) {
-            tableActions.put(databaseTableName, new Action<>(ActionType.DROP, null));
+            tableActions.put(nameMapping, new Action<>(ActionType.DROP, null));
             return;
         }
         switch (oldTableAction.getType()) {
             case DROP:
-                throw new RuntimeException("Not found table: " + databaseTableName);
+                throw new RuntimeException("Not found table: " + nameMapping.getFullLocalName());
             case ADD:
             case ALTER:
             case INSERT_EXISTING:
@@ -1017,18 +1045,48 @@ public class HMSTransaction implements Transaction {
     }
 
 
-    private void checkNoPartitionAction(String databaseName, String tableName) {
+    private void checkNoPartitionAction(NameMapping nameMapping) {
         Map<List<String>, Action<PartitionAndMore>> partitionActionsForTable =
-                partitionActions.get(new DatabaseTableName(databaseName, tableName));
+                partitionActions.get(nameMapping);
         if (partitionActionsForTable != null && !partitionActionsForTable.isEmpty()) {
             throw new RuntimeException(
                     "Cannot make schema changes to a table with modified partitions in the same transaction");
         }
     }
 
+    private void createAndAddPartition(
+            NameMapping nameMapping,
+            Table table,
+            List<String> partitionValues,
+            String writePath,
+            THivePartitionUpdate pu,
+            HivePartitionStatistics hivePartitionStatistics,
+            boolean dropFirst) {
+        StorageDescriptor sd = table.getSd();
+        String pathForHMS = this.fileType == TFileType.FILE_S3
+                ? writePath
+                : pu.getLocation().getTargetPath();
+        HivePartition hivePartition = new HivePartition(
+                nameMapping,
+                false,
+                sd.getInputFormat(),
+                pathForHMS,
+                partitionValues,
+                Maps.newHashMap(),
+                sd.getOutputFormat(),
+                sd.getSerdeInfo().getSerializationLib(),
+                sd.getCols()
+        );
+        if (dropFirst) {
+            dropPartition(nameMapping, hivePartition.getPartitionValues(), true);
+        }
+        addPartition(
+                nameMapping, hivePartition, writePath,
+                pu.getName(), pu.getFileNames(), hivePartitionStatistics, pu);
+    }
+
     public synchronized void addPartition(
-            String databaseName,
-            String tableName,
+            NameMapping nameMapping,
             HivePartition partition,
             String currentLocation,
             String partitionName,
@@ -1036,7 +1094,7 @@ public class HMSTransaction implements Transaction {
             HivePartitionStatistics statistics,
             THivePartitionUpdate hivePartitionUpdate) {
         Map<List<String>, Action<PartitionAndMore>> partitionActionsForTable =
-                partitionActions.computeIfAbsent(new DatabaseTableName(databaseName, tableName), k -> new HashMap<>());
+                partitionActions.computeIfAbsent(nameMapping, k -> new HashMap<>());
         Action<PartitionAndMore> oldPartitionAction = partitionActionsForTable.get(partition.getPartitionValues());
         if (oldPartitionAction == null) {
             partitionActionsForTable.put(
@@ -1064,21 +1122,20 @@ public class HMSTransaction implements Transaction {
             case INSERT_EXISTING:
             case MERGE:
                 throw new RuntimeException(
-                    "Partition already exists for table: "
-                        + databaseName + "." + tableName + ", partition values: " + partition.getPartitionValues());
+                        "Partition already exists for table: "
+                                + nameMapping.getFullLocalName() + ", partition values: " + partition
+                                .getPartitionValues());
             default:
                 throw new IllegalStateException("Unknown action type: " + oldPartitionAction.getType());
         }
     }
 
-    public synchronized void dropPartition(
-            String databaseName,
-            String tableName,
+    private synchronized void dropPartition(
+            NameMapping nameMapping,
             List<String> partitionValues,
             boolean deleteData) {
-        DatabaseTableName databaseTableName = new DatabaseTableName(databaseName, tableName);
         Map<List<String>, Action<PartitionAndMore>> partitionActionsForTable =
-                partitionActions.computeIfAbsent(databaseTableName, k -> new HashMap<>());
+                partitionActions.computeIfAbsent(nameMapping, k -> new HashMap<>());
         Action<PartitionAndMore> oldPartitionAction = partitionActionsForTable.get(partitionValues);
         if (oldPartitionAction == null) {
             if (deleteData) {
@@ -1092,7 +1149,7 @@ public class HMSTransaction implements Transaction {
             case DROP:
             case DROP_PRESERVE_DATA:
                 throw new RuntimeException(
-                        "Not found partition from partition actions for " + databaseTableName
+                        "Not found partition from partition actions for " + nameMapping.getFullLocalName()
                                 + ", partitions: " + partitionValues);
             case ADD:
             case ALTER:
@@ -1100,7 +1157,7 @@ public class HMSTransaction implements Transaction {
             case MERGE:
                 throw new RuntimeException(
                         "Dropping a partition added in the same transaction is not supported: "
-                                + databaseTableName + ", partition values: " + partitionValues);
+                                + nameMapping.getFullLocalName() + ", partition values: " + partitionValues);
             default:
                 throw new IllegalStateException("Unknown action type: " + oldPartitionAction.getType());
         }
@@ -1110,7 +1167,7 @@ public class HMSTransaction implements Transaction {
 
         // update statistics for unPartitioned table or existed partition
         private final List<UpdateStatisticsTask> updateStatisticsTasks = new ArrayList<>();
-        Executor updateStatisticsExecutor = Executors.newFixedThreadPool(16);
+        ExecutorService updateStatisticsExecutor = Executors.newFixedThreadPool(16);
 
         // add new partition
         private final AddPartitionsTask addPartitionsTask = new AddPartitionsTask();
@@ -1148,6 +1205,7 @@ public class HMSTransaction implements Transaction {
             for (CompletableFuture<?> undoUpdateFuture : undoUpdateFutures.build()) {
                 MoreFutures.getFutureValue(undoUpdateFuture);
             }
+            updateStatisticsTasks.clear();
         }
 
         private void undoAddPartitionsTask() {
@@ -1156,13 +1214,13 @@ public class HMSTransaction implements Transaction {
             }
 
             HivePartition firstPartition = addPartitionsTask.getPartitions().get(0).getPartition();
-            String dbName = firstPartition.getDbName();
-            String tableName = firstPartition.getTblName();
+            NameMapping nameMapping = firstPartition.getNameMapping();
             List<List<String>> rollbackFailedPartitions = addPartitionsTask.rollback(hiveOps);
             if (!rollbackFailedPartitions.isEmpty()) {
-                LOG.warn("Failed to rollback: add_partition for partition values {}.{}.{}",
-                        dbName, tableName, rollbackFailedPartitions);
+                LOG.warn("Failed to rollback: add_partition for partition values {}.{}",
+                        nameMapping.getFullLocalName(), rollbackFailedPartitions);
             }
+            addPartitionsTask.clear();
         }
 
         private void waitForAsyncFileSystemTaskSuppressThrowable() {
@@ -1175,13 +1233,23 @@ public class HMSTransaction implements Transaction {
                     // ignore
                 }
             }
+            asyncFileSystemTaskFutures.clear();
         }
 
-        public void prepareInsertExistingTable(TableAndMore tableAndMore) {
+        public void prepareInsertExistingTable(NameMapping nameMapping, TableAndMore tableAndMore) {
             Table table = tableAndMore.getTable();
             String targetPath = table.getSd().getLocation();
             String writePath = tableAndMore.getCurrentLocation();
-            if (!targetPath.equals(writePath)) {
+            // Determine if a rename operation is required for the output file.
+            // In the BE (Backend) implementation, all object storage systems (e.g., AWS S3, MinIO, OSS, COS)
+            // are unified under the "s3" URI scheme, even if the actual underlying storage uses a different protocol.
+            // The method PathUtils.equalsIgnoreSchemeIfOneIsS3(...) compares two paths by ignoring the scheme
+            // if one of them uses the "s3" scheme, and only checks whether the bucket name and object key match.
+            // This prevents unnecessary rename operations when the scheme differs (e.g., "s3://" vs. "oss://")
+            // but the actual storage location is identical. If the paths differ after ignoring the scheme,
+            // a rename operation will be performed.
+            boolean needRename = !PathUtils.equalsIgnoreSchemeIfOneIsS3(targetPath, writePath);
+            if (needRename) {
                 wrapperAsyncRenameWithProfileSummary(
                         fileSystemExecutor,
                         asyncFileSystemTaskFutures,
@@ -1191,66 +1259,78 @@ public class HMSTransaction implements Transaction {
                         tableAndMore.getFileNames());
             } else {
                 if (!tableAndMore.hivePartitionUpdate.s3_mpu_pending_uploads.isEmpty()) {
-                    s3Commit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
+                    objCommit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
                             tableAndMore.hivePartitionUpdate, targetPath);
                 }
             }
             directoryCleanUpTasksForAbort.add(new DirectoryCleanUpTask(targetPath, false));
             updateStatisticsTasks.add(
                     new UpdateStatisticsTask(
-                            dbName,
-                            tbName,
+                            nameMapping,
                             Optional.empty(),
                             tableAndMore.getStatisticsUpdate(),
                             true
                     ));
         }
 
-        public void prepareAlterTable(TableAndMore tableAndMore) {
+        public void prepareAlterTable(NameMapping nameMapping, TableAndMore tableAndMore) {
             Table table = tableAndMore.getTable();
             String targetPath = table.getSd().getLocation();
             String writePath = tableAndMore.getCurrentLocation();
             if (!targetPath.equals(writePath)) {
-                Path path = new Path(targetPath);
-                String oldTablePath = new Path(
-                        path.getParent(), "_temp_" + queryId + "_" + path.getName()).toString();
-                Status status = wrapperRenameDirWithProfileSummary(
-                        targetPath,
-                        oldTablePath,
-                        () -> renameDirectoryTasksForAbort.add(new RenameDirectoryTask(oldTablePath, targetPath)));
-                if (!status.ok()) {
-                    throw new RuntimeException(
-                        "Error to rename dir from " + targetPath + " to " + oldTablePath + status.getErrMsg());
-                }
-                clearDirsForFinish.add(oldTablePath);
+                if (isSubDirectory(targetPath, writePath)) {
+                    String stagingRoot = getImmediateChildPath(targetPath, writePath);
+                    deleteTargetPathContents(targetPath, stagingRoot);
+                    ensureDirectory(targetPath);
+                    wrapperAsyncRenameWithProfileSummary(
+                            fileSystemExecutor,
+                            asyncFileSystemTaskFutures,
+                            fileSystemTaskCancelled,
+                            writePath,
+                            targetPath,
+                            tableAndMore.getFileNames());
+                } else {
+                    Path path = new Path(targetPath);
+                    String oldTablePath = new Path(
+                            path.getParent(), "_temp_" + queryId + "_" + path.getName()).toString();
+                    Status status = wrapperRenameDirWithProfileSummary(
+                            targetPath,
+                            oldTablePath,
+                            () -> renameDirectoryTasksForAbort.add(new RenameDirectoryTask(oldTablePath, targetPath)));
+                    if (!status.ok()) {
+                        throw new RuntimeException(
+                                "Error to rename dir from " + targetPath + " to " + oldTablePath + status.getErrMsg());
+                    }
+                    clearDirsForFinish.add(oldTablePath);
 
-                status =  wrapperRenameDirWithProfileSummary(
-                        writePath,
-                        targetPath,
-                        () -> directoryCleanUpTasksForAbort.add(
-                                new DirectoryCleanUpTask(targetPath, true)));
-                if (!status.ok()) {
-                    throw new RuntimeException(
-                        "Error to rename dir from " + writePath + " to " + targetPath + ":" + status.getErrMsg());
+                    status = wrapperRenameDirWithProfileSummary(
+                            writePath,
+                            targetPath,
+                            () -> directoryCleanUpTasksForAbort.add(
+                                    new DirectoryCleanUpTask(targetPath, true)));
+                    if (!status.ok()) {
+                        throw new RuntimeException(
+                                "Error to rename dir from " + writePath + " to " + targetPath
+                                        + ":" + status.getErrMsg());
+                    }
                 }
             } else {
                 if (!tableAndMore.hivePartitionUpdate.s3_mpu_pending_uploads.isEmpty()) {
                     s3cleanWhenSuccess.add(targetPath);
-                    s3Commit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
+                    objCommit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
                             tableAndMore.hivePartitionUpdate, targetPath);
                 }
             }
             updateStatisticsTasks.add(
-                new UpdateStatisticsTask(
-                    dbName,
-                    tbName,
-                    Optional.empty(),
-                    tableAndMore.getStatisticsUpdate(),
-                    false
-                ));
+                    new UpdateStatisticsTask(
+                            nameMapping,
+                            Optional.empty(),
+                            tableAndMore.getStatisticsUpdate(),
+                            false
+                    ));
         }
 
-        public void prepareAddPartition(PartitionAndMore partitionAndMore) {
+        public void prepareAddPartition(NameMapping nameMapping, PartitionAndMore partitionAndMore) {
 
             HivePartition partition = partitionAndMore.getPartition();
             String targetPath = partition.getPath();
@@ -1266,16 +1346,15 @@ public class HMSTransaction implements Transaction {
                         () -> directoryCleanUpTasksForAbort.add(new DirectoryCleanUpTask(targetPath, true)));
             } else {
                 if (!partitionAndMore.hivePartitionUpdate.s3_mpu_pending_uploads.isEmpty()) {
-                    s3Commit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
+                    objCommit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
                             partitionAndMore.hivePartitionUpdate, targetPath);
                 }
             }
 
-            StorageDescriptor sd = getTable(dbName, tbName).getSd();
+            StorageDescriptor sd = getTable(nameMapping).getSd();
 
             HivePartition hivePartition = new HivePartition(
-                    dbName,
-                    tbName,
+                    nameMapping,
                     false,
                     sd.getInputFormat(),
                     targetPath,
@@ -1283,7 +1362,7 @@ public class HMSTransaction implements Transaction {
                     Maps.newHashMap(),
                     sd.getOutputFormat(),
                     sd.getSerdeInfo().getSerializationLib(),
-                    getTableColumns(dbName, tbName)
+                    sd.getCols()
             );
 
             HivePartitionWithStatistics partitionWithStats =
@@ -1294,7 +1373,7 @@ public class HMSTransaction implements Transaction {
             addPartitionsTask.addPartition(partitionWithStats);
         }
 
-        public void prepareInsertExistPartition(PartitionAndMore partitionAndMore) {
+        public void prepareInsertExistPartition(NameMapping nameMapping, PartitionAndMore partitionAndMore) {
 
             HivePartition partition = partitionAndMore.getPartition();
             String targetPath = partition.getPath();
@@ -1311,24 +1390,24 @@ public class HMSTransaction implements Transaction {
                         partitionAndMore.getFileNames());
             } else {
                 if (!partitionAndMore.hivePartitionUpdate.s3_mpu_pending_uploads.isEmpty()) {
-                    s3Commit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
+                    objCommit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
                             partitionAndMore.hivePartitionUpdate, targetPath);
                 }
             }
 
             updateStatisticsTasks.add(
-                new UpdateStatisticsTask(
-                    dbName,
-                    tbName,
-                    Optional.of(partitionAndMore.getPartitionName()),
-                    partitionAndMore.getStatisticsUpdate(),
-                    true));
+                    new UpdateStatisticsTask(
+                            nameMapping,
+                            Optional.of(partitionAndMore.getPartitionName()),
+                            partitionAndMore.getStatisticsUpdate(),
+                            true));
         }
 
         private void runDirectoryClearUpTasksForAbort() {
             for (DirectoryCleanUpTask cleanUpTask : directoryCleanUpTasksForAbort) {
                 recursiveDeleteItems(cleanUpTask.getPath(), cleanUpTask.isDeleteEmptyDir(), false);
             }
+            directoryCleanUpTasksForAbort.clear();
         }
 
         private void runRenameDirTasksForAbort() {
@@ -1336,13 +1415,15 @@ public class HMSTransaction implements Transaction {
             for (RenameDirectoryTask task : renameDirectoryTasksForAbort) {
                 status = fs.exists(task.getRenameFrom());
                 if (status.ok()) {
-                    status = wrapperRenameDirWithProfileSummary(task.getRenameFrom(), task.getRenameTo(), () -> {});
+                    status = wrapperRenameDirWithProfileSummary(task.getRenameFrom(), task.getRenameTo(), () -> {
+                    });
                     if (!status.ok()) {
                         LOG.warn("Failed to abort rename dir from {} to {}:{}",
                                 task.getRenameFrom(), task.getRenameTo(), status.getErrMsg());
                     }
                 }
             }
+            renameDirectoryTasksForAbort.clear();
         }
 
         private void runClearPathsForFinish() {
@@ -1361,7 +1442,7 @@ public class HMSTransaction implements Transaction {
             }
         }
 
-        public void prepareAlterPartition(PartitionAndMore partitionAndMore) {
+        public void prepareAlterPartition(NameMapping nameMapping, PartitionAndMore partitionAndMore) {
             HivePartition partition = partitionAndMore.getPartition();
             String targetPath = partition.getPath();
             String writePath = partitionAndMore.getCurrentLocation();
@@ -1376,36 +1457,35 @@ public class HMSTransaction implements Transaction {
                         () -> renameDirectoryTasksForAbort.add(new RenameDirectoryTask(oldPartitionPath, targetPath)));
                 if (!status.ok()) {
                     throw new RuntimeException(
-                        "Error to rename dir "
-                                + "from " + targetPath
-                                + " to " + oldPartitionPath + ":" + status.getErrMsg());
+                            "Error to rename dir "
+                                    + "from " + targetPath
+                                    + " to " + oldPartitionPath + ":" + status.getErrMsg());
                 }
                 clearDirsForFinish.add(oldPartitionPath);
 
                 status = wrapperRenameDirWithProfileSummary(
-                    writePath,
-                    targetPath,
-                    () -> directoryCleanUpTasksForAbort.add(new DirectoryCleanUpTask(targetPath, true)));
+                        writePath,
+                        targetPath,
+                        () -> directoryCleanUpTasksForAbort.add(new DirectoryCleanUpTask(targetPath, true)));
                 if (!status.ok()) {
                     throw new RuntimeException(
-                        "Error to rename dir from " + writePath + " to " + targetPath + ":" + status.getErrMsg());
+                            "Error to rename dir from " + writePath + " to " + targetPath + ":" + status.getErrMsg());
                 }
             } else {
                 if (!partitionAndMore.hivePartitionUpdate.s3_mpu_pending_uploads.isEmpty()) {
                     s3cleanWhenSuccess.add(targetPath);
-                    s3Commit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
+                    objCommit(fileSystemExecutor, asyncFileSystemTaskFutures, fileSystemTaskCancelled,
                             partitionAndMore.hivePartitionUpdate, targetPath);
                 }
             }
 
             updateStatisticsTasks.add(
-                new UpdateStatisticsTask(
-                    dbName,
-                    tbName,
-                    Optional.of(partitionAndMore.getPartitionName()),
-                    partitionAndMore.getStatisticsUpdate(),
-                    false
-                ));
+                    new UpdateStatisticsTask(
+                            nameMapping,
+                            Optional.of(partitionAndMore.getPartitionName()),
+                            partitionAndMore.getStatisticsUpdate(),
+                            false
+                    ));
         }
 
 
@@ -1471,7 +1551,7 @@ public class HMSTransaction implements Transaction {
         }
 
         private void pruneAndDeleteStagingDirectories() {
-            recursiveDeleteItems(new Path(declaredIntentionsToWrite), true, false);
+            stagingDirectory.ifPresent((v) -> recursiveDeleteItems(new Path(v), true, false));
         }
 
         private void abortMultiUploads() {
@@ -1496,6 +1576,7 @@ public class HMSTransaction implements Transaction {
                             .build());
                 }, fileSystemExecutor));
             }
+            uncompletedMpuPendingUploads.clear();
         }
 
         public void doNothing() {
@@ -1508,6 +1589,8 @@ public class HMSTransaction implements Transaction {
             runS3cleanWhenSuccess();
             doAddPartitionsTask();
             doUpdateStatisticsTasks();
+            //delete write path
+            pruneAndDeleteStagingDirectories();
             doNothing();
         }
 
@@ -1528,12 +1611,160 @@ public class HMSTransaction implements Transaction {
             for (CompletableFuture<?> future : asyncFileSystemTaskFutures) {
                 MoreFutures.getFutureValue(future, RuntimeException.class);
             }
+            asyncFileSystemTaskFutures.clear();
+        }
+
+        public void shutdownExecutorService() {
+            // Disable new tasks from being submitted
+            updateStatisticsExecutor.shutdown();
+            try {
+                // Wait a while for existing tasks to terminate
+                if (!updateStatisticsExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    // Cancel currently executing tasks
+                    updateStatisticsExecutor.shutdownNow();
+                    // Wait a while for tasks to respond to being cancelled
+                    if (!updateStatisticsExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
+                        LOG.warn("Pool did not terminate");
+                    }
+                }
+            } catch (InterruptedException e) {
+                // (Re-)Cancel if current thread also interrupted
+                updateStatisticsExecutor.shutdownNow();
+                // Preserve interrupt status
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    @VisibleForTesting
+    static boolean isSubDirectory(String parent, String child) {
+        if (parent == null || child == null) {
+            return false;
+        }
+        Path parentPath = new Path(parent);
+        Path childPath = new Path(child);
+        URI parentUri = parentPath.toUri();
+        URI childUri = childPath.toUri();
+        if (!sameFileSystem(parentUri, childUri)) {
+            return false;
+        }
+        String parentPathValue = normalizePath(parentUri.getPath());
+        String childPathValue = normalizePath(childUri.getPath());
+        if (parentPathValue.isEmpty() || childPathValue.isEmpty()) {
+            return false;
+        }
+        return !parentPathValue.equals(childPathValue)
+                && childPathValue.startsWith(parentPathValue + "/");
+    }
+
+    /**
+     * Returns the first-level child path of {@code parent} that contains {@code child},
+     * or null if {@code child} is not a subdirectory of {@code parent}.
+     * Example: parent=/warehouse/table, child=/warehouse/table/.doris_staging/user/uuid
+     * returns /warehouse/table/.doris_staging.
+     */
+    @VisibleForTesting
+    static String getImmediateChildPath(String parent, String child) {
+        if (!isSubDirectory(parent, child)) {
+            return null;
+        }
+        Path parentPath = new Path(parent);
+        URI parentUri = parentPath.toUri();
+        URI childUri = new Path(child).toUri();
+        String parentPathValue = normalizePath(parentUri.getPath());
+        String childPathValue = normalizePath(childUri.getPath());
+        String relative = childPathValue.substring(parentPathValue.length() + 1);
+        int slashIndex = relative.indexOf("/");
+        String firstComponent = slashIndex == -1 ? relative : relative.substring(0, slashIndex);
+        return new Path(parentPath, firstComponent).toString();
+    }
+
+    private static boolean sameFileSystem(URI left, URI right) {
+        String leftScheme = normalizeUriPart(left.getScheme());
+        String rightScheme = normalizeUriPart(right.getScheme());
+        if (!leftScheme.isEmpty() && !rightScheme.isEmpty()
+                && !leftScheme.equalsIgnoreCase(rightScheme)) {
+            return false;
+        }
+        String leftAuthority = normalizeUriPart(left.getAuthority());
+        String rightAuthority = normalizeUriPart(right.getAuthority());
+        if (!leftAuthority.isEmpty() && !rightAuthority.isEmpty()
+                && !leftAuthority.equalsIgnoreCase(rightAuthority)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static String normalizeUriPart(String value) {
+        return value == null ? "" : value;
+    }
+
+    private static String normalizePath(String path) {
+        if (path == null || path.isEmpty()) {
+            return "";
+        }
+        int end = path.length();
+        while (end > 1 && path.charAt(end - 1) == '/') {
+            end--;
+        }
+        return path.substring(0, end);
+    }
+
+    private static boolean pathsEqual(String left, String right) {
+        if (left == null || right == null) {
+            return left == null && right == null;
+        }
+        URI leftUri = new Path(left).toUri();
+        URI rightUri = new Path(right).toUri();
+        if (!sameFileSystem(leftUri, rightUri)) {
+            return false;
+        }
+        return normalizePath(leftUri.getPath()).equals(normalizePath(rightUri.getPath()));
+    }
+
+    @VisibleForTesting
+    void deleteTargetPathContents(String targetPath, String excludedChildPath) {
+        Set<String> dirs = new HashSet<>();
+        Status status = fs.listDirectories(targetPath, dirs);
+        if (!status.ok() && !Status.ErrCode.NOT_FOUND.equals(status.getErrCode())) {
+            throw new RuntimeException(
+                    "Failed to list directories under " + targetPath + ":" + status.getErrMsg());
+        }
+        for (String dir : dirs) {
+            if (excludedChildPath != null && pathsEqual(dir, excludedChildPath)) {
+                continue;
+            }
+            Status deleteStatus = wrapperDeleteDirWithProfileSummary(dir);
+            if (!deleteStatus.ok() && !Status.ErrCode.NOT_FOUND.equals(deleteStatus.getErrCode())) {
+                throw new RuntimeException("Failed to delete directory " + dir + ":" + deleteStatus.getErrMsg());
+            }
+        }
+
+        List<RemoteFile> files = new ArrayList<>();
+        status = fs.listFiles(targetPath, false, files);
+        if (!status.ok() && !Status.ErrCode.NOT_FOUND.equals(status.getErrCode())) {
+            throw new RuntimeException(
+                    "Failed to list files under " + targetPath + ":" + status.getErrMsg());
+        }
+        for (RemoteFile file : files) {
+            Status deleteStatus = wrapperDeleteWithProfileSummary(file.getPath().toString());
+            if (!deleteStatus.ok() && !Status.ErrCode.NOT_FOUND.equals(deleteStatus.getErrCode())) {
+                throw new RuntimeException("Failed to delete file " + file.getPath() + ":" + deleteStatus.getErrMsg());
+            }
+        }
+    }
+
+    @VisibleForTesting
+    void ensureDirectory(String path) {
+        Status status = fs.makeDir(path);
+        if (!status.ok()) {
+            throw new RuntimeException("Failed to create directory " + path + ":" + status.getErrMsg());
         }
     }
 
     public Status wrapperRenameDirWithProfileSummary(String origFilePath,
-                                                     String destFilePath,
-                                                     Runnable runWhenPathNotExist) {
+            String destFilePath,
+            Runnable runWhenPathNotExist) {
         summaryProfile.ifPresent(profile -> {
             profile.setTempStartTime();
             profile.incRenameDirCnt();
@@ -1570,38 +1801,57 @@ public class HMSTransaction implements Transaction {
     }
 
     public void wrapperAsyncRenameWithProfileSummary(Executor executor,
-                                                     List<CompletableFuture<?>> renameFileFutures,
-                                                     AtomicBoolean cancelled,
-                                                     String origFilePath,
-                                                     String destFilePath,
-                                                     List<String> fileNames) {
+            List<CompletableFuture<?>> renameFileFutures,
+            AtomicBoolean cancelled,
+            String origFilePath,
+            String destFilePath,
+            List<String> fileNames) {
         FileSystemUtil.asyncRenameFiles(
                 fs, executor, renameFileFutures, cancelled, origFilePath, destFilePath, fileNames);
         summaryProfile.ifPresent(profile -> profile.addRenameFileCnt(fileNames.size()));
     }
 
     public void wrapperAsyncRenameDirWithProfileSummary(Executor executor,
-                                                        List<CompletableFuture<?>> renameFileFutures,
-                                                        AtomicBoolean cancelled,
-                                                        String origFilePath,
-                                                        String destFilePath,
-                                                        Runnable runWhenPathNotExist) {
+            List<CompletableFuture<?>> renameFileFutures,
+            AtomicBoolean cancelled,
+            String origFilePath,
+            String destFilePath,
+            Runnable runWhenPathNotExist) {
         FileSystemUtil.asyncRenameDir(
                 fs, executor, renameFileFutures, cancelled, origFilePath, destFilePath, runWhenPathNotExist);
         summaryProfile.ifPresent(SummaryProfile::incRenameDirCnt);
     }
 
-    private void s3Commit(Executor fileSystemExecutor, List<CompletableFuture<?>> asyncFileSystemTaskFutures,
+    /**
+     * Commits object storage partition updates (e.g., for S3, Azure Blob, etc.).
+     *
+     * <p>In object storage systems, the write workflow is typically divided into two stages:
+     * <ul>
+     *   <li><b>Upload (Stage) Phase</b> – Performed by the BE (Backend).
+     *       During this phase, data parts (for S3) or staged blocks (for Azure) are uploaded to
+     *       the storage system.</li>
+     *   <li><b>Commit Phase</b> – Performed by the FE (Frontend).
+     *       The FE is responsible for finalizing the uploads initiated by the BE:
+     *       <ul>
+     *         <li>For <b>S3</b>: the FE calls {@code completeMultipartUpload} to merge all uploaded parts into a
+     *         single object.</li>
+     *         <li>For <b>Azure Blob</b>: the BE stages blocks, and the FE performs the final commit to seal
+     *         the blob.</li>
+     *       </ul>
+     *   </li>
+     * </ul>
+     *
+     * <p>This method is executed by the FE and ensures that all uploads initiated by the BE
+     * are properly committed and finalized on the object storage side.
+     */
+    private void objCommit(Executor fileSystemExecutor, List<CompletableFuture<?>> asyncFileSystemTaskFutures,
             AtomicBoolean fileSystemTaskCancelled, THivePartitionUpdate hivePartitionUpdate, String path) {
-        S3FileSystem s3FileSystem = (S3FileSystem) ((SwitchingFileSystem) fs).fileSystem(path);
-        S3Client s3Client;
-        try {
-            s3Client = (S3Client) s3FileSystem.getObjStorage().getClient();
-        } catch (UserException e) {
-            throw new RuntimeException(e);
+        List<TS3MPUPendingUpload> s3MpuPendingUploads = hivePartitionUpdate.getS3MpuPendingUploads();
+        if (isMockedPartitionUpdate) {
+            return;
         }
-
-        for (TS3MPUPendingUpload s3MPUPendingUpload : hivePartitionUpdate.getS3MpuPendingUploads()) {
+        ObjFileSystem fileSystem = (ObjFileSystem) ((SwitchingFileSystem) fs).fileSystem(path);
+        for (TS3MPUPendingUpload s3MPUPendingUpload : s3MpuPendingUploads) {
             asyncFileSystemTaskFutures.add(CompletableFuture.runAsync(() -> {
                 if (fileSystemTaskCancelled.get()) {
                     return;
@@ -1609,18 +1859,15 @@ public class HMSTransaction implements Transaction {
                 List<CompletedPart> completedParts = Lists.newArrayList();
                 for (Map.Entry<Integer, String> entry : s3MPUPendingUpload.getEtags().entrySet()) {
                     completedParts.add(CompletedPart.builder().eTag(entry.getValue()).partNumber(entry.getKey())
-                            .build());
+                              .build());
                 }
 
-                s3Client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
-                        .bucket(s3MPUPendingUpload.getBucket())
-                        .key(s3MPUPendingUpload.getKey())
-                        .uploadId(s3MPUPendingUpload.getUploadId())
-                        .multipartUpload(CompletedMultipartUpload.builder().parts(completedParts).build())
-                        .build());
+                fileSystem.completeMultipartUpload(s3MPUPendingUpload.getBucket(),
+                         s3MPUPendingUpload.getKey(),
+                         s3MPUPendingUpload.getUploadId(),
+                         s3MPUPendingUpload.getEtags());
                 uncompletedMpuPendingUploads.remove(new UncompletedMpuPendingUpload(s3MPUPendingUpload, path));
             }, fileSystemExecutor));
         }
     }
 }
-

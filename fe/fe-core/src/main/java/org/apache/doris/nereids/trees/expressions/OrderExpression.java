@@ -81,7 +81,12 @@ public class OrderExpression extends Expression implements UnaryExpression, Prop
     }
 
     @Override
-    public String toSql() {
+    public String toDigest() {
+        return orderKey.toDigest();
+    }
+
+    @Override
+    public String computeToSql() {
         return orderKey.toSql();
     }
 
@@ -101,7 +106,7 @@ public class OrderExpression extends Expression implements UnaryExpression, Prop
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(super.hashCode(), orderKey);
+    public int computeHashCode() {
+        return Objects.hash(super.computeHashCode(), orderKey);
     }
 }

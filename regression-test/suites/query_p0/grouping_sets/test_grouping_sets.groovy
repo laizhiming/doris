@@ -98,7 +98,7 @@ suite("test_grouping_sets", "p0") {
             SELECT k1, k3, MAX( k8 ) FROM test_query_db.test 
             GROUP BY k1, GROUPING SETS ( (k1, k3), (k1), ( ) ), ROLLUP(k1, k3)
             """
-        exception "Syntax error"
+        exception "mismatched input 'SETS'"
     }
 
     qt_select13"""
@@ -149,7 +149,7 @@ suite("test_grouping_sets", "p0") {
     qt_select20 """SELECT k1 ,GROUPING(k1) FROM test_query_db.test GROUP BY CUBE (k1) ORDER BY k1"""
     test {
         sql "SELECT k1 ,GROUPING(k2) FROM test_query_db.test GROUP BY CUBE (k1) ORDER BY k1"
-        exception "Column in Grouping does not exist in GROUP BY clause"
+        exception "LOGICAL_REPEAT 's GROUPING function 'Grouping(k2)', its argument 'k2' must appear in GROUP BY clause."
     }
 
     // test grouping sets id contain null data

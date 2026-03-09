@@ -21,6 +21,8 @@ import org.apache.doris.nereids.pattern.ExpressionPatternRules;
 import org.apache.doris.nereids.pattern.ExpressionPatternTraverseListeners;
 import org.apache.doris.nereids.pattern.ExpressionPatternTraverseListeners.CombinedListener;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.SessionVarGuardExpr;
+import org.apache.doris.qe.AutoCloseSessionVariable;
 
 import com.google.common.collect.ImmutableList;
 import org.apache.logging.log4j.LogManager;
@@ -32,13 +34,15 @@ import javax.annotation.Nullable;
 
 /** ExpressionBottomUpRewriter */
 public class ExpressionBottomUpRewriter implements ExpressionRewriteRule<ExpressionRewriteContext> {
-    public static final String BATCH_ID_KEY = "batch_id";
+    private static final String BATCH_ID_KEY = "batch_id";
+    private static final AtomicInteger BATCH_ID = new AtomicInteger(0);
     private static final Logger LOG = LogManager.getLogger(ExpressionBottomUpRewriter.class);
-    private static final AtomicInteger rewriteBatchId = new AtomicInteger();
+
     private final ExpressionPatternRules rules;
     private final ExpressionPatternTraverseListeners listeners;
 
-    public ExpressionBottomUpRewriter(ExpressionPatternRules rules, ExpressionPatternTraverseListeners listeners) {
+    public ExpressionBottomUpRewriter(
+            ExpressionPatternRules rules, ExpressionPatternTraverseListeners listeners) {
         this.rules = rules;
         this.listeners = listeners;
     }
@@ -46,13 +50,16 @@ public class ExpressionBottomUpRewriter implements ExpressionRewriteRule<Express
     // entrance
     @Override
     public Expression rewrite(Expression expr, ExpressionRewriteContext ctx) {
-        int currentBatch = rewriteBatchId.incrementAndGet();
-        return rewriteBottomUp(expr, ctx, currentBatch, null, rules, listeners);
+        return rewriteBottomUp(expr, ctx, BATCH_ID.getAndIncrement(), null, rules, listeners);
     }
 
     private static Expression rewriteBottomUp(
             Expression expression, ExpressionRewriteContext context, int currentBatch, @Nullable Expression parent,
             ExpressionPatternRules rules, ExpressionPatternTraverseListeners listeners) {
+
+        if (!rules.hasCurrentAndChildrenRules(expression)) {
+            return expression;
+        }
 
         Optional<Integer> rewriteState = expression.getMutableState(BATCH_ID_KEY);
         if (!rewriteState.isPresent() || rewriteState.get() != currentBatch) {
@@ -68,7 +75,15 @@ public class ExpressionBottomUpRewriter implements ExpressionRewriteRule<Express
             Expression afterRewrite = expression;
             try {
                 Expression beforeRewrite;
-                afterRewrite = rewriteChildren(expression, context, currentBatch, rules, listeners);
+                if (expression instanceof SessionVarGuardExpr) {
+                    try (AutoCloseSessionVariable auto = new AutoCloseSessionVariable(
+                            context.cascadesContext.getConnectContext(),
+                            ((SessionVarGuardExpr) expression).getSessionVars())) {
+                        afterRewrite = rewriteChildren(expression, context, currentBatch, rules, listeners);
+                    }
+                } else {
+                    afterRewrite = rewriteChildren(expression, context, currentBatch, rules, listeners);
+                }
                 // use rewriteTimes to avoid dead loop
                 int rewriteTimes = 0;
                 boolean changed;
@@ -85,7 +100,7 @@ public class ExpressionBottomUpRewriter implements ExpressionRewriteRule<Express
                         afterRewrite = rewriteChildren(afterRewrite, context, currentBatch, rules, listeners);
                     }
                     rewriteTimes++;
-                } while (changed && rewriteTimes < 100);
+                } while (changed && rewriteTimes < 100 && rules.hasCurrentAndChildrenRules(beforeRewrite));
 
                 // set rewritten
                 afterRewrite.setMutableState(BATCH_ID_KEY, currentBatch);

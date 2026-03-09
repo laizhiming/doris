@@ -17,9 +17,25 @@
 
 package org.apache.doris.nereids.trees.plans.distribute.worker;
 
+import org.apache.doris.system.Backend;
+import org.apache.doris.thrift.TNetworkAddress;
+
+import com.google.common.collect.ImmutableMap;
+
+import java.util.List;
+import java.util.Map;
+
 /** DistributedPlanWorkerManager */
 public interface DistributedPlanWorkerManager {
-    DistributedPlanWorker getWorker(long backendId);
+    void addBackends(long catalogId, ImmutableMap<Long, Backend> backends);
 
-    DistributedPlanWorker randomAvailableWorker();
+    DistributedPlanWorker getWorker(long catalogId, long backendId);
+
+    DistributedPlanWorker getWorker(long catalogId, Backend backend);
+
+    DistributedPlanWorker randomAvailableWorker(long catalogId);
+
+    long randomAvailableWorker(Map<TNetworkAddress, Long> addressToBackendID);
+
+    List<Backend> getAllBackends(long catalogId, boolean needAlive);
 }

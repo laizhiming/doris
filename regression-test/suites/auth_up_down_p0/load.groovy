@@ -15,7 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_upgrade_downgrade_prepare_auth","p0,auth") {
+suite("test_upgrade_downgrade_prepare_auth","p0,auth,restart_fe") {
+
+    def forComputeGroupStr = "";
+
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        forComputeGroupStr = " for  $validCluster "
+    }
 
     String user1 = 'test_upgrade_downgrade_compatibility_auth_user1'
     String user2 = 'test_upgrade_downgrade_compatibility_auth_user2'
@@ -45,6 +55,14 @@ suite("test_upgrade_downgrade_prepare_auth","p0,auth") {
     sql """CREATE ROLE ${role1}"""
     sql """CREATE ROLE ${role2}"""
 
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user1}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user2}""";
+    }
 
     try_sql """drop table if exists ${dbName}.${tableName1}"""
     sql """drop database if exists ${dbName}"""
@@ -72,15 +90,15 @@ suite("test_upgrade_downgrade_prepare_auth","p0,auth") {
         );
         """
 
-    sql """drop WORKLOAD GROUP if exists '${wg1}'"""
-    sql """drop WORKLOAD GROUP if exists '${wg2}'"""
-    sql """CREATE WORKLOAD GROUP "${wg1}"
+    sql """drop WORKLOAD GROUP if exists '${wg1}' $forComputeGroupStr """
+    sql """drop WORKLOAD GROUP if exists '${wg2}' $forComputeGroupStr """
+    sql """CREATE WORKLOAD GROUP "${wg1}" $forComputeGroupStr
         PROPERTIES (
-            "cpu_share"="10"
+            "min_cpu_percent"="10"
         );"""
-    sql """CREATE WORKLOAD GROUP "${wg2}"
+    sql """CREATE WORKLOAD GROUP "${wg2}" $forComputeGroupStr
         PROPERTIES (
-            "cpu_share"="10"
+            "min_cpu_percent"="10"
         );"""
 
     sql """DROP RESOURCE if exists ${rg1}"""
@@ -120,23 +138,23 @@ suite("test_upgrade_downgrade_prepare_auth","p0,auth") {
     // user
     sql """grant select_priv on ${dbName}.${tableName1} to ${user1}"""
     sql """grant select_priv on ${dbName}.${tableName2} to ${user1}"""
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         sql "select username from ${dbName}.${tableName1}"
     }
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         sql "select username from ${dbName}.${tableName2}"
     }
 
     sql """revoke select_priv on ${dbName}.${tableName1} from ${user1}"""
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         try {
             sql "select username from ${dbName}.${tableName1}"
         } catch (Exception e) {
             log.info(e.getMessage())
-            assertTrue(e.getMessage().contains("Admin_priv,Select_priv"))
+            assertTrue(e.getMessage().contains("denied"))
         }
     }
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         sql "select username from ${dbName}.${tableName2}"
     }
 
@@ -144,48 +162,48 @@ suite("test_upgrade_downgrade_prepare_auth","p0,auth") {
     sql """grant select_priv on ${dbName}.${tableName1} to ROLE '${role1}'"""
     sql """grant Load_priv on ${dbName}.${tableName1} to ROLE '${role2}'"""
     sql """grant '${role1}', '${role2}' to '${user2}'"""
-    connect(user=user2, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user2, "${pwd}", context.config.jdbcUrl) {
         sql "select username from ${dbName}.${tableName1}"
         sql """insert into ${dbName}.`${tableName1}` values (4, "444")"""
     }
 
     sql """revoke '${role1}' from '${user2}'"""
-    connect(user=user2, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user2, "${pwd}", context.config.jdbcUrl) {
         try {
             sql "select username from ${dbName}.${tableName1}"
         } catch (Exception e) {
             log.info(e.getMessage())
-            assertTrue(e.getMessage().contains("Admin_priv,Select_priv"))
+            assertTrue(e.getMessage().contains("denied"))
         }
     }
-    connect(user=user2, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user2, "${pwd}", context.config.jdbcUrl) {
         sql """insert into ${dbName}.`${tableName1}` values (5, "555")"""
     }
 
     // workload group
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         sql """set workload_group = '${wg1}';"""
         try {
             sql "select username from ${dbName}.${tableName2}"
         } catch (Exception e) {
             log.info(e.getMessage())
-            assertTrue(e.getMessage().contains("USAGE/ADMIN privilege"))
+            assertTrue(e.getMessage().contains("denied"))
         }
     }
     sql """GRANT USAGE_PRIV ON WORKLOAD GROUP '${wg1}' TO '${user1}';"""
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         sql """set workload_group = '${wg1}';"""
         sql """select username from ${dbName}.${tableName2}"""
     }
 
     // resource group
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         def res = sql """SHOW RESOURCES;"""
         assertTrue(res == [])
     }
     sql """GRANT USAGE_PRIV ON RESOURCE ${rg1} TO ${user1};"""
-    connect(user=user1, password="${pwd}", url=context.config.jdbcUrl) {
+    connect(user1, "${pwd}", context.config.jdbcUrl) {
         def res = sql """SHOW RESOURCES;"""
-        assertTrue(res.size == 10)
+        assertTrue(res.size() == 10)
     }
 }

@@ -17,7 +17,6 @@
 
 package org.apache.doris.load.routineload;
 
-import org.apache.doris.analysis.LoadColumnsInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
@@ -55,7 +54,6 @@ public class RoutineLoadTaskSchedulerTest {
     public void testRunOneCycle(@Injectable KafkaRoutineLoadJob kafkaRoutineLoadJob1,
                                 @Injectable KafkaRoutineLoadJob routineLoadJob,
                                 @Injectable RoutineLoadDesc routineLoadDesc,
-                                @Injectable LoadColumnsInfo loadColumnsInfo,
                                 @Mocked GlobalTransactionMgr globalTransactionMgr,
                                 @Mocked BackendService.Client client,
                                 @Mocked ClientPool clientPool) throws LoadException,
@@ -69,8 +67,8 @@ public class RoutineLoadTaskSchedulerTest {
         Deencapsulation.setField(kafkaProgress, "partitionIdToOffset", partitionIdToOffset);
 
         LinkedBlockingDeque<RoutineLoadTaskInfo> routineLoadTaskInfoQueue = new LinkedBlockingDeque<>();
-        KafkaTaskInfo routineLoadTaskInfo1 = new KafkaTaskInfo(new UUID(1, 1), 1L, 20000, 0,
-                partitionIdToOffset, false);
+        KafkaTaskInfo routineLoadTaskInfo1 = new KafkaTaskInfo(new UUID(1, 1), 1L, 20000,
+                partitionIdToOffset, false, -1, false);
         routineLoadTaskInfoQueue.addFirst(routineLoadTaskInfo1);
 
         Map<Long, RoutineLoadTaskInfo> idToRoutineLoadTask = Maps.newHashMap();

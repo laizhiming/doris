@@ -42,6 +42,36 @@ suite('dual') {
     qt_sql 'select a from (select 1 as a from dual union all select 2 as a from dual) u'
     qt_sql 'select row_number() over (order by 1) from dual;'
 
+    // Test CTE with name starting with 'dual' - should not be confused with FROM DUAL
+    qt_sql '''
+        with dualtbl as (
+            select 1 as col1, 2 as col2
+        )
+        select col1, col2 from dualtbl
+    '''
+
+    qt_sql '''
+        with dualtbl as (
+            select 1 as a
+        ),
+        dual2 as (
+            select a + 1 as b from dualtbl
+        )
+        select * from dual2
+    '''
+
+    // Test subquery alias starting with 'dual'
+    qt_sql 'select * from (select 1 as x) dualtbl'
+    qt_sql 'select dualtbl.x from (select 1 as x) dualtbl'
+
+    // Multiple CTEs referencing each other with dual-prefix names
+    qt_sql '''
+        with duala as (select 1 as v),
+             dualb as (select v + 1 as v from duala),
+             dualc as (select v + 1 as v from dualb)
+        select * from dualc
+    '''
+
     // Dropping and creating a table named 'dual' to test behavior when dual is a real table
     sql 'drop table if exists `dual`'
     sql '''
@@ -60,11 +90,7 @@ suite('dual') {
     qt_sql 'select 1 from `dual`'
     qt_sql 'select 1 from dual'
 
-    // Tests for dropping 'dual' and ensuring correct error handling
-    test {
-        sql 'drop table if exists dual'
-        exception """DUAL is keyword, maybe `DUAL`"""
-    }
+    sql 'drop table if exists dual'
     sql 'drop table if exists `dual`'
 
     // Test error handling when table does not exist
@@ -72,14 +98,6 @@ suite('dual') {
         sql "select 1 from `dual`"
         exception "Table [dual] does not exist in database [regression_test_query_p0_dual]"
     }
-
-    // Disable and enable Nereids planner to check behavior differences
-    sql "set enable_nereids_planner = false"
-    test {
-        sql "select 1 from `dual`"
-        exception "Unknown table 'dual'"
-    }
-    sql "set enable_nereids_planner = true"
 
     // Tests for unknown column errors
     test {

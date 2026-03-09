@@ -17,17 +17,15 @@
 
 package org.apache.doris.catalog;
 
-import org.apache.doris.common.io.Text;
 import org.apache.doris.persist.gson.GsonPostProcessable;
-import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
 
-import java.io.DataInput;
-import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -48,6 +46,12 @@ public class TempPartitions implements GsonPostProcessable {
     private RangePartitionInfo partitionInfo = null;
 
     public TempPartitions() {
+    }
+
+    // used by remote doris catalog
+    public TempPartitions(Map<Long, Partition> idToPartition, Map<String, Partition> nameToPartition) {
+        this.idToPartition = idToPartition;
+        this.nameToPartition = nameToPartition;
     }
 
     public void addPartition(Partition partition) {
@@ -122,12 +126,6 @@ public class TempPartitions implements GsonPostProcessable {
         }
     }
 
-    @Deprecated
-    public static TempPartitions read(DataInput in) throws IOException {
-        String json = Text.readString(in);
-        return GsonUtils.GSON.fromJson(json, TempPartitions.class);
-    }
-
     @Override
     public void gsonPostProcess() {
         for (Partition partition : idToPartition.values()) {
@@ -151,5 +149,13 @@ public class TempPartitions implements GsonPostProcessable {
     @Override
     public int hashCode() {
         return Objects.hash(idToPartition, nameToPartition, partitionInfo);
+    }
+
+    public List<Long> getPartitionIds() {
+        return new ArrayList<>(idToPartition.keySet());
+    }
+
+    public Collection<Partition> getPartitions() {
+        return idToPartition.values();
     }
 }

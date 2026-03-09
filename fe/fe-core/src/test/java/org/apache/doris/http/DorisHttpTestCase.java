@@ -26,6 +26,9 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EsResource;
 import org.apache.doris.catalog.EsTable;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTablet;
+import org.apache.doris.catalog.LocalTabletInvertedIndex;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
@@ -47,7 +50,6 @@ import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.httpv2.HttpServer;
 import org.apache.doris.httpv2.IllegalArgException;
-import org.apache.doris.load.Load;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
 import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.persist.EditLog;
@@ -145,15 +147,15 @@ public abstract class DorisHttpTestCase {
         columns.add(k1);
         columns.add(k2);
 
-        Replica replica1 = new Replica(testReplicaId1, testBackendId1, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
-        Replica replica2 = new Replica(testReplicaId2, testBackendId2, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
-        Replica replica3 = new Replica(testReplicaId3, testBackendId3, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica1 = new LocalReplica(testReplicaId1, testBackendId1, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica2 = new LocalReplica(testReplicaId2, testBackendId2, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica3 = new LocalReplica(testReplicaId3, testBackendId3, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
 
         // tablet
-        Tablet tablet = new Tablet(tabletId);
+        Tablet tablet = new LocalTablet(tabletId);
 
         // index
         MaterializedIndex baseIndex = new MaterializedIndex(testIndexId, MaterializedIndex.IndexState.NORMAL);
@@ -275,10 +277,6 @@ public abstract class DorisHttpTestCase {
                     minTimes = 0;
                     result = true;
 
-                    env.getLoadInstance();
-                    minTimes = 0;
-                    result = new Load();
-
                     env.getEditLog();
                     minTimes = 0;
                     result = editLog;
@@ -367,7 +365,7 @@ public abstract class DorisHttpTestCase {
     public void setUp() {
         Env env = newDelegateCatalog();
         SystemInfoService systemInfoService = new SystemInfoService();
-        TabletInvertedIndex tabletInvertedIndex = new TabletInvertedIndex();
+        TabletInvertedIndex tabletInvertedIndex = new LocalTabletInvertedIndex();
         new MockUp<Env>() {
             @Mock
             SchemaChangeHandler getSchemaChangeHandler() {

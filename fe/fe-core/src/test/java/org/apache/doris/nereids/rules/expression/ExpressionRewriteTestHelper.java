@@ -17,18 +17,24 @@
 
 package org.apache.doris.nereids.rules.expression;
 
+import org.apache.doris.catalog.Column;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.analyzer.UnboundSlot;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.rules.analysis.ExpressionAnalyzer;
+import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
 import org.apache.doris.nereids.trees.plans.RelationId;
+import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.BooleanType;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.DateV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
 import org.apache.doris.nereids.types.DoubleType;
@@ -39,28 +45,39 @@ import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.util.MemoTestUtils;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.junit.jupiter.api.Assertions;
 
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 public abstract class ExpressionRewriteTestHelper extends ExpressionRewrite {
     protected static final NereidsParser PARSER = new NereidsParser();
     protected ExpressionRuleExecutor executor;
 
+    protected CascadesContext cascadesContext;
     protected ExpressionRewriteContext context;
 
     public ExpressionRewriteTestHelper() {
-        CascadesContext cascadesContext = MemoTestUtils.createCascadesContext(
+        cascadesContext = MemoTestUtils.createCascadesContext(
                 new UnboundRelation(new RelationId(1), ImmutableList.of("tbl")));
         context = new ExpressionRewriteContext(cascadesContext);
     }
 
-    protected final void assertRewrite(String expression, String expected) {
-        Expression needRewriteExpression = PARSER.parseExpression(expression);
-        Expression expectedExpression = PARSER.parseExpression(expected);
+    protected void setExpressionOnFilter() {
+        LogicalFilter<?> filter = new LogicalFilter<LogicalEmptyRelation>(ImmutableSet.of(),
+                new LogicalEmptyRelation(new RelationId(1), ImmutableList.of()));
+        // AddMinMax run in filter plan
+        context = new ExpressionRewriteContext(filter, cascadesContext);
+    }
+
+    protected void assertRewrite(String expression, String expected) {
+        Map<String, Slot> mem = Maps.newHashMap();
+        Expression needRewriteExpression = replaceUnboundSlot(PARSER.parseExpression(expression), mem);
+        Expression expectedExpression = replaceUnboundSlot(PARSER.parseExpression(expected), mem);
         Expression rewrittenExpression = executor.rewrite(needRewriteExpression, context);
         Assertions.assertEquals(expectedExpression, rewrittenExpression);
     }
@@ -85,15 +102,18 @@ public abstract class ExpressionRewriteTestHelper extends ExpressionRewrite {
     }
 
     protected void assertRewriteAfterTypeCoercion(String expression, String expected) {
+        assertRewriteAfterConvert(expression, expected, ExpressionRewriteTestHelper::typeCoercion);
+    }
+
+    protected void assertRewriteAfterConvert(String expression, String expected, Function<Expression, Expression> converter) {
         Map<String, Slot> mem = Maps.newHashMap();
-        Expression needRewriteExpression = PARSER.parseExpression(expression);
-        needRewriteExpression = typeCoercion(replaceUnboundSlot(needRewriteExpression, mem));
-        Expression expectedExpression = PARSER.parseExpression(expected);
+        Expression needRewriteExpression = converter.apply(replaceUnboundSlot(PARSER.parseExpression(expression), mem));
         Expression rewrittenExpression = executor.rewrite(needRewriteExpression, context);
+        Expression expectedExpression = converter.apply(replaceUnboundSlot(PARSER.parseExpression(expected), mem));
         Assertions.assertEquals(expectedExpression.toSql(), rewrittenExpression.toSql());
     }
 
-    protected Expression replaceUnboundSlot(Expression expression, Map<String, Slot> mem) {
+    public static Expression replaceUnboundSlot(Expression expression, Map<String, Slot> mem) {
         List<Expression> children = Lists.newArrayList();
         boolean hasNewChildren = false;
         for (Expression child : expression.children()) {
@@ -104,18 +124,24 @@ public abstract class ExpressionRewriteTestHelper extends ExpressionRewrite {
             children.add(newChild);
         }
         if (expression instanceof UnboundSlot) {
-            String name = ((UnboundSlot) expression).getName();
-            mem.putIfAbsent(name, SlotReference.of(name, getType(name.charAt(0))));
+            ExprId exprId = StatementScopeIdGenerator.newExprId();
+            UnboundSlot slot = (UnboundSlot) expression;
+            String name = slot.getNameParts().get(slot.getNameParts().size() - 1);
+            List<String> qualifier = slot.getQualifier();
+            DataType dataType = getType(name.charAt(0));
+            boolean notNullable = name.charAt(0) == 'X' || name.length() >= 2 && name.charAt(1) == 'X';
+            Column column = new Column(name, dataType.toCatalogDataType());
+            mem.putIfAbsent(name, new SlotReference(exprId, name, dataType, !notNullable, qualifier, null, column, null, null));
             return mem.get(name);
         }
         return hasNewChildren ? expression.withChildren(children) : expression;
     }
 
-    protected Expression typeCoercion(Expression expression) {
+    public static Expression typeCoercion(Expression expression) {
         return ExpressionAnalyzer.FUNCTION_ANALYZER_RULE.rewrite(expression, null);
     }
 
-    protected DataType getType(char t) {
+    private static DataType getType(char t) {
         switch (t) {
             case 'T':
                 return TinyIntType.INSTANCE;
@@ -131,6 +157,8 @@ public abstract class ExpressionRewriteTestHelper extends ExpressionRewrite {
                 return BooleanType.INSTANCE;
             case 'C':
                 return DateV2Type.INSTANCE;
+            case 'A':
+                return DateTimeV2Type.SYSTEM_DEFAULT;
             case 'M':
                 return DecimalV3Type.SYSTEM_DEFAULT;
             default:

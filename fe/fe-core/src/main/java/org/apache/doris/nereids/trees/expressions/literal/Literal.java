@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.analysis.BoolLiteral;
+import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.catalog.MysqlColType;
 import org.apache.doris.catalog.Type;
@@ -25,28 +26,39 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.util.ByteBufferUtil;
 import org.apache.doris.mysql.MysqlProto;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.exceptions.CastException;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.shape.LeafExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.CharType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
+import org.apache.doris.nereids.types.DateType;
 import org.apache.doris.nereids.types.DecimalV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
+import org.apache.doris.nereids.types.DoubleType;
+import org.apache.doris.nereids.types.IntegerType;
 import org.apache.doris.nereids.types.LargeIntType;
-import org.apache.doris.nereids.types.StringType;
+import org.apache.doris.nereids.types.SmallIntType;
+import org.apache.doris.nereids.types.TimeStampTzType;
+import org.apache.doris.nereids.types.TimeV2Type;
+import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.types.VarcharType;
-import org.apache.doris.nereids.types.coercion.IntegralType;
+import org.apache.doris.nereids.types.coercion.CharacterType;
+import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.collect.ImmutableList;
+import org.apache.log4j.Logger;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -54,8 +66,9 @@ import java.util.Optional;
  * All data type literal expression in Nereids.
  * TODO: Increase the implementation of sub expression. such as Integer.
  */
-public abstract class Literal extends Expression implements LeafExpression, Comparable<Literal> {
+public abstract class Literal extends Expression implements LeafExpression {
 
+    private static final Logger logger = Logger.getLogger(Literal.class);
     protected final DataType dataType;
 
     /**
@@ -105,6 +118,10 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
 
     public abstract Object getValue();
 
+    protected String castValueToString() {
+        return String.valueOf(getValue());
+    }
+
     /**
      * Map literal to double, and keep "<=" order.
      * for numeric literal (int/long/double/float), directly convert to double
@@ -135,7 +152,7 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return toString();
     }
 
@@ -158,11 +175,18 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
     }
 
     /**
-     * literal expr compare.
+     * Cast with checking strict mode is enabled or not.
      */
-    @Override
-    public int compareTo(Literal other) {
-        return toLegacyLiteral().compareLiteral(other.toLegacyLiteral());
+    public Expression checkedCastWithStrictChecking(DataType targetType) {
+        try {
+            return checkedCastTo(targetType);
+        } catch (CastException c) {
+            if (SessionVariable.enableStrictCast()) {
+                throw c;
+            } else {
+                return new NullLiteral(dataType);
+            }
+        }
     }
 
     /**
@@ -170,40 +194,73 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
      */
     @Override
     public Expression checkedCastTo(DataType targetType) throws AnalysisException {
+        if (this instanceof NullLiteral) {
+            return new NullLiteral(targetType);
+        }
         if (getDataType().isNumericType()) {
             String desc = getStringValue();
-            BigDecimal val = new BigDecimal(desc);
-            BigDecimal maxVal = val;
-            BigDecimal minVal = val;
-            if (targetType.isTinyIntType()) {
-                maxVal = new BigDecimal(Byte.MAX_VALUE);
-                minVal = new BigDecimal(Byte.MIN_VALUE);
-            } else if (targetType.isSmallIntType()) {
-                maxVal = new BigDecimal(Short.MAX_VALUE);
-                minVal = new BigDecimal(Short.MIN_VALUE);
-            } else if (targetType.isIntegerType()) {
-                maxVal = new BigDecimal(Integer.MAX_VALUE);
-                minVal = new BigDecimal(Integer.MIN_VALUE);
-            } else if (targetType.isBigIntType()) {
-                maxVal = new BigDecimal(Long.MAX_VALUE);
-                minVal = new BigDecimal(Long.MIN_VALUE);
-            } else if (targetType.isLargeIntType()) {
-                maxVal = new BigDecimal(LargeIntType.MAX_VALUE);
-                minVal = new BigDecimal(LargeIntType.MIN_VALUE);
-            } else if (targetType.isFloatType()) {
-                maxVal = new BigDecimal(Float.MAX_VALUE);
-                minVal = BigDecimal.valueOf(-Float.MAX_VALUE);
-            } else if (targetType.isDoubleType()) {
-                maxVal = new BigDecimal(Double.MAX_VALUE);
-                minVal = BigDecimal.valueOf(-Double.MAX_VALUE);
-            }
-
-            if (val.compareTo(maxVal) > 0 || val.compareTo(minVal) < 0) {
-                throw new AnalysisException(
-                        String.format("%s can't cast to %s", desc, targetType));
+            if (numericOverflow(desc, targetType)) {
+                throw new CastException(String.format("%s can't cast to %s, overflow.", desc, targetType));
             }
         }
         return uncheckedCastTo(targetType);
+    }
+
+    protected boolean numericOverflow(String desc, DataType targetType) {
+        if (this instanceof FloatLiteral || this instanceof DoubleLiteral) {
+            if (DoubleLiteral.POS_INF_NAME.contains(desc.toLowerCase())
+                    || DoubleLiteral.NEG_INF_NAME.contains(desc.toLowerCase())
+                    || DoubleLiteral.NAN_NAME.contains(desc.toLowerCase())) {
+                return false;
+            }
+        }
+        BigDecimal val = new BigDecimal(desc);
+        return numericOverflow(val, targetType);
+    }
+
+    protected boolean numericOverflow(BigDecimal value, DataType targetType) {
+        BigDecimal maxVal = value;
+        BigDecimal minVal = value;
+        if (targetType.isTinyIntType()) {
+            maxVal = new BigDecimal(Byte.MAX_VALUE);
+            minVal = new BigDecimal(Byte.MIN_VALUE);
+        } else if (targetType.isSmallIntType()) {
+            maxVal = new BigDecimal(Short.MAX_VALUE);
+            minVal = new BigDecimal(Short.MIN_VALUE);
+        } else if (targetType.isIntegerType()) {
+            maxVal = new BigDecimal(Integer.MAX_VALUE);
+            minVal = new BigDecimal(Integer.MIN_VALUE);
+        } else if (targetType.isBigIntType()) {
+            maxVal = new BigDecimal(Long.MAX_VALUE);
+            minVal = new BigDecimal(Long.MIN_VALUE);
+        } else if (targetType.isLargeIntType()) {
+            maxVal = new BigDecimal(LargeIntType.MAX_VALUE);
+            minVal = new BigDecimal(LargeIntType.MIN_VALUE);
+        }
+        BigInteger integerValue = value.toBigInteger();
+        return integerValue.compareTo(maxVal.toBigInteger()) > 0
+                || integerValue.compareTo(minVal.toBigInteger()) < 0;
+    }
+
+    protected Expression getDecimalLiteral(BigDecimal bigDecimal, DataType targetType) {
+        int pReal = bigDecimal.precision();
+        int sReal = bigDecimal.scale();
+        int pTarget = targetType.isDecimalV2Type()
+                ? ((DecimalV2Type) targetType).getPrecision() : ((DecimalV3Type) targetType).getPrecision();
+        int sTarget = targetType.isDecimalV2Type()
+                ? ((DecimalV2Type) targetType).getScale() : ((DecimalV3Type) targetType).getScale();
+        if (bigDecimal.compareTo(BigDecimal.ZERO) != 0 && pTarget - sTarget < pReal - sReal) {
+            throw new CastException(String.format("%s can't cast to %s in strict mode.", getValue(), targetType));
+        }
+        BigDecimal result = bigDecimal.setScale(sTarget, RoundingMode.HALF_UP)
+                .round(new MathContext(pTarget, RoundingMode.HALF_UP));
+        logger.info("getDecimalLiteral orig bigDecimal: " + bigDecimal
+                + ", targetType: " + targetType + ", result big decimal: " + result);
+        if (targetType.isDecimalV2Type()) {
+            return new DecimalLiteral((DecimalV2Type) targetType, result);
+        } else {
+            return new DecimalV3Literal((DecimalV3Type) targetType, result);
+        }
     }
 
     @Override
@@ -214,82 +271,24 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
         if (this instanceof NullLiteral) {
             return new NullLiteral(targetType);
         }
-        // TODO support string to complex
-        String desc = getStringValue();
-        // convert boolean to byte string value to support cast boolean to numeric in FE.
-        if (this.equals(BooleanLiteral.TRUE)) {
-            desc = "1";
-        } else if (this.equals(BooleanLiteral.FALSE)) {
-            desc = "0";
+        if (targetType.isStringLikeType() && !this.dataType.isComplexType()) {
+            return uncheckedCastToString((CharacterType) targetType);
         }
-        if (targetType.isBooleanType()) {
-            try {
-                // convert any non-zero numeric literal to true if target type is boolean
-                long value = Long.parseLong(desc);
-                if (value == 0) {
-                    return Literal.of(false);
-                } else {
-                    return Literal.of(true);
-                }
-            } catch (Exception e) {
-                // ignore
-            }
-            if ("0".equals(desc) || "false".equals(desc.toLowerCase(Locale.ROOT))) {
-                return Literal.of(false);
-            }
-            if ("1".equals(desc) || "true".equals(desc.toLowerCase(Locale.ROOT))) {
-                return Literal.of(true);
-            }
-        }
-        if (targetType instanceof IntegralType) {
-            // do trailing zeros to avoid number parse error when cast to integral type
-            BigDecimal bigDecimal = new BigDecimal(desc);
-            if (bigDecimal.stripTrailingZeros().scale() <= 0) {
-                desc = bigDecimal.stripTrailingZeros().toPlainString();
-            }
-        }
-        if (targetType.isTinyIntType()) {
-            return Literal.of(Byte.valueOf(desc));
-        } else if (targetType.isSmallIntType()) {
-            return Literal.of(Short.valueOf(desc));
-        } else if (targetType.isIntegerType()) {
-            return Literal.of(Integer.valueOf(desc));
-        } else if (targetType.isBigIntType()) {
-            return Literal.of(Long.valueOf(desc));
-        } else if (targetType.isLargeIntType()) {
-            return Literal.of(new BigDecimal(desc).toBigInteger());
-        } else if (targetType.isFloatType()) {
-            return Literal.of(Double.valueOf(desc).floatValue());
-        } else if (targetType.isDoubleType()) {
-            return Literal.of(Double.parseDouble(desc));
+        throw new AnalysisException(String.format("Cast from %s to %s not supported", this, targetType));
+    }
+
+    protected Expression uncheckedCastToString(CharacterType targetType) {
+        String value = castValueToString();
+        if (targetType.isStringType()) {
+            return new StringLiteral(value);
         } else if (targetType.isCharType()) {
-            if (((CharType) targetType).getLen() >= desc.length()) {
-                return new CharLiteral(desc, ((CharType) targetType).getLen());
+            if (targetType.getLen() < 0 || targetType.getLen() >= value.length()) {
+                return new CharLiteral(value, targetType.getLen());
             }
-        } else if (targetType.isVarcharType()) {
-            return new VarcharLiteral(desc, ((VarcharType) targetType).getLen());
-        } else if (targetType instanceof StringType) {
-            return new StringLiteral(desc);
-        } else if (targetType.isDateType()) {
-            return new DateLiteral(desc);
-        } else if (targetType.isDateTimeType()) {
-            return new DateTimeLiteral(desc);
-        } else if (targetType.isDecimalV2Type()) {
-            return new DecimalLiteral((DecimalV2Type) targetType, new BigDecimal(desc));
-        } else if (targetType.isDecimalV3Type()) {
-            return new DecimalV3Literal((DecimalV3Type) targetType, new BigDecimal(desc));
-        } else if (targetType.isDateV2Type()) {
-            return new DateV2Literal(desc);
-        } else if (targetType.isDateTimeV2Type()) {
-            return new DateTimeV2Literal((DateTimeV2Type) targetType, desc);
-        } else if (targetType.isJsonType()) {
-            return new JsonLiteral(desc);
-        } else if (targetType.isIPv4Type()) {
-            return new IPv4Literal(desc);
-        } else if (targetType.isIPv6Type()) {
-            return new IPv6Literal(desc);
+        } else {
+            return new VarcharLiteral(value, targetType.getLen());
         }
-        throw new AnalysisException("cannot cast " + desc + " from type " + this.dataType + " to type " + targetType);
+        throw new AnalysisException(String.format("Cast from %s to %s not supported", value, targetType));
     }
 
     /** fromLegacyLiteral */
@@ -300,8 +299,28 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
         } else if (literalExpr instanceof org.apache.doris.analysis.NullLiteral) {
             return new NullLiteral(dataType);
         }
-        // fast path
         switch (type.getPrimitiveType()) {
+            case TINYINT: {
+                IntLiteral intLiteral = (IntLiteral) literalExpr;
+                return new TinyIntLiteral((byte) intLiteral.getValue());
+            }
+            case SMALLINT: {
+                IntLiteral intLiteral = (IntLiteral) literalExpr;
+                return new SmallIntLiteral((short) intLiteral.getValue());
+            }
+            case INT: {
+                IntLiteral intLiteral = (IntLiteral) literalExpr;
+                return new IntegerLiteral((int) intLiteral.getValue());
+            }
+            case BIGINT: {
+                IntLiteral intLiteral = (IntLiteral) literalExpr;
+                return new BigIntLiteral(intLiteral.getValue());
+            }
+            case LARGEINT: {
+                org.apache.doris.analysis.LargeIntLiteral intLiteral
+                        = (org.apache.doris.analysis.LargeIntLiteral) literalExpr;
+                return new LargeIntLiteral(intLiteral.getRealValue());
+            }
             case DATEV2: {
                 org.apache.doris.analysis.DateLiteral dateLiteral = (org.apache.doris.analysis.DateLiteral) literalExpr;
                 return new DateV2Literal(dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay());
@@ -310,42 +329,78 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
                 org.apache.doris.analysis.DateLiteral dateLiteral = (org.apache.doris.analysis.DateLiteral) literalExpr;
                 return new DateLiteral(dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay());
             }
+            case DATETIME: {
+                org.apache.doris.analysis.DateLiteral dateLiteral = (org.apache.doris.analysis.DateLiteral) literalExpr;
+                return new DateTimeLiteral(
+                        DateTimeType.INSTANCE, dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay(),
+                        dateLiteral.getHour(), dateLiteral.getMinute(), dateLiteral.getSecond(),
+                        dateLiteral.getMicrosecond()
+                );
+            }
+            case DATETIMEV2: {
+                org.apache.doris.analysis.DateLiteral dateLiteral = (org.apache.doris.analysis.DateLiteral) literalExpr;
+                return new DateTimeV2Literal(
+                        (DateTimeV2Type) DateType.fromCatalogType(type),
+                        dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay(),
+                        dateLiteral.getHour(), dateLiteral.getMinute(), dateLiteral.getSecond(),
+                        dateLiteral.getMicrosecond()
+                );
+            }
+            case TIMESTAMPTZ: {
+                org.apache.doris.analysis.DateLiteral dateLiteral = (org.apache.doris.analysis.DateLiteral) literalExpr;
+                return new TimestampTzLiteral(
+                        (TimeStampTzType) DateType.fromCatalogType(type),
+                        dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay(),
+                        dateLiteral.getHour(), dateLiteral.getMinute(), dateLiteral.getSecond(),
+                        dateLiteral.getMicrosecond()
+                );
+            }
             case BOOLEAN: {
                 return ((BoolLiteral) literalExpr).getValue() ? BooleanLiteral.TRUE : BooleanLiteral.FALSE;
             }
-            default: {
+            case CHAR: {
+                return new CharLiteral(literalExpr.getStringValue(), ((CharType) dataType).getLen());
             }
-        }
-        // slow path
-        String stringValue = literalExpr.getStringValue();
-        switch (type.getPrimitiveType()) {
-            case TINYINT: return new TinyIntLiteral(Byte.parseByte(stringValue));
-            case SMALLINT: return new SmallIntLiteral(Short.parseShort(stringValue));
-            case INT: return new IntegerLiteral(Integer.parseInt(stringValue));
-            case BIGINT: return new BigIntLiteral(Long.parseLong(stringValue));
-            case LARGEINT: return new LargeIntLiteral(new BigInteger(stringValue));
-            case STRING: return new StringLiteral(stringValue);
-            case CHAR: return new CharLiteral(stringValue, ((CharType) dataType).getLen());
-            case VARCHAR: return new VarcharLiteral(stringValue, ((VarcharType) dataType).getLen());
-            case FLOAT: return new FloatLiteral(Float.parseFloat(stringValue));
-            case DOUBLE: return new DoubleLiteral(Double.parseDouble(stringValue));
-            case DECIMALV2: return new DecimalLiteral((DecimalV2Type) dataType, new BigDecimal(stringValue));
+            case VARCHAR: {
+                return new VarcharLiteral(literalExpr.getStringValue(), ((VarcharType) dataType).getLen());
+            }
+            case STRING: {
+                return new StringLiteral(literalExpr.getStringValue());
+            }
+            case FLOAT: {
+                org.apache.doris.analysis.FloatLiteral floatLiteral
+                        = (org.apache.doris.analysis.FloatLiteral) literalExpr;
+                return new FloatLiteral((float) floatLiteral.getValue());
+            }
+            case DOUBLE: {
+                org.apache.doris.analysis.FloatLiteral floatLiteral
+                        = (org.apache.doris.analysis.FloatLiteral) literalExpr;
+                return new DoubleLiteral(floatLiteral.getValue());
+            }
+            case DECIMALV2: {
+                org.apache.doris.analysis.DecimalLiteral decimalLiteral
+                        = (org.apache.doris.analysis.DecimalLiteral) literalExpr;
+                BigDecimal clonedValue = decimalLiteral.getValue().add(BigDecimal.ZERO);
+                return new DecimalLiteral((DecimalV2Type) dataType, clonedValue);
+            }
             case DECIMAL32:
             case DECIMAL64:
             case DECIMAL128:
             case DECIMAL256: {
-                return new DecimalV3Literal((DecimalV3Type) dataType, new BigDecimal(stringValue));
+                org.apache.doris.analysis.DecimalLiteral decimalLiteral
+                        = (org.apache.doris.analysis.DecimalLiteral) literalExpr;
+                BigDecimal clonedValue = decimalLiteral.getValue().add(BigDecimal.ZERO);
+                return new DecimalV3Literal((DecimalV3Type) dataType, clonedValue);
             }
-            case DATETIME: return new DateTimeLiteral(stringValue);
-            case DATETIMEV2: return new DateTimeV2Literal(stringValue);
-            case JSONB: return new JsonLiteral(stringValue);
-            case IPV4: return new IPv4Literal(stringValue);
-            case IPV6: return new IPv6Literal(stringValue);
+            case JSONB: return new JsonLiteral(literalExpr.getStringValue());
+            case IPV4: return new IPv4Literal(literalExpr.getStringValue());
+            case IPV6: return new IPv6Literal(literalExpr.getStringValue());
+            case TIMEV2: return new TimeV2Literal((TimeV2Type) dataType, literalExpr.getStringValue());
             default: {
+                throw new AnalysisException("Unsupported convert the " + literalExpr.getType()
+                        + " of legacy literal to nereids literal");
             }
         }
-        throw new AnalysisException("Unsupported convert the " + literalExpr.getType()
-                + " of legacy literal to nereids literal");
     }
 
     @Override
@@ -361,13 +416,23 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
     }
 
     @Override
-    public int hashCode() {
+    protected int computeHashCode() {
+        return Objects.hashCode(getValue());
+    }
+
+    @Override
+    public int fastChildrenHashCode() {
         return Objects.hashCode(getValue());
     }
 
     @Override
     public String toString() {
         return String.valueOf(getValue());
+    }
+
+    @Override
+    public String getFingerprint() {
+        return "?";
     }
 
     public abstract LiteralExpr toLegacyLiteral();
@@ -522,7 +587,7 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
             String value = new String(bytes);
             BigDecimal v = new BigDecimal(value);
             if (Config.enable_decimal_conversion) {
-                return new DecimalV3Literal(v);
+                return DecimalV3Literal.createWithCheck256(v);
             }
             return new DecimalLiteral(v);
         } catch (NumberFormatException e) {
@@ -596,5 +661,27 @@ public abstract class Literal extends Expression implements LeafExpression, Comp
         // ATTN: use fixed StandardCharsets.UTF_8 to avoid unexpected charset in
         // different environment
         return new VarcharLiteral(new String(bytes, StandardCharsets.UTF_8));
+    }
+
+    /**convertToTypedLiteral*/
+    public static Literal convertToTypedLiteral(Object value, DataType dataType) {
+        Number number = (Number) value;
+        if (dataType.equals(TinyIntType.INSTANCE)) {
+            return new TinyIntLiteral(number.byteValue());
+        } else if (dataType.equals(SmallIntType.INSTANCE)) {
+            return new SmallIntLiteral(number.shortValue());
+        } else if (dataType.equals(IntegerType.INSTANCE)) {
+            return new IntegerLiteral(number.intValue());
+        } else if (dataType.equals(BigIntType.INSTANCE)) {
+            return new BigIntLiteral(number.longValue());
+        } else if (dataType.equals(DoubleType.INSTANCE)) {
+            return new DoubleLiteral(number.doubleValue());
+        }
+        return null;
+    }
+
+    @Override
+    public String toDigest() {
+        return "?";
     }
 }

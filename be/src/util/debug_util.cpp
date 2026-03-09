@@ -17,10 +17,12 @@
 
 #include "util/debug_util.h"
 
+#include <bvar/bvar.h>
 #include <gen_cpp/HeartbeatService_types.h>
 #include <gen_cpp/PlanNodes_types.h>
 #include <stdint.h>
 
+#include <cstring>
 #include <iomanip>
 #include <map>
 #include <sstream> // IWYU pragma: keep
@@ -45,6 +47,7 @@ std::string print_plan_node_type(const TPlanNodeType::type& type) {
 
 std::string get_build_version(bool compact) {
     std::stringstream ss;
+    // clang-format off
     ss << version::doris_build_version()
 #if defined(__x86_64__) || defined(_M_X64)
 #ifdef __AVX2__
@@ -73,7 +76,9 @@ std::string get_build_version(bool compact) {
        << " with BLSAN"
 #endif
 #endif
+       << (version::doris_feature_list().empty() ? "" : " features: " + version::doris_feature_list())
        << " (build " << version::doris_build_hash() << ")";
+    // clang-format on
 
     if (!compact) {
         ss << std::endl
@@ -103,6 +108,16 @@ std::string hexdump(const char* buf, int len) {
     }
     return ss.str();
 }
+
+bvar::Status<uint64_t> be_version_metrics("doris_be_version", [] {
+    std::stringstream ss;
+    ss << version::doris_build_version_major() << 0 << version::doris_build_version_minor() << 0
+       << version::doris_build_version_patch();
+    if (version::doris_build_version_hotfix() > 0) {
+        ss << 0 << version::doris_build_version_hotfix();
+    }
+    return std::strtoul(ss.str().c_str(), nullptr, 10);
+}());
 
 std::string PrintThriftNetworkAddress(const TNetworkAddress& add) {
     std::stringstream ss;

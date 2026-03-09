@@ -22,16 +22,11 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.PatternMatcherException;
-import org.apache.doris.common.io.Text;
 
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -79,31 +74,28 @@ public abstract class PrivTable {
             }
         }
 
-        PrivEntry existingEntry = getExistingEntry(newEntry);
-        if (existingEntry == null) {
+        int idx = Collections.binarySearch(entries, newEntry);
+        if (idx < 0) {
             if (errOnNonExist) {
                 throw new DdlException("entry does not exist");
             }
-            entries.add(newEntry);
-            Collections.sort(entries);
-            LOG.info("add priv entry: {}", newEntry);
+            int insertPos = -idx - 1;
+            entries.add(insertPos, newEntry);
             return newEntry;
-        } else {
-            if (errOnExist) {
-                throw new DdlException("entry already exist");
-            } else {
-                mergePriv(existingEntry, newEntry);
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("merge priv entry: {}", existingEntry);
-                }
-            }
         }
+
+        if (errOnExist) {
+            throw new DdlException("entry already exist");
+        }
+
+        PrivEntry existingEntry = entries.get(idx);
+        mergePriv(existingEntry, newEntry);
         return existingEntry;
     }
 
 
     public List<PrivEntry> getEntries() {
-        return entries;
+        return Collections.unmodifiableList(entries);
     }
 
     public void dropEntry(PrivEntry entry) {
@@ -160,12 +152,8 @@ public abstract class PrivTable {
 
     // Get existing entry which is the keys match the given entry
     protected PrivEntry getExistingEntry(PrivEntry entry) {
-        for (PrivEntry existingEntry : entries) {
-            if (existingEntry.keyMatch(entry)) {
-                return existingEntry;
-            }
-        }
-        return null;
+        int idx = Collections.binarySearch(entries, entry);
+        return idx >= 0 ? entries.get(idx) : null;
     }
 
     private void mergePriv(
@@ -182,25 +170,6 @@ public abstract class PrivTable {
         return entries.isEmpty();
     }
 
-    @Deprecated
-    public static PrivTable read(DataInput in) throws IOException {
-        String className = Text.readString(in);
-        PrivTable privTable = null;
-        try {
-            Class<? extends PrivTable> derivedClass = (Class<? extends PrivTable>) Class.forName(className);
-            privTable = derivedClass.newInstance();
-            Class[] paramTypes = {DataInput.class};
-            Method readMethod = derivedClass.getMethod("readFields", paramTypes);
-            Object[] params = {in};
-            readMethod.invoke(privTable, params);
-
-            return privTable;
-        } catch (ClassNotFoundException | InstantiationException | IllegalAccessException | NoSuchMethodException
-                | SecurityException | IllegalArgumentException | InvocationTargetException e) {
-            throw new IOException("failed read PrivTable", e);
-        }
-    }
-
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder("\n");
@@ -208,16 +177,6 @@ public abstract class PrivTable {
             sb.append(privEntry).append("\n");
         }
         return sb.toString();
-    }
-
-    @Deprecated
-    public void readFields(DataInput in) throws IOException {
-        int size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            PrivEntry entry = PrivEntry.read(in);
-            entries.add(entry);
-        }
-        Collections.sort(entries);
     }
 
     public void merge(PrivTable privTable) {

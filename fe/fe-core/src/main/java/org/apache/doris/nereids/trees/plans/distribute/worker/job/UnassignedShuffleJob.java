@@ -17,16 +17,20 @@
 
 package org.apache.doris.nereids.trees.plans.distribute.worker.job;
 
+import org.apache.doris.catalog.Env;
+import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.trees.plans.distribute.DistributeContext;
 import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorker;
-import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorkerManager;
 import org.apache.doris.planner.ExchangeNode;
 import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.qe.ConnectContext;
 
+import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
 import java.util.Collection;
@@ -38,20 +42,29 @@ import java.util.function.Function;
 
 /** UnassignedShuffleJob */
 public class UnassignedShuffleJob extends AbstractUnassignedJob {
-    public UnassignedShuffleJob(PlanFragment fragment, ListMultimap<ExchangeNode, UnassignedJob> exchangeToChildJob) {
-        super(fragment, ImmutableList.of(), exchangeToChildJob);
+    private boolean useSerialSource;
+
+    public UnassignedShuffleJob(
+            StatementContext statementContext, PlanFragment fragment,
+            ListMultimap<ExchangeNode, UnassignedJob> exchangeToChildJob) {
+        super(statementContext, fragment, ImmutableList.of(), exchangeToChildJob);
     }
 
     @Override
     public List<AssignedJob> computeAssignedJobs(
-            DistributedPlanWorkerManager workerManager, ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
-        int expectInstanceNum = degreeOfParallelism();
+            DistributeContext distributeContext, ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
+        useSerialSource = fragment.useSerialSource(
+                distributeContext.isLoadJob ? null : statementContext.getConnectContext());
+
         List<AssignedJob> biggestParallelChildFragment = getInstancesOfBiggestParallelChildFragment(inputJobs);
+        int expectInstanceNum = degreeOfParallelism(biggestParallelChildFragment.size(), inputJobs);
 
         if (expectInstanceNum > 0 && expectInstanceNum < biggestParallelChildFragment.size()) {
             // When group by cardinality is smaller than number of backend, only some backends always
             // process while other has no data to process.
             // So we shuffle instances to make different backends handle different queries.
+            // Additional: when query cache limits instance count, the shuffling still applies to
+            // spread the reduced set of instances across distinct workers to avoid cache thrashing.
             List<DistributedPlanWorker> shuffleWorkersInBiggestParallelChildFragment
                     = distinctShuffleWorkers(biggestParallelChildFragment);
             Function<Integer, DistributedPlanWorker> workerSelector = instanceIndex -> {
@@ -69,17 +82,25 @@ public class UnassignedShuffleJob extends AbstractUnassignedJob {
         }
     }
 
-    protected int degreeOfParallelism() {
-        if (!fragment.getDataPartition().isPartitioned()) {
-            return 1;
-        }
-
+    protected int degreeOfParallelism(int childInstanceNum, ListMultimap<ExchangeNode, AssignedJob> inputJobs) {
         // TODO: check we use nested loop join do right outer / semi / anti join,
         //       we should add an exchange node with gather distribute under the nested loop join
-
         int expectInstanceNum = -1;
-        if (ConnectContext.get() != null && ConnectContext.get().getSessionVariable() != null) {
-            expectInstanceNum = ConnectContext.get().getSessionVariable().getExchangeInstanceParallel();
+        ConnectContext connectContext = statementContext.getConnectContext();
+        if (connectContext != null && connectContext.getSessionVariable() != null) {
+            expectInstanceNum = connectContext.getSessionVariable().getExchangeInstanceParallel();
+        }
+        // If child fragment uses query cache, limit instance num to avoid too many instances
+        if (childInstanceNum > 0 && connectContext != null) {
+            boolean childHasQueryCacheParam = inputJobs.values().stream()
+                    .anyMatch(job -> job.unassignedJob().getFragment().queryCacheParam != null);
+            if (childHasQueryCacheParam) {
+                int maxInstanceNum = connectContext.getSessionVariable().getParallelExecInstanceNum()
+                        * Env.getCurrentSystemInfo().getBackendsNumber(false);
+                expectInstanceNum = expectInstanceNum > 0
+                        ? Math.min(expectInstanceNum, Math.min(childInstanceNum, maxInstanceNum))
+                        : Math.min(childInstanceNum, maxInstanceNum);
+            }
         }
         return expectInstanceNum;
     }
@@ -99,15 +120,52 @@ public class UnassignedShuffleJob extends AbstractUnassignedJob {
         return biggestParallelChildFragment;
     }
 
-    private List<AssignedJob> buildInstances(int instanceNum, Function<Integer, DistributedPlanWorker> workerSelector) {
+    private List<AssignedJob> buildInstances(
+            int instanceNum, Function<Integer, DistributedPlanWorker> workerSelector) {
+        ConnectContext connectContext = statementContext.getConnectContext();
+        if (useSerialSource) {
+            return buildInstancesWithLocalShuffle(instanceNum, workerSelector, connectContext);
+        } else {
+            return buildInstancesWithoutLocalShuffle(instanceNum, workerSelector, connectContext);
+        }
+    }
+
+    private List<AssignedJob> buildInstancesWithoutLocalShuffle(
+            int instanceNum, Function<Integer, DistributedPlanWorker> workerSelector, ConnectContext connectContext) {
         ImmutableList.Builder<AssignedJob> instances = ImmutableList.builderWithExpectedSize(instanceNum);
-        ConnectContext context = ConnectContext.get();
         for (int i = 0; i < instanceNum; i++) {
             DistributedPlanWorker selectedWorker = workerSelector.apply(i);
             AssignedJob assignedJob = assignWorkerAndDataSources(
-                    i, context.nextInstanceId(), selectedWorker, new DefaultScanSource(ImmutableMap.of())
+                    i, connectContext.nextInstanceId(),
+                    selectedWorker, new DefaultScanSource(ImmutableMap.of())
             );
             instances.add(assignedJob);
+        }
+        return instances.build();
+    }
+
+    private List<AssignedJob> buildInstancesWithLocalShuffle(
+            int instanceNum, Function<Integer, DistributedPlanWorker> workerSelector, ConnectContext connectContext) {
+        ImmutableList.Builder<AssignedJob> instances = ImmutableList.builderWithExpectedSize(instanceNum);
+        Multimap<DistributedPlanWorker, Integer> workerToInstanceIds = ArrayListMultimap.create();
+        for (int i = 0; i < instanceNum; i++) {
+            DistributedPlanWorker selectedWorker = workerSelector.apply(i);
+            workerToInstanceIds.put(selectedWorker, i);
+        }
+
+        int shareScanId = 0;
+        for (Entry<DistributedPlanWorker, Collection<Integer>> kv : workerToInstanceIds.asMap().entrySet()) {
+            DistributedPlanWorker worker = kv.getKey();
+            Collection<Integer> indexesInFragment = kv.getValue();
+            DefaultScanSource shareScanSource = new DefaultScanSource(ImmutableMap.of());
+            for (Integer indexInFragment : indexesInFragment) {
+                LocalShuffleAssignedJob instance = new LocalShuffleAssignedJob(
+                        indexInFragment, shareScanId, connectContext.nextInstanceId(),
+                        this, worker, shareScanSource
+                );
+                instances.add(instance);
+            }
+            shareScanId++;
         }
         return instances.build();
     }

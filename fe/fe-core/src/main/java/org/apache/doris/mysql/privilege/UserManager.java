@@ -28,7 +28,7 @@ import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.PatternMatcherException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
-import org.apache.doris.common.util.QueryableReentrantReadWriteLock;
+import org.apache.doris.common.lock.MonitoredReentrantReadWriteLock;
 import org.apache.doris.mysql.MysqlPassword;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -38,7 +38,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.util.Strings;
@@ -60,7 +60,7 @@ public class UserManager implements Writable, GsonPostProcessable {
     public static final String ANY_HOST = "%";
     private static final Logger LOG = LogManager.getLogger(UserManager.class);
 
-    private static final QueryableReentrantReadWriteLock rwLock = new QueryableReentrantReadWriteLock(false);
+    private static final MonitoredReentrantReadWriteLock rwLock = new MonitoredReentrantReadWriteLock(false);
     private static final Lock rlock = rwLock.readLock();
     private static final Lock wlock = rwLock.writeLock();
 
@@ -245,6 +245,7 @@ public class UserManager implements Writable, GsonPostProcessable {
             userByUserIdentity.setPassword(pwd);
             userByUserIdentity.setComment(comment);
             userByUserIdentity.setSetByDomainResolver(setByResolver);
+            userByUserIdentity.setUserIdentity(userIdent);
             return userByUserIdentity;
         }
 
@@ -362,6 +363,11 @@ public class UserManager implements Writable, GsonPostProcessable {
                     // password, this "domain" user ident will be returned as "current user".
                     for (String newIP : entry.getValue()) {
                         UserIdentity userIdent = UserIdentity.createAnalyzedUserIdentWithIp(userEntry.getKey(), newIP);
+                        UserIdentity domainUserIdent = domainUser.getUserIdentity();
+                        userIdent.setSan(domainUserIdent.getSan());
+                        userIdent.setIssuer(domainUserIdent.getIssuer());
+                        userIdent.setCipher(domainUserIdent.getCipher());
+                        userIdent.setSubject(domainUserIdent.getSubject());
                         byte[] password = domainUser.getPassword().getPassword();
                         Preconditions.checkNotNull(password, entry.getKey());
                         try {

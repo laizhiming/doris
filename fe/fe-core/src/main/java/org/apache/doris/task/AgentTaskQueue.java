@@ -33,6 +33,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * Task queue
@@ -96,6 +97,18 @@ public class AgentTaskQueue {
         --taskNum;
     }
 
+    public static synchronized void removeTask(long backendId, Consumer<AgentTask> onTaskRemoved) {
+        Map<TTaskType, Map<Long, AgentTask>> tasks = AgentTaskQueue.tasks.row(backendId);
+        tasks.forEach((type, taskSet) -> {
+            Iterator<Map.Entry<Long, AgentTask>> it = taskSet.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<Long, AgentTask> entry = it.next();
+                it.remove();
+                onTaskRemoved.accept(entry.getValue());
+            }
+        });
+    }
+
     /*
      * we cannot define a push task with only 'backendId', 'signature' and 'TTaskType'
      * add version and TPushType to help
@@ -132,6 +145,19 @@ public class AgentTaskQueue {
         }
     }
 
+    public static synchronized boolean contains(AgentTask task) {
+        long backendId = task.getBackendId();
+        TTaskType type = task.getTaskType();
+        long signature = task.getSignature();
+
+        if (!tasks.contains(backendId, type)) {
+            return false;
+        }
+
+        Map<Long, AgentTask> signatureMap = tasks.get(backendId, type);
+        return signatureMap.containsKey(signature);
+    }
+
     public static synchronized AgentTask getTask(long backendId, TTaskType type, long signature) {
         if (!tasks.contains(backendId, type)) {
             return null;
@@ -156,7 +182,7 @@ public class AgentTaskQueue {
     // this is just for unit test
     public static synchronized List<AgentTask> getTask(TTaskType type) {
         List<AgentTask> res = Lists.newArrayList();
-        for (Map<Long, AgentTask> agentTasks : tasks.column(TTaskType.ALTER).values()) {
+        for (Map<Long, AgentTask> agentTasks : tasks.column(type).values()) {
             res.addAll(agentTasks.values());
         }
         return res;

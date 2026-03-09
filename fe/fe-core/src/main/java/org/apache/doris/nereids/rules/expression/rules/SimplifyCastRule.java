@@ -19,6 +19,7 @@ package org.apache.doris.nereids.rules.expression.rules;
 
 import org.apache.doris.nereids.rules.expression.ExpressionPatternMatcher;
 import org.apache.doris.nereids.rules.expression.ExpressionPatternRuleFactory;
+import org.apache.doris.nereids.rules.expression.ExpressionRuleType;
 import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
@@ -30,16 +31,20 @@ import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.SmallIntLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.VarBinaryLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DecimalV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
 import org.apache.doris.nereids.types.StringType;
+import org.apache.doris.nereids.types.VarBinaryType;
 import org.apache.doris.nereids.types.VarcharType;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.io.BaseEncoding;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 
 /**
@@ -56,6 +61,7 @@ public class SimplifyCastRule implements ExpressionPatternRuleFactory {
     public List<ExpressionPatternMatcher<? extends Expression>> buildRules() {
         return ImmutableList.of(
                 matchesType(Cast.class).then(SimplifyCastRule::simplifyCast)
+                        .toRule(ExpressionRuleType.SIMPLIFY_CAST)
         );
     }
 
@@ -112,9 +118,28 @@ public class SimplifyCastRule implements ExpressionPatternRuleFactory {
                         return new DecimalV3Literal(decimalV3Type,
                                 new BigDecimal(((BigIntLiteral) child).getValue()));
                     } else if (child instanceof DecimalV3Literal) {
-                        return new DecimalV3Literal(decimalV3Type,
-                                ((DecimalV3Literal) child).getValue());
+                        DecimalV3Type childType = (DecimalV3Type) child.getDataType();
+                        if (childType.getRange() <= decimalV3Type.getRange()) {
+                            return new DecimalV3Literal(decimalV3Type,
+                                    ((DecimalV3Literal) child).getValue()
+                                            .setScale(decimalV3Type.getScale(), RoundingMode.HALF_UP));
+                        } else {
+                            return cast;
+                        }
                     }
+                } else if (castType instanceof VarBinaryType) {
+                    String str;
+                    if (child instanceof VarcharLiteral) {
+                        str = ((VarcharLiteral) child).getValue();
+                    } else if (child instanceof CharLiteral) {
+                        str = ((CharLiteral) child).getValue();
+                    } else if (child instanceof StringLiteral) {
+                        str = ((StringLiteral) child).getValue();
+                    } else {
+                        return cast;
+                    }
+                    String hex = BaseEncoding.base16().encode(str.getBytes());
+                    return new VarBinaryLiteral(hex);
                 }
             } catch (Throwable t) {
                 return cast;

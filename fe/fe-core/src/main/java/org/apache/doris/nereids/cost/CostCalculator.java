@@ -19,7 +19,6 @@ package org.apache.doris.nereids.cost;
 
 import org.apache.doris.nereids.PlanContext;
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.properties.DistributionSpecReplicated;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.qe.ConnectContext;
@@ -38,22 +37,14 @@ public class CostCalculator {
      */
     public static Cost calculateCost(ConnectContext connectContext, GroupExpression groupExpression,
             List<PhysicalProperties> childrenProperties) {
-        PlanContext planContext = new PlanContext(connectContext, groupExpression);
-        if (childrenProperties.size() >= 2
-                && childrenProperties.get(1).getDistributionSpec() instanceof DistributionSpecReplicated) {
-            planContext.setBroadcastJoin();
-        }
-
-        CostModelV1 costModelV1 = new CostModelV1(connectContext);
+        PlanContext planContext = new PlanContext(connectContext, groupExpression, childrenProperties);
+        CostModel costModelV1 = new CostModel(connectContext);
         return groupExpression.getPlan().accept(costModelV1, planContext);
     }
 
     public static Cost addChildCost(ConnectContext connectContext, Plan plan, Cost planCost, Cost childCost,
             int index) {
         SessionVariable sessionVariable = connectContext.getSessionVariable();
-        if (sessionVariable.getEnableNewCostModel()) {
-            return CostModelV2.addChildCost(plan, planCost, childCost, index);
-        }
-        return CostModelV1.addChildCost(sessionVariable, planCost, childCost);
+        return CostModel.addChildCost(sessionVariable, planCost, childCost);
     }
 }

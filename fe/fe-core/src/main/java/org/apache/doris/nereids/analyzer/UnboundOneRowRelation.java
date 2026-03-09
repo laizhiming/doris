@@ -37,6 +37,7 @@ import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * A relation that contains only one row consist of some constant expressions.
@@ -71,7 +72,7 @@ public class UnboundOneRowRelation extends LogicalRelation implements Unbound, O
 
     @Override
     public List<? extends Expression> getExpressions() {
-        throw new UnsupportedOperationException(this.getClass().getSimpleName() + " don't support getExpression()");
+        return projects;
     }
 
     @Override
@@ -107,5 +108,16 @@ public class UnboundOneRowRelation extends LogicalRelation implements Unbound, O
                 "relationId", relationId,
                 "projects", projects
         );
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("SELECT ");
+        sb.append(
+                projects.stream().map(Expression::toDigest)
+                        .collect(Collectors.joining(", "))
+        );
+        return sb.toString();
     }
 }

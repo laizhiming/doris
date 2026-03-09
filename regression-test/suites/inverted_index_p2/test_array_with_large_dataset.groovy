@@ -37,6 +37,7 @@ suite("test_array_with_large_dataset", "p2"){
             // also, you can stream load a http stream, e.g. http://xxx/some.csv
             file fileName
             time 300000
+            retryIfHttpError true
             // stream load action will check result, include Success status, and NumberTotalRows == NumberLoadedRows
 
             // if declared a check callback, the default check condition will ignore.
@@ -67,17 +68,7 @@ suite("test_array_with_large_dataset", "p2"){
             COMMENT 'OLAP'
             DISTRIBUTED BY HASH(`id`) BUCKETS 16
             PROPERTIES (
-            "replication_allocation" = "tag.location.default: 1",
-            "min_load_replica_num" = "-1",
-            "is_being_synced" = "false",
-            "storage_medium" = "hdd",
-            "storage_format" = "V2",
-            "inverted_index_storage_format" = "V1",
-            "light_schema_change" = "true",
-            "disable_auto_compaction" = "false",
-            "enable_single_replica_compaction" = "false",
-            "group_commit_interval_ms" = "10000",
-            "group_commit_data_bytes" = "134217728"
+            "replication_allocation" = "tag.location.default: 1"
     );
     """
     

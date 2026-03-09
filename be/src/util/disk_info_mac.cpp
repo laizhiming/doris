@@ -28,8 +28,8 @@
 #include <string>
 #include <vector>
 
-#include "disk_info.h"
 #include "io/fs/local_file_system.h"
+#include "util/disk_info.h"
 
 namespace doris {
 
@@ -61,7 +61,7 @@ void DiskInfo::get_device_names() {
     std::sort(std::begin(mount_infos), std::end(mount_infos),
               [](const auto& info, const auto& other) {
                   const auto& mount_point = info.second;
-                  const auto& other_mount_point = info.second;
+                  const auto& other_mount_point = other.second;
                   return mount_point < other_mount_point;
               });
 
@@ -74,7 +74,7 @@ void DiskInfo::get_device_names() {
             auto it = major_to_disk_id.find(major(dev));
             int disk_id;
             if (it == major_to_disk_id.end()) {
-                disk_id = _s_disks.size();
+                disk_id = int(_s_disks.size());
                 major_to_disk_id[major(dev)] = disk_id;
 
                 std::string name = "disk" + std::to_string(disk_id);
@@ -157,6 +157,7 @@ Status DiskInfo::get_disk_devices(const std::vector<std::string>& paths,
             match_dev = info.first;
         }
         if (max_mount_size > 0) {
+            // The library function uses char* and `match_dev` is std::string, so use const_cast.
             devices->emplace(basename(const_cast<char*>(match_dev.c_str())));
         }
     }

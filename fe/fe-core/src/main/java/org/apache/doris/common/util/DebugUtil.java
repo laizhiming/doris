@@ -19,13 +19,18 @@ package org.apache.doris.common.util;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.proto.Types;
+import org.apache.doris.thrift.TPlanNodeRuntimeStatsItem;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Strings;
+import org.apache.commons.lang3.StringUtils;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.text.DecimalFormat;
+import java.util.List;
 import java.util.UUID;
 
 public class DebugUtil {
@@ -176,5 +181,68 @@ public class DebugUtil {
         StringWriter sw = new StringWriter();
         e.printStackTrace(new PrintWriter(sw));
         return sw.toString();
+    }
+
+    public static String prettyPrintChangedSessionVar(List<List<String>> nestedList) {
+        if (nestedList == null || nestedList.isEmpty()) {
+            return "";
+        }
+
+        JSONArray array = new JSONArray();
+        for (List<String> row : nestedList) {
+            if (row == null || row.isEmpty()) {
+                continue;
+            }
+            JSONObject obj = new JSONObject();
+            // Expected order: VarName, CurrentValue, DefaultValue
+            if (row.size() >= 1) {
+                obj.put("VarName", row.get(0));
+            }
+            if (row.size() >= 2) {
+                obj.put("CurrentValue", row.get(1));
+            }
+            if (row.size() >= 3) {
+                obj.put("DefaultValue", row.get(2));
+            }
+            array.put(obj);
+        }
+        // Pretty print with indentation for readability in logs/profile
+        return array.toString(2);
+    }
+
+    public static String prettyPrintPlanNodeRuntimeStatsItems(
+            List<TPlanNodeRuntimeStatsItem> planNodeRuntimeStatsItems) {
+        StringBuilder result = new StringBuilder();
+        if (planNodeRuntimeStatsItems == null || planNodeRuntimeStatsItems.isEmpty()) {
+            result.append("The list is empty or null.\n");
+            return result.toString();
+        }
+
+        result.append(String.format("%-10s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s %-10s\n",
+                "NodeID", "InstanceNum", "InputRows", "OutputRows", "CommonFilterRows", "CommonFilterInputRows",
+                "RuntimeFilterRows", "RuntimeFilterInputRows", "JoinBuilderRows", "JoinProbeRows",
+                "JoinBuilderSkewRatio", "JoinProbeSkewRatio"));
+
+        for (TPlanNodeRuntimeStatsItem item : planNodeRuntimeStatsItems) {
+            result.append(String.format("%-10d %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d %-10d\n",
+                    item.getNodeId(),
+                    item.getInstanceNum(),
+                    item.getInputRows(),
+                    item.getOutputRows(),
+                    item.getCommonFilterRows(),
+                    item.getCommonFilterInputRows(),
+                    item.getRuntimeFilterRows(),
+                    item.getRuntimeFilterInputRows(),
+                    item.getJoinBuilderRows(),
+                    item.getJoinProbeRows(),
+                    item.getJoinBuilderSkewRatio(),
+                    item.getJoinProberSkewRatio()
+            ));
+        }
+        return result.toString();
+    }
+
+    private static String format(int width, String name) {
+        return name + StringUtils.repeat(" ", Math.max(0, name.length() - width));
     }
 }

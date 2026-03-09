@@ -18,6 +18,7 @@
 package org.apache.doris.statistics;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.statistics.util.StatisticsUtil;
 import org.apache.doris.utframe.TestWithFeService;
@@ -35,6 +36,7 @@ public class MVStatisticsTest extends TestWithFeService {
 
     @Override
     protected void runBeforeAll() throws Exception {
+        FeConstants.runningUnitTest = true;
         createDatabase("test");
         connectContext.setDatabase("test");
         createTable("CREATE TABLE t1 (col1 int not null, col2 int not null, col3 int not null)\n"
@@ -43,7 +45,7 @@ public class MVStatisticsTest extends TestWithFeService {
                 + "PROPERTIES(\n"
                 + "    \"replication_num\"=\"1\"\n"
                 + ");\n");
-        createMv("CREATE MATERIALIZED VIEW mv1 AS SELECT col3 , SUM(COL2) FROM t1 group by col3");
+        createMv("CREATE MATERIALIZED VIEW mv1 AS SELECT col3 as a1 , SUM(COL2) FROM t1 group by col3");
     }
 
     @Tested

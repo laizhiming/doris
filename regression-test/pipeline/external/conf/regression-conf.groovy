@@ -25,6 +25,14 @@ targetJdbcUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLo
 jdbcUser = "root"
 jdbcPassword = ""
 
+//arrow flight sql test config
+extArrowFlightSqlHost = "172.19.0.2"
+extArrowFlightSqlPort = 8081
+extArrowFlightSqlUser = "root"
+extArrowFlightSqlPassword= ""
+extArrowFlightHttpPort= 8131
+extFeThriftPort = 9020
+
 ccrDownstreamUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLoadLocalInfile=true"
 ccrDownstreamUser = "root"
 ccrDownstreamPassword = ""
@@ -46,32 +54,31 @@ dataPath = "${DORIS_HOME}/regression-test/data"
 pluginPath = "${DORIS_HOME}/regression-test/plugins"
 realDataPath = "${DORIS_HOME}/regression-test/realdata"
 trinoPluginsPath = "/tmp/trino_connector"
-// sf1DataPath can be url like "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com" or local path like "/data"
-//sf1DataPath = "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com"
 
 // will test <group>/<suite>.groovy
 // empty group will test all group
-testGroups = ""
+testGroups = "external"
 // empty suite will test all suite
 testSuites = ""
 // empty directories will test all directories
 testDirectories = ""
 
 // this groups will not be executed
-excludeGroups = ""
+excludeGroups = "p1,p2"
 // this suites will not be executed
 // load_stream_fault_injection may cause bad disk
 
 excludeSuites = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
-    "test_bitmap_filter," +
     "test_dump_image," +
     "test_index_failure_injection," +
     "test_information_schema_external," +
     "test_profile," +
     "test_refresh_mtmv," +
     "test_spark_load," +
+    "test_paimon_gcs," +
     "test_broker_load_func," +
     "test_stream_stub_fault_injection," +
+    "test_iceberg_overwrite_with_wrong_partition," +
     "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
 
 // this directories will not be executed
@@ -105,7 +112,6 @@ mariadb_10_port=3326
 // To enable jdbc test, you need first start hive container.
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableHiveTest=true
-enablePaimonTest=enable_deprecated_case
 
 // port of hive2 docker
 hive2HmsPort=9083
@@ -124,10 +130,24 @@ hive3PgPort=5732
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableKafkaTest=true
 kafka_port=19193
+// refactor params
+enableRefactorParamsTest=true
 
 // iceberg test config
 iceberg_rest_uri_port=18181
+iceberg_rest_uri_port_s3=19181
+iceberg_rest_uri_port_oss=19182
+iceberg_rest_uri_port_cos=19183
+iceberg_rest_uri_port_obs=19184
+iceberg_rest_uri_port_gcs=19185
+iceberg_rest_uri_port_hdfs=19186
+iceberg_rest_hdfs_port=20020
 iceberg_minio_port=19001
+enableIcebergTest=true
+
+// polaris rest catalog config
+polaris_rest_uri_port=20181
+polaris_minio_port=20001
 
 enableEsTest=true
 es_5_port=59200
@@ -137,10 +157,17 @@ es_8_port=39200
 
 cacheDataPath = "/data/regression/"
 
-s3Endpoint = "cos.ap-hongkong.myqcloud.com"
-s3BucketName = "doris-build-hk-1308700295"
-s3Region = "ap-hongkong"
-s3Provider = "COS"
+s3Source = "aliyun"
+s3Endpoint = "oss-cn-hongkong-internal.aliyuncs.com"
+
+// for multi cloud test case, eg. paimon_base_filesystem
+aliYunAk="***********"
+aliYunSk="***********"
+txYunAk="***********"
+txYunSk="***********"
+
+// max compute catalog test config
+enableMaxComputeTest=true
 
 max_failure_num=50
 
@@ -153,6 +180,7 @@ hdfs_port=8020
 oracle_11_port=1521
 sqlserver_2022_port=1433
 clickhouse_22_port=8123
+oceanbase_port=2881
 db2_11_port=50000
 
 // trino-connector catalog test config
@@ -162,3 +190,20 @@ enableTrinoConnectorTest = true
 enableKerberosTest = true
 kerberosHmsPort=9883
 kerberosHdfsPort=8820
+enableNonCatalogKerberosTest = true
+
+
+// LakeSoul catalog test config
+enableLakesoulTest = true
+
+// AWS iam role config
+
+// hudi p0 external regression test config
+// To enable hudi test, you need first start hudi container.
+// See `docker/thirdparties/run-thirdparties-docker.sh -c hudi`
+enableHudiTest=true
+// hudi catalog config
+hudiHmsPort=19083
+hudiMinioPort=19100
+hudiMinioAccessKey="minio"
+hudiMinioSecretKey="minio123"

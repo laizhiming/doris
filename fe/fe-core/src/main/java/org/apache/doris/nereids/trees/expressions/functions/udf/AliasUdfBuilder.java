@@ -17,17 +17,21 @@
 
 package org.apache.doris.nereids.trees.expressions.functions.udf;
 
+import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.ReflectionUtils;
 import org.apache.doris.nereids.analyzer.Scope;
+import org.apache.doris.nereids.analyzer.UnboundSlot;
 import org.apache.doris.nereids.rules.analysis.ExpressionAnalyzer;
+import org.apache.doris.nereids.rules.analysis.SessionVarGuardRewriter;
+import org.apache.doris.nereids.rules.analysis.SessionVarGuardRewriter.AddSessionVarGuardRewriter;
 import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.BoundFunction;
-import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
+import org.apache.doris.qe.AutoCloseSessionVariable;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -51,6 +55,11 @@ public class AliasUdfBuilder extends UdfBuilder {
     @Override
     public List<DataType> getArgTypes() {
         return aliasUdf.getArgTypes();
+    }
+
+    @Override
+    public List<FunctionSignature> getSignatures() {
+        return aliasUdf.getSignatures();
     }
 
     @Override
@@ -79,47 +88,51 @@ public class AliasUdfBuilder extends UdfBuilder {
         // use AliasFunction to process TypeCoercion
         BoundFunction boundAliasFunction = ((BoundFunction) aliasUdf.withChildren(arguments.stream()
                 .map(Expression.class::cast).collect(Collectors.toList())));
+        Map<String, String> sessionVariables = aliasUdf.getSessionVariables();
+        ConnectContext ctx = ConnectContext.get();
+        Map<String, String> currentSessionVars = ctx == null
+                ? Maps.newHashMap() : ctx.getSessionVariable().getAffectQueryResultInPlanVariables();
+        Expression analyzedExpression;
+        try (AutoCloseSessionVariable autoClose = new AutoCloseSessionVariable(ctx, sessionVariables)) {
+            Expression processedExpression = TypeCoercionUtils.processBoundFunction(boundAliasFunction);
+            List<Expression> inputs = processedExpression.getArguments();
 
-        Expression processedExpression = TypeCoercionUtils.processBoundFunction(boundAliasFunction);
-        List<Expression> inputs = processedExpression.getArguments();
+            // replace the placeholder slot to the input expressions.
+            // adjust input, parameter and replaceMap to be corresponding.
+            Map<String, UnboundSlot> slots = Maps.newLinkedHashMap();
+            aliasUdf.getUnboundFunction().foreachUp(child -> {
+                if (child instanceof UnboundSlot) {
+                    slots.put(((UnboundSlot) child).getName(), (UnboundSlot) child);
+                }
+            });
 
-        // replace the placeholder slot to the input expressions.
-        // adjust input, parameter and replaceMap to be corresponding.
-        Map<String, SlotReference> slots = Maps.newLinkedHashMap();
-        aliasUdf.getUnboundFunction().foreachUp(child -> {
-            if (child instanceof SlotReference) {
-                slots.put(((SlotReference) child).getName(), (SlotReference) child);
+            Map<UnboundSlot, Expression> paramSlotToRealInput = Maps.newHashMap();
+            for (int i = 0; i < inputs.size(); ++i) {
+                String parameter = aliasUdf.getParameters().get(i);
+                Preconditions.checkArgument(slots.containsKey(parameter));
+                paramSlotToRealInput.put(slots.get(parameter), inputs.get(i));
             }
-        });
 
-        Map<SlotReference, Expression> paramSlotToRealInput = Maps.newHashMap();
-        for (int i = 0; i < inputs.size(); ++i) {
-            String parameter = aliasUdf.getParameters().get(i);
-            Preconditions.checkArgument(slots.containsKey(parameter));
-            paramSlotToRealInput.put(slots.get(parameter), inputs.get(i));
+            ExpressionAnalyzer udfAnalyzer = new ExpressionAnalyzer(
+                    null, new Scope(ImmutableList.of()), null, false, false) {
+                @Override
+                public Expression visitUnboundSlot(UnboundSlot unboundSlot, ExpressionRewriteContext context) {
+                    return paramSlotToRealInput.get(unboundSlot);
+                }
+            };
+            analyzedExpression = udfAnalyzer.analyze(aliasUdf.getUnboundFunction());
+            if (!SessionVarGuardRewriter.checkSessionVariablesMatch(currentSessionVars, sessionVariables)) {
+                analyzedExpression = analyzedExpression.accept(
+                        new AddSessionVarGuardRewriter(sessionVariables), Boolean.FALSE);
+            }
         }
-
-        ExpressionAnalyzer udfAnalyzer = new ExpressionAnalyzer(
-                null, new Scope(ImmutableList.of()), null, false, false) {
-            @Override
-            public Expression visitSlotReference(SlotReference slotReference, ExpressionRewriteContext context) {
-                return paramSlotToRealInput.get(slotReference);
-            }
-        };
-
-        return Pair.of(udfAnalyzer.analyze(aliasUdf.getUnboundFunction()), boundAliasFunction);
+        return Pair.of(analyzedExpression, boundAliasFunction);
     }
 
-    private static class SlotReplacer extends DefaultExpressionRewriter<Map<SlotReference, Expression>> {
-        public static final SlotReplacer INSTANCE = new SlotReplacer();
-
-        public Expression replace(Expression expression, Map<SlotReference, Expression> context) {
-            return expression.accept(this, context);
-        }
-
-        @Override
-        public Expression visitSlotReference(SlotReference slot, Map<SlotReference, Expression> context) {
-            return context.get(slot);
-        }
+    @Override
+    public String parameterDisplayString() {
+        return aliasUdf.getArgTypes().stream()
+                .map(DataType::toString)
+                .collect(Collectors.joining(", ", "(", ")"));
     }
 }

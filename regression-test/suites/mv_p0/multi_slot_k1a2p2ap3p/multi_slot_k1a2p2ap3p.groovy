@@ -18,6 +18,9 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("multi_slot_k1a2p2ap3p") {
+
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql """ DROP TABLE IF EXISTS d_table; """
 
     sql """
@@ -45,17 +48,9 @@ suite ("multi_slot_k1a2p2ap3p") {
     qt_select_star "select * from d_table order by k1;"
 
     sql "analyze table d_table with sync;"
-    sql """set enable_stats=false;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='7');"""
 
-    explain {
-        sql("select abs(k1)+k2+1,abs(k2+2)+k3+3 from d_table order by abs(k1)+k2+1,abs(k2+2)+k3+3")
-        contains "(k1a2p2ap3p)"
-    }
+    mv_rewrite_success_without_check_chosen("select abs(k1)+k2+1,abs(k2+2)+k3+3 from d_table order by abs(k1)+k2+1,abs(k2+2)+k3+3", "k1a2p2ap3p")
     qt_select_mv "select abs(k1)+k2+1,abs(k2+2)+k3+3 from d_table order by abs(k1)+k2+1,abs(k2+2)+k3+3;"
 
-    sql """set enable_stats=true;"""
-    explain {
-        sql("select abs(k1)+k2+1,abs(k2+2)+k3+3 from d_table order by abs(k1)+k2+1,abs(k2+2)+k3+3")
-        contains "(k1a2p2ap3p)"
-    }
 }

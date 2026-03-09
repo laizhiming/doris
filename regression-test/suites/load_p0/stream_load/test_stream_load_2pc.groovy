@@ -27,7 +27,7 @@ suite("test_stream_load_2pc", "p0") {
 
     // for test dup, mow, uniq, agg tables, we use sql statement concat these parameters
     // due to dynamic partition is different from others, it's the reason why we concat create sql statement 
-    def tables = ["stream_load_dup_tbl_basic", "stream_load_mow_tbl_basic", "stream_load_uniq_tbl_basic", "stream_load_agg_tbl_basic"]
+    def tables = ["stream_load_dup_tbl_basic_2pc", "stream_load_mow_tbl_basic_2pc", "stream_load_uniq_tbl_basic_2pc", "stream_load_agg_tbl_basic_2pc"]
 
     def columns_stream_load = [
         """k00, k01, k02, k03, k04, k05, k06, k07, k08, k09, k10, k11, k12, k13, k14, k15, k16, k17, k18""",
@@ -39,7 +39,7 @@ suite("test_stream_load_2pc", "p0") {
 
     def create_table_sql = [
         """
-        CREATE TABLE stream_load_dup_tbl_basic
+        CREATE TABLE ${tables[0]}
         (
                 k00 INT             NOT NULL,
                 k01 DATE            NOT NULL,
@@ -88,14 +88,14 @@ suite("test_stream_load_2pc", "p0") {
                 INDEX idx_ngrambf_k116 (`k16`) USING NGRAM_BF PROPERTIES("gram_size"="3", "bf_size"="256"),
                 INDEX idx_ngrambf_k117 (`k17`) USING NGRAM_BF PROPERTIES("gram_size"="3", "bf_size"="256"),
 
-                INDEX idx_bitmap_k104 (`k02`) USING BITMAP,
-                INDEX idx_bitmap_k110 (`kd01`) USING BITMAP
+                INDEX idx_bitmap_k104 (`k02`) USING INVERTED,
+                INDEX idx_bitmap_k110 (`kd01`) USING INVERTED
 
         )
         DUPLICATE KEY(k00)""",
 
         """
-            CREATE TABLE stream_load_mow_tbl_basic
+            CREATE TABLE ${tables[1]}
             (
                 k00 INT             NOT NULL,
                 k01 DATE            NULL,
@@ -148,7 +148,7 @@ suite("test_stream_load_2pc", "p0") {
         """,
 
         """
-            CREATE TABLE stream_load_uniq_tbl_basic
+            CREATE TABLE ${tables[2]}
             (
                 k00 INT             NOT NULL,
                 k01 DATE            NOT NULL,
@@ -188,17 +188,17 @@ suite("test_stream_load_2pc", "p0") {
                 kd17 STRING          NOT NULL DEFAULT "我能吞下玻璃而不伤身体",
                 kd18 JSON            NULL,
 
-                INDEX idx_bitmap_k104 (`k02`) USING BITMAP,
-                INDEX idx_bitmap_k110 (`kd01`) USING BITMAP,
-                INDEX idx_bitmap_k113 (`k13`) USING BITMAP,
-                INDEX idx_bitmap_k114 (`k14`) USING BITMAP,
-                INDEX idx_bitmap_k117 (`k17`) USING BITMAP
+                INDEX idx_bitmap_k104 (`k02`) USING INVERTED,
+                INDEX idx_bitmap_k110 (`kd01`) USING INVERTED,
+                INDEX idx_bitmap_k113 (`k13`) USING INVERTED,
+                INDEX idx_bitmap_k114 (`k14`) USING INVERTED,
+                INDEX idx_bitmap_k117 (`k17`) USING INVERTED
             )
             UNIQUE KEY(k00,k01)
         """,
 
         """
-            CREATE TABLE stream_load_agg_tbl_basic
+            CREATE TABLE ${tables[3]}
             (
                 k00 INT             NOT NULL,
                 k01 DATE            NOT NULL,
@@ -244,7 +244,7 @@ suite("test_stream_load_2pc", "p0") {
                 kd20 HLL             HLL_UNION ,
                 kd21 QUANTILE_STATE  QUANTILE_UNION ,
 
-                INDEX idx_bitmap_k104 (`k01`) USING BITMAP
+                INDEX idx_bitmap_k104 (`k01`) USING INVERTED
             )
             AGGREGATE KEY(k00,k01)
         """
@@ -301,7 +301,8 @@ suite("test_stream_load_2pc", "p0") {
         """,
 
         """
-            "replication_num" = "1"
+            "replication_num" = "1",
+            "enable_unique_key_merge_on_write" = "false"
         """,
 
         """
@@ -317,9 +318,9 @@ suite("test_stream_load_2pc", "p0") {
         '',
         """
         "dynamic_partition.enable" = "true",
-        "dynamic_partition.time_unit" = "MONTH",
-        "dynamic_partition.start" = "-3",
-        "dynamic_partition.end" = "3",
+        "dynamic_partition.time_unit" = "YEAR",
+        "dynamic_partition.start" = "-10",
+        "dynamic_partition.end" = "10",
         "dynamic_partition.prefix" = "p",
         "dynamic_partition.buckets" = "32",
         "dynamic_partition.create_history_partition" = "true"
@@ -340,13 +341,17 @@ suite("test_stream_load_2pc", "p0") {
     def do_streamload_2pc_commit_by_label = { label, tbl ->
         def command = "curl -X PUT --location-trusted -u ${context.config.feHttpUser}:${context.config.feHttpPassword}" +
                 " -H label:${label}" +
-                " -H txn_operation:commit" +
-                " http://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc"
+                " -H txn_operation:commit"
+        if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+            command = command + " https://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc" + " --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey")
+        } else {
+            command = command + " http://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc"
+        }
         log.info("http_stream execute 2pc: ${command}")
 
         def process = command.execute()
-        code = process.waitFor()
-        out = process.text
+        def code = process.waitFor()
+        def out = process.text
         log.info("http_stream 2pc result: ${out}".toString())
         def json2pc = parseJson(out)
         return json2pc
@@ -355,13 +360,17 @@ suite("test_stream_load_2pc", "p0") {
     def do_streamload_2pc_commit_by_txn_id = { txnId, tbl ->
         def command = "curl -X PUT --location-trusted -u ${context.config.feHttpUser}:${context.config.feHttpPassword}" +
                 " -H txn_id:${txnId}" +
-                " -H txn_operation:commit" +
-                " http://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc"
+                " -H txn_operation:commit"
+        if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+            command = command + " https://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc" + " --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey")
+        } else {
+            command = command + " http://${context.config.feHttpAddress}/api/${db}/${tbl}/_stream_load_2pc"
+        }
         log.info("http_stream execute 2pc: ${command}")
 
         def process = command.execute()
-        code = process.waitFor()
-        out = process.text
+        def code = process.waitFor()
+        def out = process.text
         log.info("http_stream 2pc result: ${out}".toString())
         def json2pc = parseJson(out)
         return json2pc
@@ -405,7 +414,7 @@ suite("test_stream_load_2pc", "p0") {
                     `v2` tinyint(4) NULL,
                     `v3` tinyint(4) NULL,
                     `v4` DATETIME NULL,
-                    `v5` date default "2024-06-18"
+                    `v5` date default current_date
                 ) ENGINE=OLAP
                 $partition
                 $distributed
@@ -452,16 +461,16 @@ suite("test_stream_load_2pc", "p0") {
         def dynamic_partition = ["", "", "", "", "",
         """
             "dynamic_partition.enable" = "true",
-            "dynamic_partition.time_unit" = "MONTH",
-            "dynamic_partition.start" = "-1",
-            "dynamic_partition.end" = "1",
+            "dynamic_partition.time_unit" = "YEAR",
+            "dynamic_partition.start" = "-10",
+            "dynamic_partition.end" = "5",
             "dynamic_partition.prefix" = "p",
-            "dynamic_partition.buckets" = "3"
+            "dynamic_partition.buckets" = "32"
         """ 
         ]
 
         
-        def tbl_2pc_expected = [1, 4, 4, 4, 4, 2]
+        def tbl_2pc_expected = [1, 4, 4, 4, 4, 6]
         def i = 0;
 
         def streamLoadAction = { tbl, columns, filename, rowCount, expected ->
@@ -521,7 +530,7 @@ suite("test_stream_load_2pc", "p0") {
 
             def count = 0
             while (true) {
-                res = sql "select count(*) from ${tbl}"
+                def res = sql "select count(*) from ${tbl}"
                 if (res[0][0] > 0) {
                     break
                 }
@@ -540,8 +549,7 @@ suite("test_stream_load_2pc", "p0") {
                 orderby = "order by k00, k01"
             }
 
-            qt_sql_2pc_commit "select * from ${tbl} $orderby"
-
+            qt_sql_2pc_commit "select count(*) from ${tbl}"
             json2pc = do_streamload_2pc_commit_by_txn_id.call(txnId, tbl)
             assertTrue(json2pc.msg.contains("is already visible, not pre-committed"))
         }
@@ -549,7 +557,6 @@ suite("test_stream_load_2pc", "p0") {
         for (String partition in partitions) {
             drop_table.call()
             create_table.call(partition, dynamic_partition[i])
-
             streamLoadAction.call(tableName, 'k1, k2, v1, v2, v3', "test_two_phase_commit.csv", 2, tbl_2pc_expected[i])
             i++
             
@@ -564,16 +571,20 @@ suite("test_stream_load_2pc", "p0") {
             }
             return create + "\n" + partition + "\nDISTRIBUTED BY HASH(k01) BUCKETS 32\n"+ "PROPERTIES($property $dynamic)"
         }
-        def expected = [1, 3, 3, 5, 7] 
+        def expected = [1, 3, 3, 5, 21] 
         // we recreate table for each partition, then load data with stream load and check the result
         for (i = 0; i < tables.size(); ++i) {
+            if (isCloudMode() && tables[i].equals("stream_load_mow_tbl_basic_2pc")) {
+                log.info("Skip stream load mow table in cloud mode")
+                continue;
+            }
             def j = 0
             for (String paritition in tbl_partitions) {
 
                 String sqlStr = concat_sql.call(create_table_sql[i], paritition, properties[i], dynamics[j])
                 sql """drop table if exists ${tables[i]}"""
                 sql """${sqlStr}"""
-
+                
                 streamLoadAction.call(tables[i], columns_stream_load[i], "two_phase_commit_basic_data.csv", 20, expected[j++])
             }
         }

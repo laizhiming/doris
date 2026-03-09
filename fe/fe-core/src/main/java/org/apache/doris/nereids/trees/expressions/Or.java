@@ -18,9 +18,9 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 
@@ -36,17 +36,28 @@ public class Or extends CompoundPredicate {
      * @param right right child of comparison predicate
      */
     public Or(Expression left, Expression right) {
-        super(ImmutableList.of(left, right), "OR");
+        this(left, right, false);
     }
 
-    private Or(List<Expression> children) {
-        super(children, "OR");
+    public Or(Expression left, Expression right, boolean inferred) {
+        this(ExpressionUtils.mergeList(
+                ExpressionUtils.extractDisjunction(left),
+                ExpressionUtils.extractDisjunction(right)), inferred);
+    }
+
+    public Or(List<Expression> children) {
+        this(children, false);
+    }
+
+    public Or(List<Expression> children, boolean inferred) {
+        super(children, "OR", inferred);
+        Preconditions.checkArgument(children.size() >= 2);
     }
 
     @Override
     public Expression withChildren(List<Expression> children) {
-        Preconditions.checkArgument(children.size() == 2);
-        return new Or(children);
+        Preconditions.checkArgument(children.size() >= 2);
+        return new Or(children, this.isInferred());
     }
 
     @Override
@@ -56,16 +67,40 @@ public class Or extends CompoundPredicate {
 
     @Override
     public CompoundPredicate flip() {
-        return new And(left(), right());
+        return new And(children);
     }
 
     @Override
-    public CompoundPredicate flip(Expression left, Expression right) {
-        return new And(left, right);
+    public CompoundPredicate flip(List<Expression> children) {
+        return new And(children);
     }
 
     @Override
     public Class<? extends CompoundPredicate> flipType() {
         return And.class;
+    }
+
+    @Override
+    protected List<Expression> extract() {
+        return ExpressionUtils.extractDisjunction(this);
+    }
+
+    @Override
+    public List<Expression> children() {
+        if (flattenChildren.isEmpty()) {
+            for (Expression child : children) {
+                if (child instanceof Or) {
+                    flattenChildren.addAll(((Or) child).extract());
+                } else {
+                    flattenChildren.add(child);
+                }
+            }
+        }
+        return flattenChildren;
+    }
+
+    @Override
+    public Expression withInferred(boolean inferred) {
+        return new Or(children, inferred);
     }
 }

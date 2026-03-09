@@ -19,26 +19,20 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.AutoIncrementIdUpdateLog;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.gson.GsonPostProcessable;
-import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
-public class AutoIncrementGenerator implements Writable, GsonPostProcessable {
+public class AutoIncrementGenerator implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(AutoIncrementGenerator.class);
 
-    public static final long NEXT_ID_INIT_VALUE = 1;
     // _MIN_BATCH_SIZE = 4064 in load task
     private static final long BATCH_ID_INTERVAL = 500000;
 
@@ -62,6 +56,7 @@ public class AutoIncrementGenerator implements Writable, GsonPostProcessable {
         this.tableId = tableId;
         this.columnId = columnId;
         this.nextId = nextId;
+        this.batchEndId = nextId;
     }
 
     public void setEditLog(EditLog editLog) {
@@ -70,6 +65,8 @@ public class AutoIncrementGenerator implements Writable, GsonPostProcessable {
 
     public synchronized void applyChange(long columnId, long batchNextId) {
         if (this.columnId == columnId && batchEndId < batchNextId) {
+            LOG.info("[auto-inc] AutoIncrementGenerator applyChange, db_id={}, table_id={}, column_id={}, "
+                    + "batchNextId={}", dbId, tableId, columnId, batchNextId);
             nextId = batchNextId;
             batchEndId = batchNextId;
         }
@@ -77,35 +74,32 @@ public class AutoIncrementGenerator implements Writable, GsonPostProcessable {
 
     public synchronized Pair<Long, Long> getAutoIncrementRange(long columnId,
             long length, long lowerBound) throws UserException {
-        LOG.info("[getAutoIncrementRange request][col:{}][length:{}], [{}]", columnId, length, this.columnId);
+        LOG.info("[auto-inc] getAutoIncrementRange request, db_id={}, table_id={}, column_id={}, length={}", dbId,
+                tableId, columnId, length);
         if (this.columnId != columnId) {
             throw new UserException("column dosen't exist, columnId=" + columnId);
         }
-        long startId = Math.max(nextId, lowerBound);
+        long startId = nextId;
         long endId = startId + length;
-        nextId = startId + length;
         if (endId > batchEndId) {
             Preconditions.checkState(editLog != null);
-            AutoIncrementIdUpdateLog info = new AutoIncrementIdUpdateLog(dbId, tableId, columnId, batchEndId);
+            long newBatchEndId = (endId / BATCH_ID_INTERVAL + 1) * BATCH_ID_INTERVAL;
+            AutoIncrementIdUpdateLog info = new AutoIncrementIdUpdateLog(dbId, tableId, columnId, newBatchEndId);
             editLog.logUpdateAutoIncrementId(info);
-            batchEndId = (endId / BATCH_ID_INTERVAL + 1) * BATCH_ID_INTERVAL;
+            batchEndId = newBatchEndId;
+            LOG.info("[auto-inc] update batchEndId to {}, db_id={}, table_id={}, column_id={}",
+                    newBatchEndId, dbId, tableId, columnId);
         }
-        LOG.info("[getAutoIncrementRange result][{}, {}]", startId, length);
+        nextId = endId;
+        LOG.info("[auto-inc] getAutoIncrementRange result, db_id={}, table_id={}, column_id={}, start={}, length:{}",
+                dbId, tableId, columnId, startId, length);
         return Pair.of(startId, length);
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
-    }
-
-    public static AutoIncrementGenerator read(DataInput in) throws IOException {
-        return GsonUtils.GSON.fromJson(Text.readString(in), AutoIncrementGenerator.class);
     }
 
     @Override
     public void gsonPostProcess() throws IOException {
         nextId = batchEndId;
+        LOG.info("[auto-inc] AutoIncrementGenerator set nextId to batchEndId={}", batchEndId);
     }
 
 }

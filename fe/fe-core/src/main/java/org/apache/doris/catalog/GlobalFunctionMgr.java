@@ -18,7 +18,6 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.persist.gson.GsonPostProcessable;
@@ -48,26 +47,14 @@ public class GlobalFunctionMgr extends MetaObject implements GsonPostProcessable
     private ConcurrentMap<String, ImmutableList<Function>> name2Function = Maps.newConcurrentMap();
 
     public static GlobalFunctionMgr read(DataInput in) throws IOException {
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_136) {
-            GlobalFunctionMgr globalFunctionMgr = new GlobalFunctionMgr();
-            globalFunctionMgr.readFields(in);
-            return globalFunctionMgr;
-        } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, GlobalFunctionMgr.class);
-        }
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, GlobalFunctionMgr.class);
     }
 
     @Override
     public void write(DataOutput out) throws IOException {
         // write functions
-        Text.writeString(out, GsonUtils.GSON.toJson(name2Function));
-    }
-
-    @Override
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        FunctionUtil.readFields(in, null, name2Function);
+        Text.writeString(out, GsonUtils.GSON.toJson(this, GlobalFunctionMgr.class));
     }
 
     public void gsonPostProcess() throws IOException {
@@ -89,9 +76,11 @@ public class GlobalFunctionMgr extends MetaObject implements GsonPostProcessable
         if (FunctionUtil.addFunctionImpl(function, ifNotExists, false, name2Function)) {
             Env.getCurrentEnv().getEditLog().logAddGlobalFunction(function);
             try {
-                FunctionUtil.translateToNereids(null, function);
+                FunctionUtil.translateToNereidsThrows(null, function);
             } catch (Exception e) {
                 LOG.warn("Nereids add function failed", e);
+                name2Function.remove(function.getFunctionName().getFunction());
+                throw e;
             }
         }
     }
@@ -116,16 +105,11 @@ public class GlobalFunctionMgr extends MetaObject implements GsonPostProcessable
 
     public synchronized void replayDropFunction(FunctionSearchDesc functionSearchDesc) {
         try {
-            FunctionUtil.dropFunctionImpl(functionSearchDesc, false, name2Function);
+            FunctionUtil.dropFunctionImpl(functionSearchDesc, true, name2Function);
             FunctionUtil.dropFromNereids(null, functionSearchDesc);
         } catch (UserException e) {
             throw new RuntimeException(e);
         }
-    }
-
-
-    public synchronized Function getFunction(Function desc, Function.CompareMode mode) {
-        return FunctionUtil.getFunction(desc, mode, name2Function);
     }
 
     public synchronized Function getFunction(FunctionSearchDesc function) throws AnalysisException {

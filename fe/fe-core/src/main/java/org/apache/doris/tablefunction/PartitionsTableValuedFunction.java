@@ -44,7 +44,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -55,7 +55,7 @@ import java.util.Optional;
 
 /**
  * The Implement of table valued function
- * partitions("database" = "db1","table" = "table1").
+ * partitions("catalog"="ctl1", "database" = "db1","table" = "table1").
  */
 public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
     private static final Logger LOG = LogManager.getLogger(PartitionsTableValuedFunction.class);
@@ -140,7 +140,7 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
             // check ctl, db, tbl
             validParams.put(key.toLowerCase(), params.get(key));
         }
-        String catalogName = validParams.get(CATALOG);
+        String catalogName = validParams.getOrDefault(CATALOG, InternalCatalog.INTERNAL_CATALOG_NAME);
         String dbName = validParams.get(DB);
         String tableName = validParams.get(TABLE);
         if (StringUtils.isEmpty(catalogName) || StringUtils.isEmpty(dbName) || StringUtils.isEmpty(tableName)) {
@@ -156,6 +156,10 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
     }
 
     private void analyze(String catalogName, String dbName, String tableName) {
+        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+        if (catalog == null) {
+            throw new AnalysisException("can not find catalog: " + catalogName);
+        }
         if (!Env.getCurrentEnv().getAccessManager()
                 .checkTblPriv(ConnectContext.get(), catalogName, dbName,
                         tableName, PrivPredicate.SHOW)) {
@@ -163,10 +167,6 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
                     ConnectContext.get().getQualifiedUser(), ConnectContext.get().getRemoteIP(),
                     catalogName + ": " + dbName + ": " + tableName);
             throw new AnalysisException(message);
-        }
-        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
-        if (catalog == null) {
-            throw new AnalysisException("can not find catalog: " + catalogName);
         }
         // disallow unsupported catalog
         if (!(catalog.isInternalCatalog() || catalog instanceof HMSExternalCatalog
@@ -210,7 +210,7 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
     }
 
     @Override
-    public TMetaScanRange getMetaScanRange() {
+    public TMetaScanRange getMetaScanRange(List<String> requiredFileds) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("getMetaScanRange() start");
         }

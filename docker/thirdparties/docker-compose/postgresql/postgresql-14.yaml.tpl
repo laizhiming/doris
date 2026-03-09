@@ -25,21 +25,41 @@ services:
       POSTGRES_PASSWORD: 123456
     ports:
       - ${DOCKER_PG_14_EXTERNAL_PORT}:5432
+    entrypoint:
+      - bash
+      - -c
+      - |
+        chmod 600 /var/lib/postgresql/certs/server.key
+        chmod 644 /var/lib/postgresql/certs/server.crt
+        chmod 644 /var/lib/postgresql/certs/root.crt
+        chown postgres:postgres /var/lib/postgresql/certs/*
+        exec docker-entrypoint.sh "$@"
+      - --      
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=30"
+      - "-c"
+      - "max_replication_slots=30"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_cert_file=/var/lib/postgresql/certs/server.crt"
+      - "-c"
+      - "ssl_key_file=/var/lib/postgresql/certs/server.key"
+      - "-c"
+      - "ssl_ca_file=/var/lib/postgresql/certs/root.crt"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT 1 FROM doris_test.deadline;'" ]
       interval: 5s
       timeout: 60s
       retries: 120
     volumes:
       - ./data/data/:/var/lib/postgresql/data/
       - ./init:/docker-entrypoint-initdb.d
-    networks:
-      - doris--postgres
-  doris--postgres--hello-world:
-    image: hello-world
-    depends_on:
-      doris--postgres:
-        condition: service_healthy
+      - ./certs:/var/lib/postgresql/certs
     networks:
       - doris--postgres
 

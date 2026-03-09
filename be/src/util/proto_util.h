@@ -22,10 +22,10 @@
 
 #include "common/config.h"
 #include "common/status.h"
-#include "network_util.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
 #include "util/brpc_client_cache.h"
+#include "util/network_util.h"
 
 namespace doris {
 
@@ -59,10 +59,10 @@ inline bool enable_http_send_block(const PTransmitDataParams& request) {
 }
 
 template <typename Closure>
-void transmit_blockv2(PBackendService_Stub& stub, std::unique_ptr<Closure> closure) {
+void transmit_blockv2(PBackendService_Stub* stub, std::unique_ptr<Closure> closure) {
     closure->cntl_->http_request().Clear();
-    stub.transmit_block(closure->cntl_.get(), closure->request_.get(), closure->response_.get(),
-                        closure.get());
+    stub->transmit_block(closure->cntl_.get(), closure->request_.get(), closure->response_.get(),
+                         closure.get());
     closure.release();
 }
 
@@ -71,11 +71,26 @@ Status transmit_block_httpv2(ExecEnv* exec_env, std::unique_ptr<Closure> closure
                              TNetworkAddress brpc_dest_addr) {
     RETURN_IF_ERROR(request_embed_attachment_contain_blockv2(closure->request_.get(), closure));
 
+    std::string host = brpc_dest_addr.hostname;
+    auto dns_cache = ExecEnv::GetInstance()->dns_cache();
+    if (dns_cache == nullptr) {
+        LOG(WARNING) << "DNS cache is not initialized, skipping hostname resolve";
+    } else if (!is_valid_ip(brpc_dest_addr.hostname)) {
+        Status status = dns_cache->get(brpc_dest_addr.hostname, &host);
+        if (!status.ok()) {
+            LOG(WARNING) << "failed to get ip from host " << brpc_dest_addr.hostname << ": "
+                         << status.to_string();
+            return Status::InternalError("failed to get ip from host {}", brpc_dest_addr.hostname);
+        }
+    }
     //format an ipv6 address
     std::string brpc_url = get_brpc_http_url(brpc_dest_addr.hostname, brpc_dest_addr.port);
 
     std::shared_ptr<PBackendService_Stub> brpc_http_stub =
             exec_env->brpc_internal_client_cache()->get_new_client_no_cache(brpc_url, "http");
+    if (brpc_http_stub == nullptr) {
+        return Status::InternalError("failed to open brpc http client to {}", brpc_url);
+    }
     closure->cntl_->http_request().uri() =
             brpc_url + "/PInternalServiceImpl/transmit_block_by_http";
     closure->cntl_->http_request().set_method(brpc::HTTP_METHOD_POST);
@@ -120,16 +135,13 @@ Status request_embed_attachmentv2(Params* brpc_request, const std::string& data,
 // Extract the brpc request and block from the controller attachment,
 // and put the block into the request.
 template <typename Params>
-Status attachment_extract_request_contain_block(const Params* brpc_request,
-                                                brpc::Controller* cntl) {
-    Params* req = const_cast<Params*>(brpc_request);
-    auto block = req->mutable_block();
-    return attachment_extract_request(req, cntl, block->mutable_column_values());
+Status attachment_extract_request_contain_block(Params* brpc_request, brpc::Controller* cntl) {
+    auto block = brpc_request->mutable_block();
+    return attachment_extract_request(brpc_request, cntl, block->mutable_column_values());
 }
 
 template <typename Params>
-Status attachment_extract_request(const Params* brpc_request, brpc::Controller* cntl,
-                                  std::string* data) {
+Status attachment_extract_request(Params* brpc_request, brpc::Controller* cntl, std::string* data) {
     const butil::IOBuf& io_buf = cntl->request_attachment();
 
     // step1: deserialize request string to brpc_request from attachment.
@@ -137,8 +149,7 @@ Status attachment_extract_request(const Params* brpc_request, brpc::Controller* 
     io_buf.copy_to(&req_str_size, sizeof(req_str_size), 0);
     std::string req_str;
     io_buf.copy_to(&req_str, req_str_size, sizeof(req_str_size));
-    Params* req = const_cast<Params*>(brpc_request);
-    req->ParseFromString(req_str);
+    brpc_request->ParseFromString(req_str);
 
     // step2: extract data from attachment.
     int64_t data_size;

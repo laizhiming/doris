@@ -56,7 +56,7 @@ public class Properties extends Expression implements LeafExpression {
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return getMap()
                 .entrySet()
                 .stream()
@@ -67,6 +67,11 @@ public class Properties extends Expression implements LeafExpression {
     @Override
     public String toString() {
         return "Properties(" + toSql() + ")";
+    }
+
+    @Override
+    public String toDigest() {
+        return "?";
     }
 
     @Override
@@ -85,8 +90,8 @@ public class Properties extends Expression implements LeafExpression {
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(super.hashCode(), keyValues);
+    public int computeHashCode() {
+        return Objects.hash(super.computeHashCode(), keyValues);
     }
 
     @Override

@@ -18,13 +18,15 @@
 package org.apache.doris.mysql;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
+import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ConnectContextUtil;
 
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
@@ -32,6 +34,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Optional;
 
 // MySQL protocol util
 public class MysqlProto {
@@ -57,7 +60,6 @@ public class MysqlProto {
             tmpUser = strList[0];
         }
 
-        context.setQualifiedUser(tmpUser);
         return tmpUser;
     }
 
@@ -91,6 +93,7 @@ public class MysqlProto {
         serializer.reset();
         MysqlHandshakePacket handshakePacket = new MysqlHandshakePacket(context.getConnectionId());
         handshakePacket.writeTo(serializer);
+        context.setMysqlHandshakePacket(handshakePacket);
         try {
             channel.sendAndFlush(serializer.toByteBuffer());
         } catch (IOException e) {
@@ -168,6 +171,12 @@ public class MysqlProto {
         if (capability.isDeprecatedEOF()) {
             context.getMysqlChannel().setClientDeprecatedEOF();
         }
+
+        // we do not save client capability to context, so here we save CLIENT_MULTI_STATEMENTS to MysqlChannel
+        if (capability.isClientMultiStatements()) {
+            context.getMysqlChannel().setClientMultiStatements();
+        }
+
         MysqlAuthPacket authPacket = new MysqlAuthPacket();
         if (!authPacket.readFrom(handshakeResponse)) {
             ErrorReport.report(ErrorCode.ERR_NOT_SUPPORTED_AUTH_MODE);
@@ -199,65 +208,34 @@ public class MysqlProto {
             return false;
         }
 
+        // try to change catalog, if default_init_catalog inside user property is not 'internal'
+        try {
+            String userInitCatalog = Env.getCurrentEnv().getAuth().getInitCatalog(context.getQualifiedUser());
+            if (userInitCatalog != null && !userInitCatalog.equals(InternalCatalog.INTERNAL_CATALOG_NAME)) {
+                CatalogIf catalogIf = context.getEnv().getCatalogMgr().getCatalog(userInitCatalog);
+                if (catalogIf != null) {
+                    context.getEnv().changeCatalog(context, userInitCatalog);
+                }
+            }
+        } catch (DdlException e) {
+            context.getState().setError(e.getMysqlErrorCode(), e.getMessage());
+            sendResponsePacket(context);
+            return false;
+        }
+
         // set database
         String db = authPacket.getDb();
         if (!Strings.isNullOrEmpty(db)) {
-            String catalogName = null;
-            String dbName = null;
-            String[] dbNames = db.split("\\.");
-            if (dbNames.length == 1) {
-                dbName = db;
-            } else if (dbNames.length == 2) {
-                catalogName = dbNames[0];
-                dbName = dbNames[1];
-            } else if (dbNames.length > 2) {
-                context.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "Only one dot can be in the name: " + db);
-                return false;
-            }
-
-            // mysql -d
-            if (Config.isCloudMode()) {
-                try {
-                    dbName = ((CloudEnv) Env.getCurrentEnv()).analyzeCloudCluster(dbName, context);
-                } catch (DdlException e) {
-                    context.getState().setError(e.getMysqlErrorCode(), e.getMessage());
-                    sendResponsePacket(context);
-                    return false;
-                }
-
-                if (dbName == null || dbName.isEmpty()) {
-                    return true;
-                }
-            }
-
-            String dbFullName = dbName;
-
-            // check catalog and db exists
-            if (catalogName != null) {
-                CatalogIf catalogIf = context.getEnv().getCatalogMgr().getCatalog(catalogName);
-                if (catalogIf == null) {
-                    context.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "No match catalog in doris: " + db);
-                    return false;
-                }
-                if (catalogIf.getDbNullable(dbFullName) == null) {
-                    context.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "No match database in doris: " + db);
-                    return false;
-                }
-            }
-            try {
-                if (catalogName != null) {
-                    context.getEnv().changeCatalog(context, catalogName);
-                }
-                Env.getCurrentEnv().changeDb(context, dbFullName);
-            } catch (DdlException e) {
-                context.getState().setError(e.getMysqlErrorCode(), e.getMessage());
+            Optional<Pair<ErrorCode, String>> res = ConnectContextUtil.initCatalogAndDb(context, db);
+            if (res.isPresent()) {
+                context.getState().setError(res.get().first, res.get().second);
                 sendResponsePacket(context);
                 return false;
             }
         }
 
         // set resource tag if has
-        context.setResourceTags(Env.getCurrentEnv().getAuth().getResourceTags(qualifiedUser));
+        context.setComputeGroup(Env.getCurrentEnv().getAuth().getComputeGroup(qualifiedUser));
         return true;
     }
 

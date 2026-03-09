@@ -27,7 +27,12 @@ suite("test_outfile_csv_with_names_and_types") {
     sql "USE $dbName"
     StringBuilder strBuilder = new StringBuilder()
     strBuilder.append("curl --location-trusted -u " + context.config.jdbcUser + ":" + context.config.jdbcPassword)
-    strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    if ((context.config.otherConfigs.get("enableTLS")?.toString()?.equalsIgnoreCase("true")) ?: false) {
+        strBuilder.append(" https://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+        strBuilder.append(" --cert " + context.config.otherConfigs.get("trustCert") + " --cacert " + context.config.otherConfigs.get("trustCACert") + " --key " + context.config.otherConfigs.get("trustCAKey"))
+    } else {
+        strBuilder.append(" http://" + context.config.feHttpAddress + "/rest/v1/config/fe")
+    }
 
     String command = strBuilder.toString()
     def process = command.toString().execute()
@@ -115,10 +120,18 @@ suite("test_outfile_csv_with_names_and_types") {
 
         // check column names
         String columnNames = """user_id,date,datetime,date_1,datetime_1,datetime_2,datetime_3,city,age,sex,bool_col,int_col,bigint_col,largeint_col,float_col,double_col,char_col,decimal_col,ipv4_col,ipv6_col"""
-        String columnTypes = """INT,DATEV2,DATETIMEV2,DATEV2,DATETIMEV2,DATETIMEV2,DATETIMEV2,VARCHAR,SMALLINT,TINYINT,BOOL,INT,BIGINT,INT,FLOAT,DOUBLE,CHAR,DECIMAL128I,IPV4,IPV6"""
+        String[] columnTypes = ["INT","DATEV2","DATETIMEV2","DATEV2","DATETIMEV2","DATETIMEV2","DATETIMEV2","VARCHAR","SMALLINT","TINYINT","BOOL","INT","BIGINT","INT","FLOAT","DOUBLE","CHAR","DECIMAL128I","IPV4","IPV6"]
         List<String> outLines = Files.readAllLines(Paths.get(files[0].getAbsolutePath()), StandardCharsets.UTF_8);
         assertEquals(columnNames, outLines.get(0))
-        assertEquals(columnTypes, outLines.get(1))
+        // check type
+        String[] splitType = outLines.get(1).split(",");
+        for (int j = 0; j < columnTypes.length; ++j) {
+            if (j == 16) {
+                assertTrue("CHAR".equals(splitType[j]) || "VARCHAR".equals(splitType[j]))
+            } else {
+                assertEquals(columnTypes[j], splitType[j])
+            }
+        }
 
         // check data correctness
         sql """ DROP TABLE IF EXISTS ${tableName2} """

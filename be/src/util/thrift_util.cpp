@@ -28,8 +28,8 @@
 
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/logging.h"
-#include "exec/tablet_info.h"
-#include "olap/tablet_schema.h"
+#include "storage/tablet/tablet_schema.h"
+#include "storage/tablet_info.h"
 #include "util/thrift_server.h"
 
 namespace apache::thrift::protocol {
@@ -156,7 +156,7 @@ std::string to_string(const TUniqueId& id) {
     return std::to_string(id.hi).append(std::to_string(id.lo));
 }
 
-bool _has_inverted_index_or_partial_update(TOlapTableSink sink) {
+bool _has_inverted_index_v1_or_partial_update(TOlapTableSink sink) {
     OlapTableSchemaParam schema;
     if (!schema.init(sink.schema).ok()) {
         return false;
@@ -167,7 +167,12 @@ bool _has_inverted_index_or_partial_update(TOlapTableSink sink) {
     for (const auto& index_schema : schema.indexes()) {
         for (const auto& index : index_schema->indexes) {
             if (index->index_type() == INVERTED) {
-                return true;
+                if (sink.schema.inverted_index_file_storage_format ==
+                    TInvertedIndexFileStorageFormat::V1) {
+                    return true;
+                } else {
+                    return false;
+                }
             }
         }
     }

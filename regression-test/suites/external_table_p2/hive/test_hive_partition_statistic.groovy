@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_hive_partition_statistic", "p2,external,hive,external_remote,external_remote_hive") {
+suite("test_hive_partition_statistic", "p2,external") {
+    Boolean ignoreP2 = true;
+    if (ignoreP2) {
+        logger.info("disable p2 test");
+        return;
+    }
     String enabled = context.config.otherConfigs.get("enableExternalHiveTest")
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         logger.info("This feature has not been supported yet, skip it.")

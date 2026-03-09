@@ -17,12 +17,16 @@
 
 #pragma once
 
+#include <gen_cpp/MasterService_types.h>
+#include <gen_cpp/Types_types.h>
+
 #include <functional>
 #include <memory>
 #include <vector>
 
 #include "common/status.h"
-#include "olap/olap_common.h"
+#include "storage/olap_common.h"
+#include "storage/tablet/tablet_fwd.h"
 
 namespace doris {
 
@@ -30,6 +34,9 @@ class CloudTablet;
 class CloudStorageEngine;
 class LRUCachePolicy;
 class CountDownLatch;
+struct SyncRowsetStats;
+
+extern uint64_t g_tablet_report_inactive_duration_ms;
 
 class CloudTabletMgr {
 public:
@@ -38,7 +45,22 @@ public:
 
     // If the tablet is in cache, return this tablet directly; otherwise will get tablet meta first,
     // sync rowsets after, and download segment data in background if `warmup_data` is true.
-    Result<std::shared_ptr<CloudTablet>> get_tablet(int64_t tablet_id, bool warmup_data = false);
+    /* Parameters:
+     * - tablet_id: the id of tablet to get
+     * - warmup_data: whether warmup tablet data in background
+     * - sync_delete_bitmap: whether sync delete bitmap when getting tablet
+     * - sync_stats: the stats of sync rowset
+     * - force_use_only_cached: whether only use cached tablet meta
+     * - cache_on_miss: whether cache the tablet meta when missing in cache
+     */
+    Result<std::shared_ptr<CloudTablet>> get_tablet(int64_t tablet_id, bool warmup_data = false,
+                                                    bool sync_delete_bitmap = true,
+                                                    SyncRowsetStats* sync_stats = nullptr,
+                                                    bool force_use_only_cached = false,
+                                                    bool cache_on_miss = true);
+
+    // Return true if cached tablet meta is found (without triggering RPC) and filled.
+    bool peek_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* tablet_meta);
 
     void erase_tablet(int64_t tablet_id);
 
@@ -64,6 +86,25 @@ public:
                                        const std::function<bool(CloudTablet*)>& filter_out,
                                        std::vector<std::shared_ptr<CloudTablet>>* tablets,
                                        int64_t* max_score);
+
+    /**
+     * Gets tablets info and total tablet num that are reported
+     *
+     * @param tablets_info used by report
+     * @param tablet_num tablets in be tabletMgr, total num
+     */
+    void build_all_report_tablets_info(std::map<TTabletId, TTablet>* tablets_info,
+                                       uint64_t* tablet_num);
+
+    void get_tablet_info(int64_t num_tablets, std::vector<TabletInfo>* tablets_info);
+
+    void get_topn_tablet_delete_bitmap_score(uint64_t* max_delete_bitmap_score,
+                                             uint64_t* max_base_rowset_delete_bitmap_score);
+
+    std::vector<std::shared_ptr<CloudTablet>> get_all_tablet();
+
+    // **ATTN: JUST FOR UT**
+    void put_tablet_for_UT(std::shared_ptr<CloudTablet> tablet);
 
 private:
     CloudStorageEngine& _engine;

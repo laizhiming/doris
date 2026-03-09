@@ -20,15 +20,24 @@
 
 #pragma once
 
+#include <gen_cpp/internal_service.pb.h>
+
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/status.h"
 #include "io/cache/block_file_cache.h"
 #include "io/cache/file_cache_common.h"
+#include "storage/options.h"
 namespace doris {
 class TUniqueId;
+
+namespace vectorized {
+class Block;
+} // namespace vectorized
 
 namespace io {
 
@@ -42,11 +51,14 @@ public:
     Status create_file_cache(const std::string& cache_base_path,
                              FileCacheSettings file_cache_settings);
 
+    Status reload_file_cache(const std::vector<CachePath>& cache_base_paths);
+
     size_t try_release();
 
     size_t try_release(const std::string& base_path);
 
-    const std::string& get_cache_path() {
+    std::string_view pick_one_cache_path() {
+        DCHECK(!_caches.empty());
         size_t cur_index = _next_index.fetch_add(1);
         return _caches[cur_index % _caches.size()]->get_base_path();
     }
@@ -55,10 +67,18 @@ public:
 
     [[nodiscard]] size_t get_cache_instance_size() const { return _caches.size(); }
 
+    std::vector<std::string> get_cache_file_by_path(const UInt128Wrapper& hash);
+    int64_t get_cache_file_size_by_path(const UInt128Wrapper& hash);
+
+    // Return cached blocks data for a given key hash
+    std::vector<doris::CacheBlockPB> get_cache_data_by_path(const UInt128Wrapper& hash);
+    // Convenience overload: compute hash from path and return cached blocks data
+    std::vector<doris::CacheBlockPB> get_cache_data_by_path(const std::string& path);
+
     BlockFileCache* get_by_path(const UInt128Wrapper& hash);
     BlockFileCache* get_by_path(const std::string& cache_base_path);
     std::vector<BlockFileCache::QueryFileCacheContextHolderPtr> get_query_context_holders(
-            const TUniqueId& query_id);
+            const TUniqueId& query_id, int file_cache_query_limit_percent);
 
     /**
      * Clears data of all file cache instances
@@ -68,7 +88,26 @@ public:
      */
     std::string clear_file_caches(bool sync);
 
+    /**
+     * dump lru queue info for all file cache instances
+     */
+    void dump_all_caches();
+
     std::vector<std::string> get_base_paths();
+
+    /**
+     * Clears data of all file cache instances
+     *
+     * @param path file cache absolute path
+     * @param new_capacity
+     * @return summary message
+     */
+    std::string reset_capacity(const std::string& path, int64_t new_capacity);
+
+    void get_cache_stats_block(vectorized::Block* block);
+
+    // Get all cache instances for inspection
+    const std::vector<std::unique_ptr<BlockFileCache>>& get_caches() const { return _caches; }
 
     FileCacheFactory() = default;
     FileCacheFactory& operator=(const FileCacheFactory&) = delete;

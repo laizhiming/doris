@@ -17,41 +17,51 @@
 
 package org.apache.doris.nereids.trees.plans.logical;
 
+import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.DataTrait;
-import org.apache.doris.nereids.properties.FdItem;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.plans.DiffOutputInAsterisk;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.nereids.util.LazyCompute;
 import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * The node of logical plan for sub query and alias
  *
  * @param <CHILD_TYPE> param
  */
-public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE> {
+public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE>
+        implements DiffOutputInAsterisk {
 
     protected RelationId relationId;
     private final List<String> qualifier;
     private final Optional<List<String>> columnAliases;
+    // AnalyzeCTE will check this flag to deal with recursive and normal CTE respectively
+    private final Supplier<Boolean> isRecursiveCte;
 
     public LogicalSubQueryAlias(String tableAlias, CHILD_TYPE child) {
         this(ImmutableList.of(tableAlias), Optional.empty(), Optional.empty(), Optional.empty(), child);
@@ -75,11 +85,21 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         super(PlanType.LOGICAL_SUBQUERY_ALIAS, groupExpression, logicalProperties, child);
         this.qualifier = ImmutableList.copyOf(Objects.requireNonNull(qualifier, "qualifier is null"));
         this.columnAliases = columnAliases;
+        this.isRecursiveCte = computeIsRecursiveCte();
     }
 
     @Override
     public List<Slot> computeOutput() {
-        List<Slot> childOutput = child().getOutput();
+        return computeOutputInternal(false);
+    }
+
+    @Override
+    public List<Slot> computeAsteriskOutput() {
+        return computeOutputInternal(true);
+    }
+
+    private List<Slot> computeOutputInternal(boolean asteriskOutput) {
+        List<Slot> childOutput = asteriskOutput ? child().getAsteriskOutput() : child().getOutput();
         List<String> columnAliases = this.columnAliases.orElseGet(ImmutableList::of);
         ImmutableList.Builder<Slot> currentOutput = ImmutableList.builder();
         for (int i = 0; i < childOutput.size(); i++) {
@@ -90,12 +110,68 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
             } else {
                 columnAlias = originSlot.getName();
             }
+            List<String> originQualifier = originSlot.getQualifier();
+
+            ArrayList<String> newQualifier = Lists.newArrayList(originQualifier);
+            if (newQualifier.size() >= qualifier.size()) {
+                for (int j = 0; j < qualifier.size(); j++) {
+                    newQualifier.set(newQualifier.size() - qualifier.size() + j, qualifier.get(j));
+                }
+            } else if (newQualifier.isEmpty()) {
+                newQualifier.addAll(qualifier);
+            }
+
             Slot qualified = originSlot
-                    .withQualifier(qualifier)
+                    .withQualifier(newQualifier)
                     .withName(columnAlias);
             currentOutput.add(qualified);
         }
         return currentOutput.build();
+    }
+
+    private Supplier<Boolean> computeIsRecursiveCte() {
+        return LazyCompute.of(() -> {
+            // we need check if any relation's name is same as alias query to know if it's recursive cte first
+            // so in later AnalyzeCTE, we could deal with recursive cte and normal cte separately
+            // it's a little ugly, maybe we can find a better way in future
+            List<UnboundRelation> relationList = new ArrayList<>(8);
+            collectRelationsInCurrentCte(this, relationList);
+            for (UnboundRelation relation : relationList) {
+                List<String> nameParts = relation.getNameParts();
+                if (nameParts.size() == 1) {
+                    String aliasName = getAlias();
+                    String tablename = nameParts.get(0);
+                    int lctNames = 0;
+                    ConnectContext ctx = ConnectContext.get();
+                    if (ctx != null && ctx.getCurrentCatalog() != null) {
+                        lctNames = ctx.getCurrentCatalog().getLowerCaseTableNames();
+                    }
+                    if (lctNames != 0) {
+                        aliasName = aliasName.toLowerCase(Locale.ROOT);
+                        tablename = tablename.toLowerCase(Locale.ROOT);
+                    }
+                    if (aliasName.equals(tablename)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        });
+    }
+
+    void collectRelationsInCurrentCte(Plan plan, List<UnboundRelation> relationList) {
+        for (Plan child : plan.children()) {
+            if (child instanceof UnboundRelation) {
+                relationList.add((UnboundRelation) child);
+            }
+            if (!(child instanceof LogicalCTE)) {
+                collectRelationsInCurrentCte(child, relationList);
+            }
+        }
+    }
+
+    public boolean isRecursiveCte() {
+        return isRecursiveCte.get();
     }
 
     public String getAlias() {
@@ -117,6 +193,18 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
     }
 
     @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("(").append(child().toDigest()).append(") AS ");
+        sb.append(qualifier.get(0));
+        if (columnAliases.isPresent()) {
+            columnAliases.get().stream()
+                    .collect(Collectors.joining(", ", "(", ")"));
+        }
+        return sb.toString();
+    }
+
+    @Override
     public boolean equals(Object o) {
         if (this == o) {
             return true;
@@ -124,8 +212,8 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        LogicalSubQueryAlias that = (LogicalSubQueryAlias) o;
-        return qualifier.equals(that.qualifier) && this.child().equals(that.child());
+        LogicalSubQueryAlias<?> that = (LogicalSubQueryAlias) o;
+        return qualifier.equals(that.qualifier);
     }
 
     @Override
@@ -171,7 +259,7 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         for (int i = 0; i < outputs.size(); i++) {
             replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
         }
-        builder.replace(replaceMap);
+        builder.replaceUniqueBy(replaceMap);
     }
 
     @Override
@@ -182,13 +270,7 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         for (int i = 0; i < outputs.size(); i++) {
             replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
         }
-        builder.replace(replaceMap);
-    }
-
-    @Override
-    public ImmutableSet<FdItem> computeFdItems() {
-        // TODO: inherit from child with replaceMap
-        return ImmutableSet.of();
+        builder.replaceUniformBy(replaceMap);
     }
 
     @Override
@@ -199,12 +281,18 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         for (int i = 0; i < outputs.size(); i++) {
             replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
         }
-        builder.replace(replaceMap);
+        builder.replaceEqualSetBy(replaceMap);
     }
 
     @Override
     public void computeFd(DataTrait.Builder builder) {
         builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> outputs = getOutput();
+        for (int i = 0; i < outputs.size(); i++) {
+            replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
+        }
+        builder.replaceFuncDepsBy(replaceMap);
     }
 
     public void setRelationId(RelationId relationId) {

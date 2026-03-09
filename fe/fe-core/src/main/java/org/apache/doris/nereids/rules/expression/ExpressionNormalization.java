@@ -18,18 +18,27 @@
 package org.apache.doris.nereids.rules.expression;
 
 import org.apache.doris.nereids.rules.expression.check.CheckCast;
+import org.apache.doris.nereids.rules.expression.rules.ConcatWsMultiArrayToOne;
 import org.apache.doris.nereids.rules.expression.rules.ConvertAggStateCast;
 import org.apache.doris.nereids.rules.expression.rules.DigitalMaskingConvert;
 import org.apache.doris.nereids.rules.expression.rules.FoldConstantRule;
 import org.apache.doris.nereids.rules.expression.rules.InPredicateDedup;
+import org.apache.doris.nereids.rules.expression.rules.InPredicateExtractNonConstant;
 import org.apache.doris.nereids.rules.expression.rules.InPredicateToEqualToRule;
+import org.apache.doris.nereids.rules.expression.rules.LogToLn;
+import org.apache.doris.nereids.rules.expression.rules.MedianConvert;
 import org.apache.doris.nereids.rules.expression.rules.MergeDateTrunc;
 import org.apache.doris.nereids.rules.expression.rules.NormalizeBinaryPredicatesRule;
+import org.apache.doris.nereids.rules.expression.rules.NormalizeStructElement;
+import org.apache.doris.nereids.rules.expression.rules.RewriteDefaultExpression;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyArithmeticComparisonRule;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyArithmeticRule;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyCastRule;
+import org.apache.doris.nereids.rules.expression.rules.SimplifyEqualBooleanLiteral;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyNotExprRule;
 import org.apache.doris.nereids.rules.expression.rules.SupportJavaDateFormatter;
+import org.apache.doris.nereids.rules.expression.rules.TimestampToAddTime;
+import org.apache.doris.nereids.trees.expressions.Expression;
 
 import com.google.common.collect.ImmutableList;
 
@@ -41,25 +50,42 @@ import java.util.List;
 public class ExpressionNormalization extends ExpressionRewrite {
     // we should run supportJavaDateFormatter before foldConstantRule or be will fold
     // from_unixtime(timestamp, 'yyyyMMdd') to 'yyyyMMdd'
-    public static final List<ExpressionRewriteRule> NORMALIZE_REWRITE_RULES = ImmutableList.of(
+    // specically note: LogToLn, ConcatWsMultiArrayToOne and TimestampToAddTime must before FoldConstantRule,
+    // otherwise log will core when input single argument like log(100), and concat_ws will return a wrong result
+    // when input multi array
+    public static final List<ExpressionRewriteRule<ExpressionRewriteContext>> NORMALIZE_REWRITE_RULES
+                = ImmutableList.of(
             bottomUp(
+                RewriteDefaultExpression.INSTANCE,
                 SupportJavaDateFormatter.INSTANCE,
                 NormalizeBinaryPredicatesRule.INSTANCE,
                 InPredicateDedup.INSTANCE,
+                InPredicateExtractNonConstant.INSTANCE,
                 InPredicateToEqualToRule.INSTANCE,
                 SimplifyNotExprRule.INSTANCE,
                 SimplifyArithmeticRule.INSTANCE,
+                LogToLn.INSTANCE,
+                ConcatWsMultiArrayToOne.INSTANCE,
+                TimestampToAddTime.INSTANCE,
                 FoldConstantRule.INSTANCE,
                 SimplifyCastRule.INSTANCE,
                 DigitalMaskingConvert.INSTANCE,
+                MedianConvert.INSTANCE,
                 SimplifyArithmeticComparisonRule.INSTANCE,
                 ConvertAggStateCast.INSTANCE,
                 MergeDateTrunc.INSTANCE,
-                CheckCast.INSTANCE
+                NormalizeStructElement.INSTANCE,
+                CheckCast.INSTANCE,
+                SimplifyEqualBooleanLiteral.INSTANCE
             )
     );
 
     public ExpressionNormalization() {
         super(new ExpressionRuleExecutor(NORMALIZE_REWRITE_RULES));
+    }
+
+    @Override
+    public Expression rewrite(Expression expression, ExpressionRewriteContext expressionRewriteContext) {
+        return super.rewrite(expression, expressionRewriteContext);
     }
 }

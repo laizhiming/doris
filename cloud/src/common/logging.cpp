@@ -22,6 +22,7 @@
 #include <glog/logging.h>
 #include <glog/vlog_is_on.h>
 
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 
@@ -72,6 +73,86 @@ void AnnotateTag::format_tag_list(std::ostream& stream) {
     }
 }
 
+void custom_prefix(std::ostream& s, const google::LogMessageInfo& l, void*) {
+    // Add prefix "RuntimeLogger ".
+    s << "RuntimeLogger ";
+    // Same as in fe.log
+    // The following is same as default log format. eg:
+    // I20240605 15:25:15.677153 1763151 meta_service_txn.cpp:481] msg...
+    s << l.severity[0];
+    s << std::setw(4) << 1900 + l.time.year();
+    s << std::setw(2) << 1 + l.time.month();
+    s << std::setw(2) << l.time.day();
+    s << ' ';
+    s << std::setw(2) << l.time.hour() << ':';
+    s << std::setw(2) << l.time.min() << ':';
+    s << std::setw(2) << l.time.sec() << ".";
+    s << std::setw(6) << l.time.usec();
+    s << ' ';
+    s << std::setfill(' ') << std::setw(5);
+    s << l.thread_id << std::setfill('0');
+    s << ' ';
+    s << l.filename << ':' << l.line_number << "]";
+}
+
+// Implement the custom log format for stdout output in K8S environment
+// Format: I20240605 15:25:15.677153 1763151 meta_service_txn.cpp:481] msg...
+struct StdoutLogSink : google::LogSink {
+    void send(google::LogSeverity severity, const char* /*full_filename*/,
+              const char* base_filename, int line, const google::LogMessageTime& time,
+              const char* message, std::size_t message_len) override {
+        // Convert log severity to corresponding character (I/W/E/F)
+        char severity_char;
+        switch (severity) {
+        case google::GLOG_INFO:
+            severity_char = 'I';
+            break;
+        case google::GLOG_WARNING:
+            severity_char = 'W';
+            break;
+        case google::GLOG_ERROR:
+            severity_char = 'E';
+            break;
+        case google::GLOG_FATAL:
+            severity_char = 'F';
+            break;
+        default:
+            severity_char = '?';
+            break;
+        }
+
+        // Set output formatting flags
+        std::cout << std::setfill('0');
+
+        // 1. Log severity (I/W/E/F)
+        std::cout << severity_char;
+
+        // 2. Date (YYYYMMDD)
+        // Note: tm_year is years since 1900, tm_mon is 0-based (0-11)
+        std::cout << std::setw(4) << (time.year() + 1900) << std::setw(2) << std::setfill('0')
+                  << (time.month() + 1) << std::setw(2) << std::setfill('0') << time.day();
+
+        // 3. Time (HH:MM:SS.ffffff)
+        std::cout << " " << std::setw(2) << std::setfill('0') << time.hour() << ":" << std::setw(2)
+                  << std::setfill('0') << time.min() << ":" << std::setw(2) << std::setfill('0')
+                  << time.sec() << "." << std::setw(6) << std::setfill('0') << time.usec();
+
+        // 4. Thread ID
+        std::cout << " " << std::setfill(' ') << std::setw(5) << getpid() << std::setfill('0');
+
+        // 5. Filename and line number
+        std::cout << " " << base_filename << ":" << line << "] ";
+
+        // 6. Log message
+        std::cout.write(message, message_len);
+
+        // Add newline and flush
+        std::cout << std::endl;
+    }
+};
+
+static StdoutLogSink stdout_log_sink;
+
 /**
  * @param basename the basename of log file
  * @return true for success
@@ -82,10 +163,23 @@ bool init_glog(const char* basename) {
     std::lock_guard<std::mutex> logging_lock(mtx);
     if (inited) return true;
 
-    FLAGS_alsologtostderr = false;
+    bool log_to_console = (getenv("DORIS_LOG_TO_STDERR") != nullptr);
+    if (log_to_console) {
+        if (config::enable_file_logger) {
+            // will output log to log file and output log to stdout
+            google::AddLogSink(&stdout_log_sink);
+        } else {
+            // enable_file_logger is false, will only output log to stdout
+            // Not output to stderr because doris_cloud.out will output log to stderr
+            FLAGS_logtostdout = true;
+        }
+    } else {
+        FLAGS_alsologtostderr = false;
+    }
+
     // Don't log to stderr except fatal level
-    // so fatal log can output to be.out .
-    FLAGS_stderrthreshold = google::ERROR;
+    // so fatal log can output to doris_cloud.out .
+    FLAGS_stderrthreshold = google::FATAL;
 
     // Set glog log dir
     FLAGS_log_dir = config::log_dir;
@@ -128,7 +222,12 @@ bool init_glog(const char* basename) {
         if (i.empty()) continue;
         google::SetVLOGLevel(i.c_str(), config::log_verbose_level);
     }
-    google::InitGoogleLogging(basename);
+    if (log_to_console) {
+        // Only add prefix if log output to stderr
+        google::InitGoogleLogging(basename, &custom_prefix);
+    } else {
+        google::InitGoogleLogging(basename);
+    }
     inited = true;
     return true;
 }

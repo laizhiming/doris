@@ -17,20 +17,24 @@
 
 #pragma once
 
+#ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 #include <unistd.h>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
+#include "core/string_ref.h"
 #include "util/simd/lower_upper_impl.h"
 #include "util/sse_util.hpp"
-#include "vec/common/string_ref.h"
 
 namespace doris {
 
-static constexpr std::array<uint8, 256> UTF8_BYTE_LENGTH = {
+static constexpr std::array<uint8_t, 256> UTF8_BYTE_LENGTH = {
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -91,6 +95,20 @@ inline bool validate_ascii_fast_avx(const char* src, size_t len) {
 
     return !error_mask;
 }
+#elif defined(__ARM_FEATURE_SVE)
+inline bool validate_ascii_fast_sve(const char* src, size_t len) {
+    for (size_t i = 0; i < len; i += svcntb()) {
+        svbool_t pg = svwhilelt_b8(i, len);
+        svuint8_t v = svld1_u8(pg, reinterpret_cast<const uint8_t*>(src + i));
+        // Check sign bit set => byte < 0 as int8 => non-ASCII
+        svbool_t neg = svcmplt_n_s8(pg, svreinterpret_s8(v), 0);
+        if (svptest_any(pg, neg)) {
+            return false;
+        }
+    }
+
+    return true;
+}
 #endif
 
 namespace simd {
@@ -112,7 +130,7 @@ public:
 
         if constexpr (trim_single) {
             const auto ch = remove_str.data[0];
-#if defined(__AVX2__) || defined(__aarch64__)
+#if defined(__AVX2__)
             constexpr auto AVX2_BYTES = sizeof(__m256i);
             const auto size = end - begin;
             const auto* const avx2_begin = end - size / AVX2_BYTES * AVX2_BYTES;
@@ -125,6 +143,21 @@ public:
                 }
             }
             p += AVX2_BYTES;
+#elif defined(__ARM_FEATURE_SVE)
+            const auto size = static_cast<size_t>(end - begin);
+            const size_t vl = svcntb();
+            if (size >= vl) {
+                const auto* const sve_begin = end - (size / vl) * vl;
+                svbool_t pg = svptrue_b8();
+                for (p = end - vl; p >= sve_begin; p -= vl) {
+                    svuint8_t v = svld1_u8(pg, p);
+                    svbool_t neq = svcmpne_n_u8(pg, v, static_cast<uint8_t>(ch));
+                    if (svptest_any(pg, neq)) {
+                        break;
+                    }
+                }
+                p += vl;
+            }
 #endif
             for (; (p - 1) >= begin && *(p - 1) == ch; p--) {
             }
@@ -153,7 +186,7 @@ public:
 
         if constexpr (trim_single) {
             const auto ch = remove_str.data[0];
-#if defined(__AVX2__) || defined(__aarch64__)
+#if defined(__AVX2__)
             constexpr auto AVX2_BYTES = sizeof(__m256i);
             const auto size = end - begin;
             const auto* const avx2_end = begin + size / AVX2_BYTES * AVX2_BYTES;
@@ -163,6 +196,20 @@ public:
                         _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i*)p), spaces));
                 if ((~masks)) {
                     break;
+                }
+            }
+#elif defined(__ARM_FEATURE_SVE)
+            const auto size = static_cast<size_t>(end - begin);
+            const size_t vl = svcntb();
+            if (size >= vl) {
+                const auto* const sve_end = begin + (size / vl) * vl;
+                svbool_t pg = svptrue_b8();
+                for (; p < sve_end; p += vl) {
+                    svuint8_t v = svld1_u8(pg, p);
+                    svbool_t eq = svcmpne_n_u8(pg, v, static_cast<uint8_t>(ch));
+                    if (svptest_any(pg, eq)) {
+                        break;
+                    }
                 }
             }
 #endif
@@ -183,28 +230,48 @@ public:
         return p;
     }
 
+    // Iterate a UTF-8 string without exceeding a given length n.
+    // The function returns two values:
+    // the first represents the byte length traversed, and the second represents the char length traversed.
+    static inline std::pair<size_t, size_t> iterate_utf8_with_limit_length(const char* begin,
+                                                                           const char* end,
+                                                                           size_t n) {
+        const char* p = begin;
+        int char_size = 0;
+
+        size_t i = 0;
+        for (; i < n && p < end; ++i, p += char_size) {
+            char_size = UTF8_BYTE_LENGTH[static_cast<uint8_t>(*p)];
+        }
+
+        return {p - begin, i};
+    }
+
     // Gcc will do auto simd in this function
+    // if input empty, return true
     static bool is_ascii(const StringRef& str) {
 #ifdef __AVX2__
         return validate_ascii_fast_avx(str.data, str.size);
+#elif defined(__ARM_FEATURE_SVE)
+        return validate_ascii_fast_sve(str.data, str.size);
 #endif
         return validate_ascii_fast(str.data, str.size);
     }
 
-    static void reverse(const StringRef& str, StringRef dst) {
+    static void reverse(const StringRef& str, std::string* dst) {
         if (is_ascii(str)) {
             int64_t begin = 0;
             int64_t end = str.size;
-            int64_t result_end = dst.size - 1;
+            int64_t result_end = dst->size() - 1;
 
             // auto SIMD here
-            auto* __restrict l = const_cast<char*>(dst.data);
+            auto* __restrict l = dst->data();
             auto* __restrict r = str.data;
             for (; begin < end; ++begin, --result_end) {
                 l[result_end] = r[begin];
             }
         } else {
-            char* dst_data = const_cast<char*>(dst.data);
+            char* dst_data = dst->data();
             for (size_t i = 0, char_size = 0; i < str.size; i += char_size) {
                 char_size = UTF8_BYTE_LENGTH[(unsigned char)(str.data)[i]];
                 // there exists occasion where the last character is an illegal UTF-8 one which returns
@@ -225,7 +292,7 @@ public:
         auto src_str_end = src_str + length;
 
 #if defined(__SSE2__) || defined(__aarch64__)
-        constexpr auto step = sizeof(uint64);
+        constexpr auto step = sizeof(uint64_t);
         if (src_str + step < src_str_end) {
             const auto hex_map = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hex_table));
             const auto mask_map = _mm_set1_epi8(0x0F);
@@ -288,8 +355,11 @@ public:
     // is to say, counting bytes which do not match 10xx_xxxx pattern.
     // All 0xxx_xxxx, 110x_xxxx, 1110_xxxx and 1111_0xxx are greater than 1011_1111 when use int8_t arithmetic,
     // so just count bytes greater than 1011_1111 in a byte string as the result of utf8_length.
-    static inline size_t get_char_len(const char* src, size_t len) {
-        size_t char_len = 0;
+    // get_char_len is used to return the UTF-8 length of a string.
+    // The return value will never exceed len.
+    template <typename T>
+    static inline T get_char_len(const char* src, T len) {
+        T char_len = 0;
         const char* p = src;
         const char* end = p + len;
 #if defined(__SSE2__) || defined(__aarch64__)

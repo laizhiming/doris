@@ -31,13 +31,14 @@ import org.apache.doris.proto.InternalService.PGetWalQueueSizeResponse;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertRequest;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertResponse;
 import org.apache.doris.proto.Types;
-import org.apache.doris.thrift.TExecPlanFragmentParamsList;
 import org.apache.doris.thrift.TFoldConstantParams;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPipelineFragmentParamsList;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import org.apache.logging.log4j.LogManager;
@@ -60,8 +61,10 @@ public class BackendServiceProxy {
     // use concurrent map to allow access serviceMap in multi thread.
     private ReentrantLock lock = new ReentrantLock();
 
-    private Executor grpcThreadPool = ThreadPoolManager.newDaemonCacheThreadPool(Config.grpc_threadmgr_threads_nums,
+    private static Executor grpcThreadPool = ThreadPoolManager.newDaemonCacheThreadPool(
+            Config.grpc_threadmgr_threads_nums,
             "grpc_thread_pool", true);
+
     private final Map<TNetworkAddress, BackendServiceClientExtIp> serviceMap;
 
     public BackendServiceProxy() {
@@ -116,6 +119,15 @@ public class BackendServiceProxy {
 
     private BackendServiceClient getProxy(TNetworkAddress address) throws UnknownHostException {
         String realIp = Env.getCurrentEnv().getDnsCache().get(address.hostname);
+
+        // Check if DNS resolution failed (returns empty string)
+        if (realIp.isEmpty() && Config.enable_fqdn_mode) {
+            String errorMsg = String.format("Failed to resolve hostname: %s. DNS cache returned empty IP address.",
+                    address.hostname);
+            LOG.warn(errorMsg);
+            throw new UnknownHostException(errorMsg);
+        }
+
         BackendServiceClientExtIp serviceClientExtIp = serviceMap.get(address);
         if (serviceClientExtIp != null && serviceClientExtIp.realIp.equals(realIp)
                 && serviceClientExtIp.client.isNormalState()) {
@@ -128,7 +140,7 @@ public class BackendServiceProxy {
         try {
             serviceClientExtIp = serviceMap.get(address);
             if (serviceClientExtIp != null && !serviceClientExtIp.realIp.equals(realIp)) {
-                LOG.warn("Cached ip changed ,before ip: {}, curIp: {}", serviceClientExtIp.realIp, realIp);
+                LOG.warn("Cached ip changed, before ip: {}, curIp: {}", serviceClientExtIp.realIp, realIp);
                 serviceMap.remove(address);
                 removedClient = serviceClientExtIp.client;
                 serviceClientExtIp = null;
@@ -142,7 +154,8 @@ public class BackendServiceProxy {
                 serviceClientExtIp = null;
             }
             if (serviceClientExtIp == null) {
-                BackendServiceClient client = new BackendServiceClient(address, grpcThreadPool);
+                // Pass resolved IP to BackendServiceClient to avoid DNS resolution at gRPC layer
+                BackendServiceClient client = new BackendServiceClient(address, realIp, grpcThreadPool);
                 serviceMap.put(address, new BackendServiceClientExtIp(realIp, client));
             }
             return serviceMap.get(address).client;
@@ -151,38 +164,6 @@ public class BackendServiceProxy {
             if (removedClient != null) {
                 removedClient.shutdown();
             }
-        }
-    }
-
-    public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentsAsync(TNetworkAddress address,
-            TExecPlanFragmentParamsList paramsList, boolean twoPhaseExecution) throws TException, RpcException {
-        InternalService.PExecPlanFragmentRequest.Builder builder =
-                InternalService.PExecPlanFragmentRequest.newBuilder();
-        if (Config.use_compact_thrift_rpc) {
-            builder.setRequest(
-                    ByteString.copyFrom(new TSerializer(new TCompactProtocol.Factory()).serialize(paramsList)));
-            builder.setCompact(true);
-        } else {
-            builder.setRequest(ByteString.copyFrom(new TSerializer().serialize(paramsList))).build();
-            builder.setCompact(false);
-        }
-        // VERSION 2 means we send TExecPlanFragmentParamsList, not single TExecPlanFragmentParams
-        builder.setVersion(InternalService.PFragmentRequestVersion.VERSION_2);
-
-        final InternalService.PExecPlanFragmentRequest pRequest = builder.build();
-        MetricRepo.BE_COUNTER_QUERY_RPC_ALL.getOrAdd(address.hostname).increase(1L);
-        MetricRepo.BE_COUNTER_QUERY_RPC_SIZE.getOrAdd(address.hostname).increase((long) pRequest.getSerializedSize());
-        try {
-            final BackendServiceClient client = getProxy(address);
-            if (twoPhaseExecution) {
-                return client.execPlanFragmentPrepareAsync(pRequest);
-            } else {
-                return client.execPlanFragmentAsync(pRequest);
-            }
-        } catch (Throwable e) {
-            LOG.warn("Execute plan fragment catch a exception, address={}:{}", address.getHostname(), address.getPort(),
-                    e);
-            throw new RpcException(address.hostname, e.getMessage());
         }
     }
 
@@ -235,7 +216,7 @@ public class BackendServiceProxy {
     }
 
     public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentStartAsync(TNetworkAddress address,
-            PExecPlanFragmentStartRequest request) throws TException, RpcException {
+            PExecPlanFragmentStartRequest request) throws RpcException {
         try {
             final BackendServiceClient client = getProxy(address);
             return client.execPlanFragmentStartAsync(request);
@@ -286,6 +267,23 @@ public class BackendServiceProxy {
         try {
             final BackendServiceClient client = getProxy(address);
             return client.fetchDataAsync(request);
+        } catch (Throwable e) {
+            LOG.warn("fetch data catch a exception, address={}:{}",
+                    address.getHostname(), address.getPort(), e);
+            throw new RpcException(address.hostname, e.getMessage());
+        }
+    }
+
+    public Future<InternalService.PFetchDataResult> fetchDataAsyncWithCallback(
+            TNetworkAddress address, InternalService.PFetchDataRequest request,
+            FutureCallback<InternalService.PFetchDataResult> callback) throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            ListenableFuture<InternalService.PFetchDataResult> future = client.fetchDataAsync(request);
+            Futures.addCallback(
+                    future, callback,
+                    grpcThreadPool);
+            return future;
         } catch (Throwable e) {
             LOG.warn("fetch data catch a exception, address={}:{}",
                     address.getHostname(), address.getPort(), e);
@@ -555,5 +553,59 @@ public class BackendServiceProxy {
         }
     }
 
+    public Future<InternalService.PGetBeResourceResponse> getBeResourceAsync(TNetworkAddress address, int timeoutSec,
+            InternalService.PGetBeResourceRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.getBeResource(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("get be resource failed, address={}:{}",
+                    address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
 
+    public Future<InternalService.PDeleteDictionaryResponse> deleteDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PDeleteDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.deleteDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("delete dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PCommitRefreshDictionaryResponse> commitDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PCommitRefreshDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.commitRefreshDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("commit refresh dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PAbortRefreshDictionaryResponse> abortDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PAbortRefreshDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.abortRefreshDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("abort refrersh dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PRequestCdcClientResult> requestCdcClient(TNetworkAddress address,
+            InternalService.PRequestCdcClientRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.requestCdcClient(request);
+        } catch (Throwable e) {
+            LOG.warn("request cdc client failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
 }

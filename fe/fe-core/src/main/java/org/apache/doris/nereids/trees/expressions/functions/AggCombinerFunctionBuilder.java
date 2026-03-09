@@ -28,6 +28,7 @@ import org.apache.doris.nereids.trees.expressions.functions.combinator.UnionComb
 import org.apache.doris.nereids.types.AggStateType;
 import org.apache.doris.nereids.types.ArrayType;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.DataTypeUtils;
 
 import java.util.List;
 import java.util.Objects;
@@ -75,7 +76,7 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
                 return false;
             }
 
-            return nestedBuilder.canApply(((AggStateType) argument.getDataType()).getMockedExpressions());
+            return nestedBuilder.canApply(DataTypeUtils.getMockedExpressions((AggStateType) argument.getDataType()));
         }
     }
 
@@ -117,9 +118,14 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
         }
 
         Expression arg = (Expression) arguments.get(0);
-        AggStateType type = (AggStateType) arg.getDataType();
+        List<Expression> nestedArguments;
+        if (arg instanceof StateCombinator) {
+            nestedArguments = arg.children();
+        } else {
+            nestedArguments = DataTypeUtils.getMockedExpressions((AggStateType) arg.getDataType());
+        }
 
-        return (AggregateFunction) nestedBuilder.build(nestedName, type.getMockedExpressions()).first;
+        return (AggregateFunction) nestedBuilder.build(nestedName, nestedArguments).first;
     }
 
     @Override
@@ -127,6 +133,10 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
         String nestedName = getNestedName(name);
         if (combinatorSuffix.equalsIgnoreCase(STATE)) {
             AggregateFunction nestedFunction = buildState(nestedName, arguments);
+            // distinct will be passed as 1st boolean true arg. remove it
+            if (!arguments.isEmpty() && arguments.get(0) instanceof Boolean && (Boolean) arguments.get(0)) {
+                arguments = arguments.subList(1, arguments.size());
+            }
             return Pair.of(new StateCombinator((List<Expression>) arguments, nestedFunction), nestedFunction);
         } else if (combinatorSuffix.equalsIgnoreCase(MERGE)) {
             AggregateFunction nestedFunction = buildMergeOrUnion(nestedName, arguments);
@@ -139,6 +149,11 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
             return Pair.of(new ForEachCombinator((List<Expression>) arguments, nestedFunction), nestedFunction);
         }
         return null;
+    }
+
+    @Override
+    public String parameterDisplayString() {
+        return nestedBuilder.parameterDisplayString();
     }
 
     public static boolean isAggStateCombinator(String name) {

@@ -19,6 +19,7 @@ package org.apache.doris.nereids.trees.plans.commands.call;
 
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.nereids.analyzer.UnboundFunction;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.qe.ConnectContext;
 
 /**
@@ -36,8 +37,10 @@ public abstract class CallFunc {
             // TODO, built-in functions require a separate management
             case "EXECUTE_STMT": // Call built-in functions first
                 return CallExecuteStmtFunc.create(user, unboundFunction.getArguments());
+            case "FLUSH_AUDIT_LOG":
+                return CallFlushAuditLogFunc.create(user, unboundFunction.getArguments());
             default:
-                return CallProcedure.create(ctx, originSql);
+                throw new AnalysisException("do not support call function " + funcName);
         }
     }
 

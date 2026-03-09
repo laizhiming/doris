@@ -17,6 +17,9 @@
 
 package org.apache.doris.nereids.trees;
 
+import org.apache.doris.nereids.parser.Origin;
+import org.apache.doris.nereids.util.MutableState;
+import org.apache.doris.nereids.util.MutableState.EmptyMutableState;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.collect.ImmutableList;
@@ -25,6 +28,7 @@ import com.google.common.collect.ImmutableSet;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Deque;
 import java.util.LinkedList;
 import java.util.List;
@@ -48,9 +52,17 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
 
     NODE_TYPE child(int index);
 
+    default Optional<Origin> getOrigin() {
+        return Optional.empty();
+    }
+
     int arity();
 
     <T> Optional<T> getMutableState(String key);
+
+    default MutableState getMutableStates() {
+        return EmptyMutableState.INSTANCE;
+    }
 
     /** getOrInitMutableState */
     default <T> T getOrInitMutableState(String key, Supplier<T> initState) {
@@ -64,6 +76,22 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
     }
 
     void setMutableState(String key, Object value);
+
+    /** getAllChildrenTypes */
+    default BitSet getAllChildrenTypes() {
+        BitSet bitSet = new BitSet();
+        for (TreeNode<?> child : children()) {
+            bitSet.or(child.getAllChildrenTypes());
+        }
+        bitSet.or(getSuperClassTypes());
+        return bitSet;
+    }
+
+    default BitSet getSuperClassTypes() {
+        BitSet bitSet = new BitSet();
+        SuperClassId.getSuperClassIds(getClass());
+        return bitSet;
+    }
 
     default NODE_TYPE withChildren(NODE_TYPE... children) {
         return withChildren(Utils.fastToImmutableList(children));
@@ -122,22 +150,23 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
 
     /**
      * similar to rewriteDownShortCircuit, except that only subtrees, whose root satisfies
-     * border predicate are rewritten.
+     * border predicate are rewritten, and if a node not match predicate, then its descendant will not rewrite.
      */
     default NODE_TYPE rewriteDownShortCircuitDown(Function<NODE_TYPE, NODE_TYPE> rewriteFunction,
-            Predicate border, boolean aboveBorder) {
+            Predicate predicate, boolean stopWhenNotMatched) {
         NODE_TYPE currentNode = (NODE_TYPE) this;
-        if (border.test(this)) {
-            aboveBorder = false;
+        boolean matched = predicate.test(this);
+        if (stopWhenNotMatched && !matched) {
+            return currentNode;
         }
-        if (!aboveBorder) {
-            currentNode = rewriteFunction.apply((NODE_TYPE) this);
+        if (matched) {
+            currentNode = rewriteFunction.apply(currentNode);
         }
         if (currentNode == this) {
             Builder<NODE_TYPE> newChildren = ImmutableList.builderWithExpectedSize(arity());
             boolean changed = false;
             for (NODE_TYPE child : children()) {
-                NODE_TYPE newChild = child.rewriteDownShortCircuitDown(rewriteFunction, border, aboveBorder);
+                NODE_TYPE newChild = child.rewriteDownShortCircuitDown(rewriteFunction, predicate, stopWhenNotMatched);
                 if (child != newChild) {
                     changed = true;
                 }
@@ -193,6 +222,20 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
         }
     }
 
+    /**
+     * Foreach treeNode. Top-down traverse implicitly.
+     * @param func foreach function
+     */
+    default void foreachWithTest(Consumer<TreeNode<NODE_TYPE>> func, Predicate<TreeNode<NODE_TYPE>> predicate) {
+        if (!predicate.test(this)) {
+            return;
+        }
+        func.accept(this);
+        for (NODE_TYPE child : children()) {
+            child.foreach(func);
+        }
+    }
+
     /** foreachBreath */
     default void foreachBreath(Predicate<TreeNode<NODE_TYPE>> func) {
         LinkedList<TreeNode<NODE_TYPE>> queue = new LinkedList<>();
@@ -207,7 +250,7 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
 
     default void foreachUp(Consumer<TreeNode<NODE_TYPE>> func) {
         for (NODE_TYPE child : children()) {
-            child.foreach(func);
+            child.foreachUp(func);
         }
         func.accept(this);
     }
@@ -230,6 +273,23 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
     }
 
     /**
+     * iterate top down and test predicate if all matched. Top-down traverse implicitly.
+     * @param predicate predicate
+     * @return true if all predicate return true
+     */
+    default boolean allMatch(Predicate<TreeNode<NODE_TYPE>> predicate) {
+        if (!predicate.test(this)) {
+            return false;
+        }
+        for (NODE_TYPE child : children()) {
+            if (!child.allMatch(predicate)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Collect the nodes that satisfied the predicate.
      */
     default <T> Set<T> collect(Predicate<TreeNode<NODE_TYPE>> predicate) {
@@ -239,6 +299,19 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
                 result.add(node);
             }
         });
+        return (Set<T>) result.build();
+    }
+
+    /**
+     * Collect the nodes that satisfied the predicate.
+     */
+    default <T> Set<T> collectWithTest(Predicate<TreeNode<NODE_TYPE>> predicate, Predicate<TreeNode<NODE_TYPE>> test) {
+        ImmutableSet.Builder<TreeNode<NODE_TYPE>> result = ImmutableSet.builder();
+        foreachWithTest(node -> {
+            if (predicate.test(node)) {
+                result.add(node);
+            }
+        }, test);
         return (Set<T>) result.build();
     }
 
@@ -288,14 +361,14 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
      * @return true if it has any instance of the types
      */
     default boolean containsType(Class... types) {
-        return anyMatch(node -> {
-            for (Class type : types) {
-                if (type.isInstance(node)) {
-                    return true;
-                }
+        BitSet allChildrenTypes = getAllChildrenTypes();
+        for (Class type : types) {
+            int classId = SuperClassId.getClassId(type);
+            if (allChildrenTypes.get(classId)) {
+                return true;
             }
-            return false;
-        });
+        }
+        return false;
     }
 
     /**
@@ -304,6 +377,9 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
      * @return true if all the tree is equals
      */
     default boolean deepEquals(TreeNode<?> that) {
+        if (this == that) {
+            return true;
+        }
         Deque<TreeNode<?>> thisDeque = new ArrayDeque<>();
         Deque<TreeNode<?>> thatDeque = new ArrayDeque<>();
 
@@ -339,5 +415,9 @@ public interface TreeNode<NODE_TYPE extends TreeNode<NODE_TYPE>> {
 
         // If the "that" tree hasn't been fully traversed, return false.
         return thatDeque.isEmpty();
+    }
+
+    default String toDigest() {
+        return "";
     }
 }

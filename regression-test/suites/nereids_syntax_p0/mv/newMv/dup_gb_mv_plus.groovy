@@ -18,6 +18,11 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("dup_gb_mv_plus") {
+
+    String db = context.config.getDbNameByFile(context.file)
+    sql "use ${db}"
+    // this mv rewrite would not be rewritten in RBO, so set NOT_IN_RBO explicitly
+    sql "set pre_materialized_view_rewrite_strategy = NOT_IN_RBO"
     sql """ DROP TABLE IF EXISTS dup_gb_mv_plus; """
 
     sql """
@@ -36,8 +41,7 @@ suite ("dup_gb_mv_plus") {
     sql "insert into dup_gb_mv_plus select 2,2,2,'b';"
     sql "insert into dup_gb_mv_plus select 3,-3,null,'c';"
 
-    createMV( "create materialized view k12sp as select k1,sum(k2+1) from dup_gb_mv_plus group by k1;")
-    sleep(3000)
+    create_sync_mv(db, "dup_gb_mv_plus", "k12sp", "select k1 as a1,sum(k2+1) from dup_gb_mv_plus group by k1;")
 
     sql "insert into dup_gb_mv_plus select -4,-4,-4,'d';"
 
@@ -45,31 +49,13 @@ suite ("dup_gb_mv_plus") {
     sql "SET enable_fallback_to_original_planner=false"
 
     sql "analyze table dup_gb_mv_plus with sync;"
-    sql """set enable_stats=false;"""
-
+    sql """alter table dup_gb_mv_plus modify column k1 set stats ('row_count'='4');"""
 
     order_qt_select_star "select * from dup_gb_mv_plus order by k1;"
 
-    explain {
-        sql("select k1,sum(k2+1) from dup_gb_mv_plus group by k1;")
-        contains "(k12sp)"
-    }
+    mv_rewrite_success("select k1,sum(k2+1) from dup_gb_mv_plus group by k1;", "k12sp")
     order_qt_select_mv "select k1,sum(k2+1) from dup_gb_mv_plus group by k1 order by k1;"
 
-    explain {
-        sql("select sum(k2+1) from dup_gb_mv_plus group by k1;")
-        contains "(k12sp)"
-    }
+    mv_rewrite_success("select sum(k2+1) from dup_gb_mv_plus group by k1;", "k12sp")
     order_qt_select_mv_sub "select sum(k2+1) from dup_gb_mv_plus group by k1 order by k1;"
-
-    sql """set enable_stats=true;"""
-    explain {
-        sql("select k1,sum(k2+1) from dup_gb_mv_plus group by k1;")
-        contains "(k12sp)"
-    }
-
-    explain {
-        sql("select sum(k2+1) from dup_gb_mv_plus group by k1;")
-        contains "(k12sp)"
-    }
 }

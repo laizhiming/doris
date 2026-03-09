@@ -306,7 +306,7 @@ suite("cte") {
         notContains "MultiCastDataSinks"
     }
 
-    sql "WITH cte_0 AS ( SELECT 1 AS a ) SELECT * from cte_0 t1 LIMIT 10 UNION SELECT * from cte_0 t1 LIMIT 10"
+    sql "WITH cte_0 AS ( SELECT 1 AS a ) (SELECT * from cte_0 t1 LIMIT 10) UNION (SELECT * from cte_0 t1 LIMIT 10)"
 
     qt_cte_with_repeat """
         with cte_0 as (select lo_orderkey, lo_linenumber, grouping_id(lo_orderkey) as id from lineorder group by cube(lo_orderkey, lo_linenumber))
@@ -333,6 +333,11 @@ suite("cte") {
     // rewrite cte children should work well with cost based rewrite rule. rely on rewrite rule: InferSetOperatorDistinct
     sql """
         WITH cte_0 AS ( SELECT 1 AS a ), cte_1 AS ( SELECT 1 AS a ) select * from cte_0, cte_1 union select * from cte_0, cte_1
+    """
+
+    // test more than one project on cte consumer
+    sql """
+        with a as (select 1 c1) select *, uuid() from a union all select c2, c2 from (select c1 + 1, uuid() c2 from a) x ;
     """
 }
 

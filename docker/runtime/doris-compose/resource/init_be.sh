@@ -22,19 +22,19 @@ DIR=$(
 
 source $DIR/common.sh
 
-REGISTER_FILE=$DORIS_HOME/status/be-$MY_IP-register
+REGISTER_FILE="${DORIS_HOME}/status/be-${MY_ID}-register"
 
 add_local_be() {
     wait_master_fe_ready
 
     while true; do
-        #lsof -i:$BE_HEARTBEAT_PORT
+        #lsof -i:$MY_HEARTBEAT_PORT
         #if [ $? -ne 0 ]; then
         #    sleep 1
         #    continue
         #fi
 
-        output=$(mysql -P $FE_QUERY_PORT -h $MASTER_FE_IP -u root --execute "ALTER SYSTEM ADD BACKEND '$MY_IP:$BE_HEARTBEAT_PORT';" 2>&1)
+        output=$(mysql -P $MASTER_FE_PORT -h $MASTER_FE_IP -u root --execute "ALTER SYSTEM ADD BACKEND '$MY_IP:$MY_HEARTBEAT_PORT';" 2>&1)
         res=$?
         health_log "$output"
         [ $res -eq 0 ] && break
@@ -48,10 +48,15 @@ add_cloud_be() {
         return
     fi
 
-    cluster_file_name="${DORIS_HOME}/conf/CLUSTER_NAME"
-    cluster_name=$(cat $cluster_file_name)
+    # Check if SQL_MODE_NODE_MGR is set to 1
+    if [ "$SQL_MODE_NODE_MGR" -eq 1 ]; then
+        health_log "SQL_MODE_NODE_MGR is set to 1, skipping cluster creation"
+        return
+    fi
+
+    cluster_name="${CLUSTER_NAME}"
     if [ -z $cluster_name ]; then
-        health_log "Empty cluster name, it should specific in file ${cluster_file_name}"
+        health_log "Empty cluster name, should specific with --be-cluster"
         exit 1
     fi
 
@@ -62,13 +67,13 @@ add_cloud_be() {
     nodes='{
     "cloud_unique_id": "'"${CLOUD_UNIQUE_ID}"'",
     "ip": "'"${MY_IP}"'",
-    "heartbeat_port": "'"${BE_HEARTBEAT_PORT}"'"
+    "heartbeat_port": "'"${MY_HEARTBEAT_PORT}"'"
     }'
 
     lock_cluster
 
     output=$(curl -s "${META_SERVICE_ENDPOINT}/MetaService/http/add_cluster?token=greedisgood9999" \
-        -d '{"instance_id": "default_instance_id",
+        -d '{"instance_id": "'"${INSTANCE_ID}"'",
         "cluster": {
         "type": "COMPUTE",
         "cluster_name": "'"${cluster_name}"'",
@@ -82,7 +87,7 @@ add_cloud_be() {
     # cluster has exists
     if [ "$code" == "ALREADY_EXISTED" ]; then
         output=$(curl -s "${META_SERVICE_ENDPOINT}/MetaService/http/add_node?token=greedisgood9999" \
-            -d '{"instance_id": "default_instance_id",
+            -d '{"instance_id": "'"${INSTANCE_ID}"'",
             "cluster": {
             "type": "COMPUTE",
             "cluster_name": "'"${cluster_name}"'",
@@ -102,7 +107,7 @@ add_cloud_be() {
     fi
 
     output=$(curl -s "${META_SERVICE_ENDPOINT}/MetaService/http/get_cluster?token=greedisgood9999" \
-        -d '{"instance_id": "default_instance_id",
+        -d '{"instance_id": "'"${INSTANCE_ID}"'",
             "cloud_unique_id": "'"${CLOUD_UNIQUE_ID}"'",
             "cluster_name": "'"${cluster_name}"'",
             "cluster_id": "'"${cluster_id}"'"
@@ -167,7 +172,7 @@ main() {
     add_be_to_cluster
 
     health_log "run start_be.sh"
-    bash $DORIS_HOME/bin/start_be.sh --daemon
+    bash $DORIS_HOME/bin/start_be.sh --daemon | tee -a $DORIS_HOME/log/be.out
 
     wait_process
 }

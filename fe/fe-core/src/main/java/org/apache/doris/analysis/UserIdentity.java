@@ -17,11 +17,9 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.Env;
 import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.CaseSensibility;
-import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.PatternMatcherWrapper;
 import org.apache.doris.common.io.Text;
@@ -57,6 +55,16 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     private String host;
     @SerializedName(value = "isDomain")
     private boolean isDomain;
+
+    // TLS certificate authentication fields
+    @SerializedName(value = "san")
+    private String san;
+    @SerializedName(value = "issuer")
+    private String issuer;
+    @SerializedName(value = "cipher")
+    private String cipher;
+    @SerializedName(value = "subject")
+    private String subject;
 
     private boolean isAnalyzed = false;
 
@@ -124,6 +132,77 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         return isDomain;
     }
 
+    // TLS certificate authentication getters and setters
+    public String getSan() {
+        return san;
+    }
+
+    public void setSan(String san) {
+        this.san = san;
+    }
+
+    public String getIssuer() {
+        return issuer;
+    }
+
+    public void setIssuer(String issuer) {
+        this.issuer = issuer;
+    }
+
+    public String getCipher() {
+        return cipher;
+    }
+
+    public void setCipher(String cipher) {
+        this.cipher = cipher;
+    }
+
+    public String getSubject() {
+        return subject;
+    }
+
+    public void setSubject(String subject) {
+        this.subject = subject;
+    }
+
+    /**
+     * Checks if this user has any TLS certificate requirements.
+     */
+    public boolean hasTlsRequirements() {
+        return san != null || issuer != null || cipher != null || subject != null;
+    }
+
+    /**
+     * Clears all TLS certificate requirements.
+     * Used when REQUIRE NONE is specified.
+     */
+    public void clearTlsRequirements() {
+        this.san = null;
+        this.issuer = null;
+        this.cipher = null;
+        this.subject = null;
+    }
+
+    /**
+     * Applies TLS options from a TlsOptions object.
+     * If tlsOptions is null or has no REQUIRE clause, no changes are made.
+     * If REQUIRE NONE is specified, all TLS requirements are cleared.
+     * Otherwise, the TLS fields are set from the TlsOptions.
+     */
+    public void applyTlsOptions(TlsOptions tlsOptions) {
+        if (tlsOptions == null || !tlsOptions.hasRequireClause()) {
+            return;
+        }
+        if (tlsOptions.isRequireNone()) {
+            clearTlsRequirements();
+        } else {
+            this.san = tlsOptions.getSan();
+            this.issuer = tlsOptions.getIssuer();
+            this.cipher = tlsOptions.getCipher();
+            this.subject = tlsOptions.getSubject();
+        }
+    }
+
     public void setIsAnalyzed() {
         this.isAnalyzed = true;
     }
@@ -182,11 +261,15 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     }
 
     public boolean isRootUser() {
-        return user.equals(Auth.ROOT_USER);
+        return this.equals(ROOT);
     }
 
     public boolean isAdminUser() {
-        return user.equals(Auth.ADMIN_USER);
+        return this.equals(ADMIN);
+    }
+
+    public boolean isSystemUser() {
+        return isRootUser() || isAdminUser();
     }
 
     public TUserIdentity toThrift() {
@@ -218,17 +301,10 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     }
 
     public static UserIdentity read(DataInput in) throws IOException {
-        // Use Gson in the VERSION_109
-        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_109) {
-            UserIdentity userIdentity = new UserIdentity();
-            userIdentity.readFields(in);
-            return userIdentity;
-        } else {
-            String json = Text.readString(in);
-            UserIdentity userIdentity = GsonUtils.GSON.fromJson(json, UserIdentity.class);
-            userIdentity.setIsAnalyzed();
-            return userIdentity;
-        }
+        String json = Text.readString(in);
+        UserIdentity userIdentity = GsonUtils.GSON.fromJson(json, UserIdentity.class);
+        userIdentity.setIsAnalyzed();
+        return userIdentity;
     }
 
     @Override
@@ -273,14 +349,6 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     public void write(DataOutput out) throws IOException {
         Preconditions.checkState(isAnalyzed);
         Text.writeString(out, GsonUtils.GSON.toJson(this));
-    }
-
-    @Deprecated
-    private void readFields(DataInput in) throws IOException {
-        user = Text.readString(in);
-        host = Text.readString(in);
-        isDomain = in.readBoolean();
-        isAnalyzed = true;
     }
 
     @Override

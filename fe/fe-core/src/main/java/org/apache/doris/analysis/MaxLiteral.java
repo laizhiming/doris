@@ -17,16 +17,17 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.common.FormatOptions;
 import org.apache.doris.thrift.TExprNode;
-
-import java.io.DataInput;
-import java.io.IOException;
 
 public final class MaxLiteral extends LiteralExpr {
 
     public static final MaxLiteral MAX_VALUE = new MaxLiteral();
 
     private MaxLiteral() {
+        this.nullable = false;
     }
 
     @Override
@@ -58,6 +59,12 @@ public final class MaxLiteral extends LiteralExpr {
     }
 
     @Override
+    public String toSqlImpl(boolean disableTableName, boolean needExternalSql, TableType tableType,
+            TableIf table) {
+        return "MAXVALUE";
+    }
+
+    @Override
     public String toString() {
         return toSql();
     }
@@ -68,14 +75,7 @@ public final class MaxLiteral extends LiteralExpr {
     }
 
     @Override
-    public String getStringValueForArray() {
+    protected String getStringValueInComplexTypeForQuery(FormatOptions options) {
         return null;
-    }
-
-    public void readFields(DataInput in) throws IOException {
-    }
-
-    public static MaxLiteral read(DataInput in) throws IOException {
-        return MAX_VALUE;
     }
 }
